@@ -467,13 +467,7 @@ if "records" in st.session_state:
             st.download_button("⬇ Download Images (.zip)", data=buf.getvalue(),
                                file_name=f"{paper_name or 'images'}_images.zip",
                                mime="application/zip")
-            st.info(
-                f"📎 **{len(images)} images extracted.**\n\n"
-                "Download the zip above — images are named by page (e.g. `p4_img1.png`) "
-                "so you can match them to questions manually in Airtable using the "
-                "**Image Description** field as a guide.",
-                icon="💡"
-            )
+
 
     with sync_col:
         if not (AT_TOKEN and AT_BASE):
