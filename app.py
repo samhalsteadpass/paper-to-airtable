@@ -1,15 +1,14 @@
 """
 app.py  –  Past Paper → Airtable  (Streamlit Cloud)
 =====================================================
-Deploy once, share the URL. No local setup needed.
-
 Secrets (set in Streamlit Cloud dashboard or .streamlit/secrets.toml):
     ANTHROPIC_API_KEY  = "sk-ant-..."
     AIRTABLE_TOKEN     = "patXXXX..."
     AIRTABLE_BASE_ID   = "appXXXX..."
+    IMGBB_API_KEY      = "xxxxxxxx..."
 
-pip / requirements.txt:
-    streamlit anthropic pymupdf pillow requests
+requirements.txt:
+    streamlit anthropic pymupdf pillow requests pandas
 """
 
 import io, json, re, base64, zipfile, time
@@ -18,42 +17,18 @@ from pathlib import Path
 import streamlit as st
 import anthropic
 import requests
-import fitz          # PyMuPDF
+import fitz
 from PIL import Image
 
 # ── Config ────────────────────────────────────────────────────────────────
-MODEL      = "claude-sonnet-4-6"
-MAX_TOKENS = 8000
-CHUNK_PAGES = 8        # pages per Claude call — reduce to 4 if still rate-limiting
-MAX_RETRIES = 4        # number of retries on rate limit
-RETRY_DELAY = 20       # seconds between retries
-AT_API     = "https://api.airtable.com/v0"
-AT_META    = "https://api.airtable.com/v0/meta"
-
-IMGBB_API = "https://api.imgbb.com/1/upload"
-
-def upload_to_imgbb(api_key: str, img: dict) -> str | None:
-    """Upload image bytes to imgbb, return public URL or None on failure."""
-    b64 = base64.standard_b64encode(img["data"]).decode()
-    resp = requests.post(IMGBB_API, data={
-        "key":   api_key,
-        "name":  img["name"],
-        "image": b64,
-    })
-    if resp.ok:
-        return resp.json()["data"]["url"]
-    return None
-
-def patch_record_images(token: str, base_id: str, table: str,
-                        record_id: str, urls: list[str]):
-    """Patch a single Airtable record's Images field with a list of URLs."""
-    resp = requests.patch(
-        f"{AT_API}/{base_id}/{requests.utils.quote(table)}/{record_id}",
-        headers=at_headers(token),
-        json={"fields": {"Images": [{"url": u} for u in urls]}},
-    )
-    if not resp.ok:
-        raise RuntimeError(f"{resp.status_code} — {resp.text[:200]}")
+MODEL       = "claude-sonnet-4-6"
+MAX_TOKENS  = 8000
+CHUNK_PAGES = 8
+MAX_RETRIES = 4
+RETRY_DELAY = 20
+AT_API      = "https://api.airtable.com/v0"
+AT_META     = "https://api.airtable.com/v0/meta"
+IMGBB_API   = "https://api.imgbb.com/1/upload"
 
 AT_FIELDS = [
     ("Question Number",    "singleLineText"),
@@ -69,13 +44,14 @@ AT_FIELDS = [
     ("Exam Type",          "singleLineText"),
 ]
 
+# ── Secrets ───────────────────────────────────────────────────────────────
 def get_secret(key: str, fallback: str = "") -> str:
     try:
         return st.secrets[key]
     except Exception:
         return fallback
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+# ── PDF / image helpers ───────────────────────────────────────────────────
 def pdf_to_b64(data: bytes) -> str:
     return base64.standard_b64encode(data).decode()
 
@@ -87,14 +63,11 @@ def clean_json(raw: str) -> str:
     return raw.strip()
 
 def extract_images(pdf_bytes: bytes) -> list[dict]:
-    """Return list of {page, name, data (bytes), width, height}."""
-    doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
-    images = []
+    doc, images = fitz.open(stream=pdf_bytes, filetype="pdf"), []
     for page_num, page in enumerate(doc, 1):
         for idx, img_info in enumerate(page.get_images(full=True), 1):
-            xref = img_info[0]
             try:
-                bi  = doc.extract_image(xref)
+                bi  = doc.extract_image(img_info[0])
                 img = Image.open(io.BytesIO(bi["image"]))
                 if img.width < 60 or img.height < 60:
                     continue
@@ -110,7 +83,19 @@ def extract_images(pdf_bytes: bytes) -> list[dict]:
     doc.close()
     return images
 
-# ── Claude calls ──────────────────────────────────────────────────────────
+def split_pdf(pdf_bytes: bytes, chunk_size: int) -> list[bytes]:
+    doc, chunks = fitz.open(stream=pdf_bytes, filetype="pdf"), []
+    for start in range(0, len(doc), chunk_size):
+        w = fitz.open()
+        w.insert_pdf(doc, from_page=start, to_page=min(start + chunk_size, len(doc)) - 1)
+        buf = io.BytesIO()
+        w.save(buf)
+        chunks.append(buf.getvalue())
+        w.close()
+    doc.close()
+    return chunks
+
+# ── Claude ────────────────────────────────────────────────────────────────
 QUESTION_PROMPT = """Extract EVERY question from this exam paper PDF.
 Return ONLY a raw JSON array — no markdown fences, no preamble.
 
@@ -143,21 +128,6 @@ Each element:
 }}
 """
 
-def split_pdf(pdf_bytes: bytes, chunk_size: int) -> list[bytes]:
-    """Split a PDF into chunks of chunk_size pages, return list of PDF bytes."""
-    doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total  = len(doc)
-    chunks = []
-    for start in range(0, total, chunk_size):
-        writer = fitz.open()
-        writer.insert_pdf(doc, from_page=start, to_page=min(start + chunk_size, total) - 1)
-        buf = io.BytesIO()
-        writer.save(buf)
-        chunks.append(buf.getvalue())
-        writer.close()
-    doc.close()
-    return chunks
-
 def ask_claude(client: anthropic.Anthropic, pdf_b64: str, prompt: str) -> str:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -175,18 +145,17 @@ def ask_claude(client: anthropic.Anthropic, pdf_b64: str, prompt: str) -> str:
             if attempt == MAX_RETRIES:
                 raise RuntimeError(
                     f"❌ Rate limit hit after {MAX_RETRIES} retries. "
-                    "Your Anthropic account may need a higher tier — see console.anthropic.com/settings/limits. "
-                    "You can also reduce CHUNK_PAGES in app.py."
+                    "See console.anthropic.com/settings/limits or reduce CHUNK_PAGES."
                 )
             wait = RETRY_DELAY * attempt
-            st.toast(f"Rate limit hit — waiting {wait}s before retry {attempt}/{MAX_RETRIES - 1}…")
+            st.toast(f"Rate limit — waiting {wait}s (retry {attempt}/{MAX_RETRIES - 1})…")
             time.sleep(wait)
         except anthropic.AuthenticationError:
-            raise RuntimeError("❌ Invalid Anthropic API key. Check your ANTHROPIC_API_KEY secret.")
+            raise RuntimeError("❌ Invalid Anthropic API key.")
         except anthropic.PermissionDeniedError:
-            raise RuntimeError("❌ Anthropic API key doesn't have permission. Check it's active at console.anthropic.com.")
+            raise RuntimeError("❌ Anthropic key has no permission.")
         except anthropic.BadRequestError as e:
-            raise RuntimeError(f"❌ Bad request to Claude (PDF may be too large or malformed): {e}")
+            raise RuntimeError(f"❌ Bad request (PDF too large or malformed): {e}")
         except anthropic.APIStatusError as e:
             raise RuntimeError(f"❌ Anthropic API error {e.status_code}: {e.message}")
 
@@ -198,8 +167,7 @@ def ensure_table(token: str, base_id: str, table: str):
     try:
         r = requests.get(f"{AT_META}/bases/{base_id}/tables", headers=at_headers(token))
         if r.status_code == 401:
-            st.info("ℹ️ Skipping auto table-creation (token lacks schema.bases:write scope). "
-                    "Make sure the table and fields exist manually — see the sidebar for the field list.")
+            st.info("ℹ️ Skipping auto table-creation (token lacks schema.bases:write).")
             return
         r.raise_for_status()
         if table in [t["name"] for t in r.json().get("tables", [])]:
@@ -211,95 +179,64 @@ def ensure_table(token: str, base_id: str, table: str):
             elif ftype == "checkbox":
                 fields.append({"name": name, "type": "checkbox",
                                "options": {"icon": "check", "color": "greenBright"}})
+            elif ftype == "multipleAttachments":
+                fields.append({"name": name, "type": "multipleAttachments"})
             else:
                 fields.append({"name": name, "type": ftype})
         r2 = requests.post(f"{AT_META}/bases/{base_id}/tables",
                            headers=at_headers(token),
                            json={"name": table, "fields": fields})
         if not r2.ok:
-            st.warning(f"Could not auto-create table ({r2.status_code}). Create it manually — see field list in the sidebar.")
+            st.warning(f"Could not auto-create table ({r2.status_code}). Create it manually.")
     except Exception as e:
         st.warning(f"Table check skipped: {e}")
 
-def push_to_airtable(token: str, base_id: str, table: str,
-                     records: list[dict], progress) -> tuple[int, list[dict]]:
-    """Push records, return (count, [{record_id, pageNumber}])"""
-    url    = f"{AT_API}/{base_id}/{requests.utils.quote(table)}"
-    total  = len(records)
-    pushed = 0
-    id_map = []   # [{record_id, pageNumber}]
+# ── imgbb ─────────────────────────────────────────────────────────────────
+def upload_to_imgbb(api_key: str, img: dict) -> str | None:
+    b64 = base64.standard_b64encode(img["data"]).decode()
+    resp = requests.post(IMGBB_API, data={"key": api_key, "name": img["name"], "image": b64})
+    if resp.ok:
+        return resp.json()["data"]["url"]
+    return None
 
-    for i in range(0, total, 10):
-        chunk = records[i:i+10]
-        body  = {"records": [{"fields": {
-            "Question Number":    str(r.get("questionNumber", "")),
-            "Question Text":      str(r.get("questionText",   "")),
-            "Mark Allocation":    int(r["markAllocation"]) if str(r.get("markAllocation","")).lstrip("-").isdigit() else 0,
-            "Topic":              str(r.get("topic",       "")),
-            "Subtopic":           str(r.get("subtopic",    "")),
-            "Mark Scheme Answer": str(r.get("markSchemeAnswer", "")),
-            "Image Description":  str(r.get("imageDescription", "")),
-            "Has Images":         bool(r.get("hasImages", False)),
-            "Paper Name":         str(r.get("paperName",  "")),
-            "Exam Type":          str(r.get("examType",   "")),
-        }} for r in chunk]}
-        resp = requests.post(url, headers=at_headers(token), json=body)
-        if not resp.ok:
-            raise RuntimeError(f"Airtable {resp.status_code}: {resp.text[:300]}")
-        for rec, row in zip(resp.json()["records"], chunk):
-            id_map.append({
-                "record_id":        rec["id"],
-                "hasImages":        row.get("hasImages", False),
-                "imageDescription": row.get("imageDescription", ""),
-            })
-        pushed += len(chunk)
-        progress.progress(pushed / total, text=f"Syncing records… {pushed}/{total}")
-
-    return pushed, id_map
-
-
-
+def patch_record_images(token: str, base_id: str, table: str, record_id: str, urls: list[str]):
+    resp = requests.patch(
+        f"{AT_API}/{base_id}/{requests.utils.quote(table)}/{record_id}",
+        headers=at_headers(token),
+        json={"fields": {"Images": [{"url": u} for u in urls]}},
+    )
+    if not resp.ok:
+        raise RuntimeError(f"{resp.status_code} — {resp.text[:200]}")
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────
 st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
-
 st.title("📄 Past Paper → Airtable")
 st.caption("Upload exam PDFs, extract questions with AI, review, then sync to Airtable.")
 
-# Read secrets (pre-configured by admin on Streamlit Cloud)
-ANTH_KEY   = get_secret("ANTHROPIC_API_KEY")
-AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
-AT_BASE    = get_secret("AIRTABLE_BASE_ID")
-IMGBB_KEY  = get_secret("IMGBB_API_KEY")
+ANTH_KEY  = get_secret("ANTHROPIC_API_KEY")
+AT_TOKEN  = get_secret("AIRTABLE_TOKEN")
+AT_BASE   = get_secret("AIRTABLE_BASE_ID")
+IMGBB_KEY = get_secret("IMGBB_API_KEY")
 
-# Sidebar — credentials (shown only if not in secrets)
 with st.sidebar:
     st.header("⚙️ Configuration")
     if not ANTH_KEY:
-        ANTH_KEY = st.text_input("Anthropic API key", type="password",
-                                  placeholder="sk-ant-...")
+        ANTH_KEY = st.text_input("Anthropic API key", type="password", placeholder="sk-ant-...")
     else:
-        st.success("✓ Anthropic key loaded from secrets")
-
+        st.success("✓ Anthropic key loaded")
     if not AT_TOKEN:
-        AT_TOKEN = st.text_input("Airtable Personal Access Token", type="password",
-                                  placeholder="patXXXXXX")
+        AT_TOKEN = st.text_input("Airtable Token", type="password", placeholder="patXXXXXX")
     else:
-        st.success("✓ Airtable token loaded from secrets")
-
+        st.success("✓ Airtable token loaded")
     if not AT_BASE:
         AT_BASE = st.text_input("Airtable Base ID", placeholder="appXXXXXX")
     else:
-        st.success("✓ Airtable Base ID loaded from secrets")
-
+        st.success("✓ Airtable Base ID loaded")
     if not IMGBB_KEY:
-        IMGBB_KEY = st.text_input("imgbb API key", type="password",
-                                   placeholder="Get free key at imgbb.com/api")
+        IMGBB_KEY = st.text_input("imgbb API key", type="password", placeholder="imgbb.com/api")
     else:
-        st.success("✓ imgbb key loaded from secrets")
-
+        st.success("✓ imgbb key loaded")
     AT_TABLE = st.text_input("Table name", value="Questions")
-
     st.divider()
     st.markdown("**Required Airtable fields**")
     for name, ftype in AT_FIELDS:
@@ -322,12 +259,11 @@ with col2:
 st.subheader("2 · Extract with AI")
 if st.button("✨ Extract Questions", type="primary",
              disabled=not (paper_file and paper_name and exam_type and ANTH_KEY)):
-    client    = anthropic.Anthropic(api_key=ANTH_KEY)
+    client      = anthropic.Anthropic(api_key=ANTH_KEY)
     paper_bytes = paper_file.read()
 
     with st.status("Extracting…", expanded=True) as status:
 
-        # Images
         st.write("📎 Extracting embedded images…")
         images = extract_images(paper_bytes)
         if ms_file:
@@ -335,18 +271,16 @@ if st.button("✨ Extract Questions", type="primary",
             ms_file.seek(0)
         st.write(f"   Found {len(images)} images")
 
-        # Questions — chunked
         st.write("🤖 Sending paper to Claude…")
         try:
             chunks    = split_pdf(paper_bytes, CHUNK_PAGES)
             questions = []
             for i, chunk in enumerate(chunks, 1):
-                offset = (i - 1) * CHUNK_PAGES   # e.g. chunk 2 starts at page 9
-                st.write(f"   Processing chunk {i}/{len(chunks)} (pages {offset+1}–{offset+CHUNK_PAGES})…")
+                offset = (i - 1) * CHUNK_PAGES
+                st.write(f"   Chunk {i}/{len(chunks)} (pages {offset+1}–{offset+CHUNK_PAGES})…")
                 raw  = ask_claude(client, pdf_to_b64(chunk),
                                   QUESTION_PROMPT.format(name=paper_name, etype=exam_type))
                 rows = json.loads(clean_json(raw))
-                # Correct page numbers to absolute PDF pages
                 for q in rows:
                     q["pageNumber"] = (q.get("pageNumber") or 1) + offset
                 questions.extend(rows)
@@ -358,7 +292,6 @@ if st.button("✨ Extract Questions", type="primary",
             st.error(str(e))
             st.stop()
 
-        # Mark scheme — chunked
         ms_map: dict[str, str] = {}
         if ms_file:
             ms_file.seek(0)
@@ -367,7 +300,7 @@ if st.button("✨ Extract Questions", type="primary",
             try:
                 ms_chunks = split_pdf(ms_bytes, CHUNK_PAGES)
                 for i, chunk in enumerate(ms_chunks, 1):
-                    st.write(f"   Processing mark scheme chunk {i}/{len(ms_chunks)}…")
+                    st.write(f"   Mark scheme chunk {i}/{len(ms_chunks)}…")
                     raw_ms = ask_claude(client, pdf_to_b64(chunk), MS_PROMPT)
                     for item in json.loads(clean_json(raw_ms)):
                         ms_map[str(item["questionNumber"]).strip()] = item["markSchemeAnswer"]
@@ -375,26 +308,25 @@ if st.button("✨ Extract Questions", type="primary",
                         time.sleep(5)
                 st.write(f"   Matched {len(ms_map)} mark scheme entries")
             except Exception as e:
-                st.warning(f"⚠️ Mark scheme extraction failed: {e}\nContinuing without mark scheme answers.")
+                st.warning(f"⚠️ Mark scheme failed: {e}")
                 ms_map = {}
 
-        # Merge
         records = []
         for q in questions:
             qnum = str(q.get("questionNumber", "")).strip()
             records.append({
-                "questionNumber":    qnum,
-                "questionText":      q.get("questionText",     ""),
-                "markAllocation":    q.get("markAllocation",   0),
-                "topic":             q.get("topic",            ""),
-                "subtopic":          q.get("subtopic",         ""),
-                "markSchemeAnswer":  ms_map.get(qnum,          ""),
-                "imageDescription":  q.get("imageDescription", ""),
-                "hasImages":         bool(q.get("hasImages", False) or
-                                         any(i["page"] == q.get("pageNumber") for i in images)),
-                "pageNumber":        q.get("pageNumber", 0),
-                "paperName":         paper_name,
-                "examType":          exam_type,
+                "questionNumber":   qnum,
+                "questionText":     q.get("questionText",     ""),
+                "markAllocation":   q.get("markAllocation",   0),
+                "topic":            q.get("topic",            ""),
+                "subtopic":         q.get("subtopic",         ""),
+                "markSchemeAnswer": ms_map.get(qnum,          ""),
+                "imageDescription": q.get("imageDescription", ""),
+                "hasImages":        bool(q.get("hasImages", False) or
+                                        any(i["page"] == q.get("pageNumber") for i in images)),
+                "pageNumber":       q.get("pageNumber", 0),
+                "paperName":        paper_name,
+                "examType":         exam_type,
             })
 
         st.session_state["records"] = records
@@ -403,27 +335,27 @@ if st.button("✨ Extract Questions", type="primary",
 
 # ── Step 3: Review ────────────────────────────────────────────────────────
 if "records" in st.session_state:
+    import pandas as pd
+
     records = st.session_state["records"]
     images  = st.session_state.get("images", [])
 
     st.subheader("3 · Review & edit")
     st.caption("Click any cell to edit before syncing.")
 
-    import pandas as pd
     df = pd.DataFrame([{
-        "Q #":            r["questionNumber"],
-        "Question Text":  r["questionText"],
-        "Marks":          r["markAllocation"],
-        "Topic":          r["topic"],
-        "Subtopic":       r["subtopic"],
-        "Mark Scheme":    r["markSchemeAnswer"],
-        "Image Desc.":    r["imageDescription"],
-        "Has Images":     r["hasImages"],
+        "Q #":           r["questionNumber"],
+        "Question Text": r["questionText"],
+        "Marks":         r["markAllocation"],
+        "Topic":         r["topic"],
+        "Subtopic":      r["subtopic"],
+        "Mark Scheme":   r["markSchemeAnswer"],
+        "Image Desc.":   r["imageDescription"],
+        "Has Images":    r["hasImages"],
     } for r in records])
 
     edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", height=420)
 
-    # Sync back edits
     col_map = {
         "Q #":           "questionNumber",
         "Question Text": "questionText",
@@ -439,7 +371,6 @@ if "records" in st.session_state:
             for col, key in col_map.items():
                 records[i][key] = row[col]
 
-    # Image gallery
     if images:
         with st.expander(f"🖼 Extracted images ({len(images)})"):
             cols = st.columns(4)
@@ -447,18 +378,15 @@ if "records" in st.session_state:
                 with cols[idx % 4]:
                     st.image(img["data"], caption=img["name"], use_container_width=True)
 
-    # Downloads
+    # ── Step 4: Export / Sync ─────────────────────────────────────────────
     st.subheader("4 · Export / Sync")
     dl_col, sync_col = st.columns([1, 2])
 
     with dl_col:
-        # JSON download
         json_bytes = json.dumps(records, indent=2, ensure_ascii=False).encode()
         st.download_button("⬇ Download JSON", data=json_bytes,
                            file_name=f"{paper_name or 'questions'}.json",
                            mime="application/json")
-
-        # Images zip download
         if images:
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w") as zf:
@@ -468,32 +396,95 @@ if "records" in st.session_state:
                                file_name=f"{paper_name or 'images'}_images.zip",
                                mime="application/zip")
 
-
     with sync_col:
         if not (AT_TOKEN and AT_BASE):
             st.warning("Add your Airtable token and Base ID in the sidebar to sync.")
+        elif not AT_TOKEN.startswith("pat"):
+            st.error("❌ Token should start with `pat`. Check secrets.")
+        elif not AT_BASE.startswith("app"):
+            st.error("❌ Base ID should start with `app`. Check secrets.")
         else:
+            token_preview = AT_TOKEN[:8] + "..." + AT_TOKEN[-4:]
+            st.caption(f"Token: `{token_preview}` | Base: `{AT_BASE}` | Table: `{AT_TABLE}`")
+
             if st.button("🚀 Sync to Airtable", type="primary"):
-                # Show exactly what credentials are loaded
-                token_preview = (AT_TOKEN[:8] + "..." + AT_TOKEN[-4:]) if len(AT_TOKEN) > 12 else "(empty)"
-                st.caption(f"Using token: `{token_preview}`  |  Base: `{AT_BASE}`  |  Table: `{AT_TABLE}`")
+                _records  = st.session_state.get("records", [])
+                _images   = st.session_state.get("images",  [])
+                _imgbb    = get_secret("IMGBB_API_KEY")
 
-                if not AT_TOKEN or not AT_TOKEN.startswith("pat"):
-                    st.error("❌ Airtable token looks wrong — it should start with `pat`. "
-                             "Check your Streamlit secrets.")
-                elif not AT_BASE or not AT_BASE.startswith("app"):
-                    st.error("❌ Base ID looks wrong — it should start with `app`. "
-                             "Check your Streamlit secrets.")
-                else:
-                    try:
-                        ensure_table(AT_TOKEN, AT_BASE, AT_TABLE)
+                log_lines = []
+                def log(msg):
+                    log_lines.append(msg)
 
-                        prog = st.progress(0, text="Starting…")
-                        n, id_map = push_to_airtable(AT_TOKEN, AT_BASE, AT_TABLE, records, prog)
-                        st.success(f"✅ {n} records synced!")
+                # 1. Push records
+                id_map = []
+                try:
+                    ensure_table(AT_TOKEN, AT_BASE, AT_TABLE)
+                    url   = f"{AT_API}/{AT_BASE}/{requests.utils.quote(AT_TABLE)}"
+                    total = len(_records)
+                    for i in range(0, total, 10):
+                        chunk = _records[i:i+10]
+                        body  = {"records": [{"fields": {
+                            "Question Number":    str(r.get("questionNumber","")),
+                            "Question Text":      str(r.get("questionText","")),
+                            "Mark Allocation":    int(r["markAllocation"]) if str(r.get("markAllocation","")).lstrip("-").isdigit() else 0,
+                            "Topic":              str(r.get("topic","")),
+                            "Subtopic":           str(r.get("subtopic","")),
+                            "Mark Scheme Answer": str(r.get("markSchemeAnswer","")),
+                            "Image Description":  str(r.get("imageDescription","")),
+                            "Has Images":         bool(r.get("hasImages", False)),
+                            "Paper Name":         str(r.get("paperName","")),
+                            "Exam Type":          str(r.get("examType","")),
+                        }} for r in chunk]}
+                        resp = requests.post(url, headers=at_headers(AT_TOKEN), json=body)
+                        if not resp.ok:
+                            raise RuntimeError(f"Airtable {resp.status_code}: {resp.text[:300]}")
+                        for rec, row in zip(resp.json()["records"], chunk):
+                            id_map.append({
+                                "record_id":        rec["id"],
+                                "hasImages":        row.get("hasImages", False),
+                                "imageDescription": row.get("imageDescription", ""),
+                            })
+                    log(f"✅ {total} records pushed to Airtable")
+                except Exception as e:
+                    log(f"❌ Record sync failed: {e}")
 
+                # 2. Upload images
+                log(f"🖼 Images in memory: {len(_images)}")
+                log(f"🔑 imgbb key: {'set ✅' if _imgbb else 'MISSING ❌'}")
+                log(f"📋 id_map entries: {len(id_map)}")
 
+                if id_map and _images and _imgbb:
+                    img_urls = []
+                    for img in _images:
+                        iurl = upload_to_imgbb(_imgbb, img)
+                        if iurl:
+                            img_urls.append(iurl)
+                            log(f"  ✅ {img['name']} uploaded to imgbb")
+                        else:
+                            log(f"  ❌ {img['name']} failed to upload")
 
-                        st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
-                    except Exception as e:
-                        st.error(f"Sync failed: {e}")
+                    if img_urls:
+                        targets = [m for m in id_map
+                                   if m.get("hasImages") or m.get("imageDescription", "").strip()]
+                        if not targets:
+                            targets = id_map
+                        log(f"📌 Patching {len(targets)} records with {len(img_urls)} image URLs…")
+                        for m in targets:
+                            try:
+                                patch_record_images(AT_TOKEN, AT_BASE, AT_TABLE,
+                                                    m["record_id"], img_urls)
+                                log(f"  ✅ {m['record_id']} patched")
+                            except Exception as e:
+                                log(f"  ❌ {m['record_id']}: {e}")
+                        log(f"✅ Done — {len(img_urls)} images attached to {len(targets)} records")
+                    else:
+                        log("❌ All imgbb uploads failed")
+                elif _images and not _imgbb:
+                    log("⚠️ IMGBB_API_KEY not set — add it to Streamlit secrets")
+                elif not _images:
+                    log("ℹ️ No images were extracted from this PDF")
+
+                # Show full log at once — no mid-run reruns
+                st.text("\n".join(log_lines))
+                st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
