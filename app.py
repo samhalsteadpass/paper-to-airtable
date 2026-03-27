@@ -169,6 +169,15 @@ def ask_claude(client: anthropic.Anthropic, pdf_b64: str, prompt: str) -> str:
 def at_headers(token: str):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
+def get_table_id(token: str, base_id: str, table_name: str) -> str:
+    """Return the tblXXXXXX ID for a given table name."""
+    r = requests.get(f"{AT_META}/bases/{base_id}/tables", headers=at_headers(token))
+    r.raise_for_status()
+    for t in r.json().get("tables", []):
+        if t["name"] == table_name:
+            return t["id"]
+    raise RuntimeError(f"Table '{table_name}' not found in base. Did you create it?")
+
 def ensure_table(token: str, base_id: str, table: str):
     try:
         r = requests.get(f"{AT_META}/bases/{base_id}/tables", headers=at_headers(token))
@@ -241,6 +250,9 @@ def upload_images_to_records(token: str, base_id: str, table: str,
     if not images:
         return 0
 
+    table_id = get_table_id(token, base_id, table)
+    st.write(f"   Resolved table ID: `{table_id}`")
+
     # Prefer records flagged as having images or with an image description
     targets = [m for m in id_map if m.get("hasImages") or m.get("imageDescription", "").strip()]
     if not targets:
@@ -248,7 +260,7 @@ def upload_images_to_records(token: str, base_id: str, table: str,
 
     st.write(f"   Attaching {len(images)} images to {len(targets)} matching records…")
 
-    url_tmpl = f"{AT_CONTENT}/{base_id}/{requests.utils.quote(table)}/{{record_id}}/uploadAttachment"
+    url_tmpl = f"{AT_CONTENT}/{base_id}/{table_id}/{{record_id}}/uploadAttachment"
     headers  = {"Authorization": f"Bearer {token}"}
     total    = len(targets) * len(images)
     uploaded = 0
