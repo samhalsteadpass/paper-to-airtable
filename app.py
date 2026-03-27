@@ -12,7 +12,7 @@ pip / requirements.txt:
     streamlit anthropic pymupdf pillow requests
 """
 
-import io, json, re, base64, zipfile
+import io, json, re, base64, zipfile, time
 from pathlib import Path
 
 import streamlit as st
@@ -24,6 +24,9 @@ from PIL import Image
 # ── Config ────────────────────────────────────────────────────────────────
 MODEL      = "claude-sonnet-4-6"
 MAX_TOKENS = 8000
+CHUNK_PAGES = 8        # pages per Claude call — reduce to 4 if still rate-limiting
+MAX_RETRIES = 4        # number of retries on rate limit
+RETRY_DELAY = 20       # seconds between retries
 AT_API     = "https://api.airtable.com/v0"
 AT_META    = "https://api.airtable.com/v0/meta"
 
@@ -114,28 +117,52 @@ Each element:
 }}
 """
 
+def split_pdf(pdf_bytes: bytes, chunk_size: int) -> list[bytes]:
+    """Split a PDF into chunks of chunk_size pages, return list of PDF bytes."""
+    doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total  = len(doc)
+    chunks = []
+    for start in range(0, total, chunk_size):
+        writer = fitz.open()
+        writer.insert_pdf(doc, from_page=start, to_page=min(start + chunk_size, total) - 1)
+        buf = io.BytesIO()
+        writer.save(buf)
+        chunks.append(buf.getvalue())
+        writer.close()
+    doc.close()
+    return chunks
+
 def ask_claude(client: anthropic.Anthropic, pdf_b64: str, prompt: str) -> str:
-    try:
-        r = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            messages=[{"role": "user", "content": [
-                {"type": "document",
-                 "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
-                {"type": "text", "text": prompt},
-            ]}],
-        )
-        return "".join(b.text for b in r.content if b.type == "text")
-    except anthropic.AuthenticationError:
-        raise RuntimeError("❌ Invalid Anthropic API key. Check your ANTHROPIC_API_KEY secret.")
-    except anthropic.PermissionDeniedError:
-        raise RuntimeError("❌ Anthropic API key doesn't have permission. Check it's active at console.anthropic.com.")
-    except anthropic.RateLimitError:
-        raise RuntimeError("❌ Anthropic rate limit hit. Wait a moment and try again.")
-    except anthropic.BadRequestError as e:
-        raise RuntimeError(f"❌ Bad request to Claude (PDF may be too large or malformed): {e}")
-    except anthropic.APIStatusError as e:
-        raise RuntimeError(f"❌ Anthropic API error {e.status_code}: {e.message}")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                messages=[{"role": "user", "content": [
+                    {"type": "document",
+                     "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+                    {"type": "text", "text": prompt},
+                ]}],
+            )
+            return "".join(b.text for b in r.content if b.type == "text")
+        except anthropic.RateLimitError:
+            if attempt == MAX_RETRIES:
+                raise RuntimeError(
+                    f"❌ Rate limit hit after {MAX_RETRIES} retries. "
+                    "Your Anthropic account may need a higher tier — see console.anthropic.com/settings/limits. "
+                    "You can also reduce CHUNK_PAGES in app.py."
+                )
+            wait = RETRY_DELAY * attempt
+            st.toast(f"Rate limit hit — waiting {wait}s before retry {attempt}/{MAX_RETRIES - 1}…")
+            time.sleep(wait)
+        except anthropic.AuthenticationError:
+            raise RuntimeError("❌ Invalid Anthropic API key. Check your ANTHROPIC_API_KEY secret.")
+        except anthropic.PermissionDeniedError:
+            raise RuntimeError("❌ Anthropic API key doesn't have permission. Check it's active at console.anthropic.com.")
+        except anthropic.BadRequestError as e:
+            raise RuntimeError(f"❌ Bad request to Claude (PDF may be too large or malformed): {e}")
+        except anthropic.APIStatusError as e:
+            raise RuntimeError(f"❌ Anthropic API error {e.status_code}: {e.message}")
 
 # ── Airtable ──────────────────────────────────────────────────────────────
 def at_headers(token: str):
@@ -262,27 +289,39 @@ if st.button("✨ Extract Questions", type="primary",
             ms_file.seek(0)
         st.write(f"   Found {len(images)} images")
 
-        # Questions
+        # Questions — chunked
         st.write("🤖 Sending paper to Claude…")
         try:
-            raw_qs = ask_claude(client, pdf_to_b64(paper_bytes),
-                                QUESTION_PROMPT.format(name=paper_name, etype=exam_type))
-            questions = json.loads(clean_json(raw_qs))
+            chunks   = split_pdf(paper_bytes, CHUNK_PAGES)
+            questions = []
+            for i, chunk in enumerate(chunks, 1):
+                st.write(f"   Processing chunk {i}/{len(chunks)} ({CHUNK_PAGES} pages)…")
+                raw = ask_claude(client, pdf_to_b64(chunk),
+                                 QUESTION_PROMPT.format(name=paper_name, etype=exam_type))
+                questions.extend(json.loads(clean_json(raw)))
+                if i < len(chunks):
+                    time.sleep(5)   # brief pause between chunks
             st.write(f"   Extracted {len(questions)} questions")
         except Exception as e:
             status.update(label="Extraction failed", state="error")
             st.error(str(e))
             st.stop()
 
-        # Mark scheme
+        # Mark scheme — chunked
         ms_map: dict[str, str] = {}
         if ms_file:
             ms_file.seek(0)
+            ms_bytes = ms_file.read()
             st.write("🤖 Sending mark scheme to Claude…")
             try:
-                raw_ms = ask_claude(client, pdf_to_b64(ms_file.read()), MS_PROMPT)
-                for item in json.loads(clean_json(raw_ms)):
-                    ms_map[str(item["questionNumber"]).strip()] = item["markSchemeAnswer"]
+                ms_chunks = split_pdf(ms_bytes, CHUNK_PAGES)
+                for i, chunk in enumerate(ms_chunks, 1):
+                    st.write(f"   Processing mark scheme chunk {i}/{len(ms_chunks)}…")
+                    raw_ms = ask_claude(client, pdf_to_b64(chunk), MS_PROMPT)
+                    for item in json.loads(clean_json(raw_ms)):
+                        ms_map[str(item["questionNumber"]).strip()] = item["markSchemeAnswer"]
+                    if i < len(ms_chunks):
+                        time.sleep(5)
                 st.write(f"   Matched {len(ms_map)} mark scheme entries")
             except Exception as e:
                 st.warning(f"⚠️ Mark scheme extraction failed: {e}\nContinuing without mark scheme answers.")
