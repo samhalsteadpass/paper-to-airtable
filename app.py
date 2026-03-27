@@ -131,24 +131,31 @@ def at_headers(token: str):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 def ensure_table(token: str, base_id: str, table: str):
-    r = requests.get(f"{AT_META}/bases/{base_id}/tables", headers=at_headers(token))
-    r.raise_for_status()
-    if table in [t["name"] for t in r.json().get("tables", [])]:
-        return
-    fields = []
-    for name, ftype in AT_FIELDS:
-        if ftype == "number":
-            fields.append({"name": name, "type": "number", "options": {"precision": 0}})
-        elif ftype == "checkbox":
-            fields.append({"name": name, "type": "checkbox",
-                           "options": {"icon": "check", "color": "greenBright"}})
-        else:
-            fields.append({"name": name, "type": ftype})
-    r2 = requests.post(f"{AT_META}/bases/{base_id}/tables",
-                       headers=at_headers(token),
-                       json={"name": table, "fields": fields})
-    if not r2.ok:
-        st.warning(f"Could not auto-create table ({r2.status_code}). Create it manually — see field list in the sidebar.")
+    try:
+        r = requests.get(f"{AT_META}/bases/{base_id}/tables", headers=at_headers(token))
+        if r.status_code == 401:
+            st.info("ℹ️ Skipping auto table-creation (token lacks schema.bases:write scope). "
+                    "Make sure the table and fields exist manually — see the sidebar for the field list.")
+            return
+        r.raise_for_status()
+        if table in [t["name"] for t in r.json().get("tables", [])]:
+            return
+        fields = []
+        for name, ftype in AT_FIELDS:
+            if ftype == "number":
+                fields.append({"name": name, "type": "number", "options": {"precision": 0}})
+            elif ftype == "checkbox":
+                fields.append({"name": name, "type": "checkbox",
+                               "options": {"icon": "check", "color": "greenBright"}})
+            else:
+                fields.append({"name": name, "type": ftype})
+        r2 = requests.post(f"{AT_META}/bases/{base_id}/tables",
+                           headers=at_headers(token),
+                           json={"name": table, "fields": fields})
+        if not r2.ok:
+            st.warning(f"Could not auto-create table ({r2.status_code}). Create it manually — see field list in the sidebar.")
+    except Exception as e:
+        st.warning(f"Table check skipped: {e}")
 
 def push_to_airtable(token: str, base_id: str, table: str,
                      records: list[dict], progress) -> int:
