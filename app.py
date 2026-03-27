@@ -222,7 +222,10 @@ def push_to_airtable(token: str, base_id: str, table: str,
         if not resp.ok:
             raise RuntimeError(f"Airtable {resp.status_code}: {resp.text[:300]}")
         for rec, row in zip(resp.json()["records"], chunk):
-            id_map.append({"record_id": rec["id"], "pageNumber": row.get("pageNumber", 0)})
+            id_map.append({
+                "record_id": rec["id"],
+                "hasImages": row.get("hasImages", False),
+            })
         pushed += len(chunk)
         progress.progress(pushed / total, text=f"Syncing records… {pushed}/{total}")
 
@@ -234,30 +237,23 @@ AT_CONTENT = "https://content.airtable.com/v0"
 def upload_images_to_records(token: str, base_id: str, table: str,
                               id_map: list[dict], images: list[dict],
                               progress, errors: list):
-    """Upload extracted images to their matching Airtable records."""
-    page_imgs: dict[int, list[dict]] = {}
-    for img in images:
-        page_imgs.setdefault(img["page"], []).append(img)
-
-    records_with_images = [(m, page_imgs[m["pageNumber"]])
-                           for m in id_map if m["pageNumber"] in page_imgs]
-
-    if not records_with_images:
-        errors.append(
-            f"⚠️ No page matches found. "
-            f"Image pages: {sorted(page_imgs.keys())} | "
-            f"Record pages: {sorted(set(m['pageNumber'] for m in id_map))}"
-        )
+    """Attach all images to every record flagged hasImages=True."""
+    if not images:
         return 0
 
-    uploaded = 0
-    total    = sum(len(imgs) for _, imgs in records_with_images)
+    targets = [m for m in id_map if m.get("hasImages")]
+    if not targets:
+        # Fallback: attach to every record
+        targets = id_map
+
     url_tmpl = f"{AT_CONTENT}/{base_id}/{{record_id}}/uploadAttachment"
     headers  = {"Authorization": f"Bearer {token}"}
+    total    = len(targets) * len(images)
+    uploaded = 0
 
-    for mapping, imgs in records_with_images:
+    for mapping in targets:
         rid = mapping["record_id"]
-        for img in imgs:
+        for img in images:
             ext  = Path(img["name"]).suffix.lstrip(".")
             mime = "image/png" if ext == "png" else f"image/{ext}"
             resp = requests.post(
@@ -268,11 +264,11 @@ def upload_images_to_records(token: str, base_id: str, table: str,
                 params={"fieldName": "Images"},
             )
             if not resp.ok:
-                errors.append(f"⚠️ {img['name']}: {resp.status_code} — {resp.text[:200]}")
+                errors.append(f"⚠️ {img['name']} → {rid}: {resp.status_code} — {resp.text[:200]}")
             else:
                 uploaded += 1
             progress.progress(
-                (uploaded + len(errors)) / total,
+                (uploaded + len(errors)) / max(total, 1),
                 text=f"Uploading images… {uploaded}/{total}"
             )
     return uploaded
