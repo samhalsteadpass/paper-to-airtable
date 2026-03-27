@@ -313,7 +313,9 @@ if st.button("✨ Extract Questions", type="primary",
 
         records = []
         for q in questions:
-            qnum = str(q.get("questionNumber", "")).strip()
+            qnum      = str(q.get("questionNumber", "")).strip()
+            page      = q.get("pageNumber") or 1
+            chunk_idx = (page - 1) // CHUNK_PAGES   # which chunk this question came from
             records.append({
                 "questionNumber":   qnum,
                 "questionText":     q.get("questionText",     ""),
@@ -323,8 +325,9 @@ if st.button("✨ Extract Questions", type="primary",
                 "markSchemeAnswer": ms_map.get(qnum,          ""),
                 "imageDescription": q.get("imageDescription", ""),
                 "hasImages":        bool(q.get("hasImages", False) or
-                                        any(i["page"] == q.get("pageNumber") for i in images)),
-                "pageNumber":       q.get("pageNumber", 0),
+                                        any(i["page"] == page for i in images)),
+                "pageNumber":       page,
+                "chunkIdx":         chunk_idx,
                 "paperName":        paper_name,
                 "examType":         exam_type,
             })
@@ -444,6 +447,7 @@ if "records" in st.session_state:
                                 "record_id":        rec["id"],
                                 "hasImages":        row.get("hasImages", False),
                                 "imageDescription": row.get("imageDescription", ""),
+                                "chunkIdx":         row.get("chunkIdx", 0),
                             })
                     log(f"✅ {total} records pushed to Airtable")
                 except Exception as e:
@@ -455,29 +459,33 @@ if "records" in st.session_state:
                 log(f"📋 id_map entries: {len(id_map)}")
 
                 if id_map and _images and _imgbb:
-                    img_urls = []
+                    # Group images by chunk (each chunk = CHUNK_PAGES pages)
+                    chunk_img_urls: dict[int, list[str]] = {}
                     for img in _images:
+                        cidx = (img["page"] - 1) // CHUNK_PAGES
                         iurl = upload_to_imgbb(_imgbb, img)
                         if iurl:
-                            img_urls.append(iurl)
-                            log(f"  ✅ {img['name']} uploaded to imgbb")
+                            chunk_img_urls.setdefault(cidx, []).append(iurl)
+                            log(f"  ✅ {img['name']} (chunk {cidx}) uploaded")
                         else:
                             log(f"  ❌ {img['name']} failed to upload")
 
-                    if img_urls:
-                        targets = [m for m in id_map
-                                   if m.get("hasImages") or m.get("imageDescription", "").strip()]
-                        if not targets:
-                            targets = id_map
-                        log(f"📌 Patching {len(targets)} records with {len(img_urls)} image URLs…")
-                        for m in targets:
+                    if chunk_img_urls:
+                        patched = 0
+                        for m in id_map:
+                            if not (m.get("hasImages") or m.get("imageDescription","").strip()):
+                                continue
+                            cidx     = m.get("chunkIdx", 0)
+                            urls     = chunk_img_urls.get(cidx, [])
+                            if not urls:
+                                continue
                             try:
                                 patch_record_images(AT_TOKEN, AT_BASE, AT_TABLE,
-                                                    m["record_id"], img_urls)
-                                log(f"  ✅ {m['record_id']} patched")
+                                                    m["record_id"], urls)
+                                patched += 1
                             except Exception as e:
                                 log(f"  ❌ {m['record_id']}: {e}")
-                        log(f"✅ Done — {len(img_urls)} images attached to {len(targets)} records")
+                        log(f"✅ Images attached to {patched} records")
                     else:
                         log("❌ All imgbb uploads failed")
                 elif _images and not _imgbb:
