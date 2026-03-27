@@ -421,11 +421,22 @@ if "records" in st.session_state:
             st.warning("Add your Airtable token and Base ID in the sidebar to sync.")
         else:
             if st.button("🚀 Sync to Airtable", type="primary"):
-                try:
-                    ensure_table(AT_TOKEN, AT_BASE, AT_TABLE)
-                    prog = st.progress(0, text="Starting…")
-                    n = push_to_airtable(AT_TOKEN, AT_BASE, AT_TABLE, records, prog)
-                    st.success(f"✅ {n} records synced to Airtable!")
-                    st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
-                except Exception as e:
-                    st.error(f"Sync failed: {e}")
+                # Show exactly what credentials are loaded
+                token_preview = (AT_TOKEN[:8] + "..." + AT_TOKEN[-4:]) if len(AT_TOKEN) > 12 else "(empty)"
+                st.caption(f"Using token: `{token_preview}`  |  Base: `{AT_BASE}`  |  Table: `{AT_TABLE}`")
+
+                if not AT_TOKEN or not AT_TOKEN.startswith("pat"):
+                    st.error("❌ Airtable token looks wrong — it should start with `pat`. "
+                             "Check your Streamlit secrets.")
+                elif not AT_BASE or not AT_BASE.startswith("app"):
+                    st.error("❌ Base ID looks wrong — it should start with `app`. "
+                             "Check your Streamlit secrets.")
+                else:
+                    try:
+                        ensure_table(AT_TOKEN, AT_BASE, AT_TABLE)
+                        prog = st.progress(0, text="Starting…")
+                        n = push_to_airtable(AT_TOKEN, AT_BASE, AT_TABLE, records, prog)
+                        st.success(f"✅ {n} records synced to Airtable!")
+                        st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
+                    except Exception as e:
+                        st.error(f"Sync failed: {e}")
