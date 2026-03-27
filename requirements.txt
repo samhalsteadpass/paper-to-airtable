@@ -1,0 +1,6 @@
+streamlit
+anthropic
+pymupdf
+pillow
+requests
+pandas
