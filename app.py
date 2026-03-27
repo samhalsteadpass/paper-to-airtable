@@ -169,15 +169,6 @@ def ask_claude(client: anthropic.Anthropic, pdf_b64: str, prompt: str) -> str:
 def at_headers(token: str):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-def get_table_id(token: str, base_id: str, table_name: str) -> str:
-    """Return the tblXXXXXX ID for a given table name."""
-    r = requests.get(f"{AT_META}/bases/{base_id}/tables", headers=at_headers(token))
-    r.raise_for_status()
-    for t in r.json().get("tables", []):
-        if t["name"] == table_name:
-            return t["id"]
-    raise RuntimeError(f"Table '{table_name}' not found in base. Did you create it?")
-
 def ensure_table(token: str, base_id: str, table: str):
     try:
         r = requests.get(f"{AT_META}/bases/{base_id}/tables", headers=at_headers(token))
@@ -242,55 +233,7 @@ def push_to_airtable(token: str, base_id: str, table: str,
     return pushed, id_map
 
 
-AT_CONTENT = "https://content.airtable.com/v0"
 
-def upload_images_to_records(token: str, base_id: str, table: str,
-                              id_map: list[dict], images: list[dict],
-                              progress, errors: list):
-    if not images:
-        return 0
-
-    table_id = get_table_id(token, base_id, table)
-    st.write(f"   Resolved table ID: `{table_id}`")
-
-    # Prefer records flagged as having images or with an image description
-    targets = [m for m in id_map if m.get("hasImages") or m.get("imageDescription", "").strip()]
-    if not targets:
-        targets = id_map   # fallback: attach to all records
-
-    st.write(f"   Attaching {len(images)} images to {len(targets)} matching records…")
-
-    url_tmpl = f"{AT_CONTENT}/{base_id}/{table_id}/{{record_id}}/uploadAttachment"
-    headers  = {"Authorization": f"Bearer {token}"}
-    total    = len(targets) * len(images)
-    uploaded = 0
-
-    for mapping in targets:
-        rid = mapping["record_id"]
-        for img in images:
-            ext  = Path(img["name"]).suffix.lstrip(".")
-            mime = "image/png" if ext == "png" else f"image/{ext}"
-            resp = requests.post(
-                url_tmpl.format(record_id=rid),
-                headers=headers,
-                files={
-                    "file":        (img["name"], img["data"], mime),
-                    "fieldName":   (None, "Images"),
-                    "contentType": (None, mime),
-                },
-            )
-            if not resp.ok:
-                err_msg = f"⚠️ {img['name']} → {rid}: {resp.status_code} — {resp.text[:200]}"
-                errors.append(err_msg)
-                if len(errors) <= 3:   # only show first 3 to avoid flooding
-                    st.warning(err_msg)
-            else:
-                uploaded += 1
-            progress.progress(
-                (uploaded + len(errors)) / max(total, 1),
-                text=f"Uploading images… {uploaded}/{total}"
-            )
-    return uploaded
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────
 st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
@@ -492,6 +435,13 @@ if "records" in st.session_state:
             st.download_button("⬇ Download Images (.zip)", data=buf.getvalue(),
                                file_name=f"{paper_name or 'images'}_images.zip",
                                mime="application/zip")
+            st.info(
+                f"📎 **{len(images)} images extracted.**\n\n"
+                "Download the zip above — images are named by page (e.g. `p4_img1.png`) "
+                "so you can match them to questions manually in Airtable using the "
+                "**Image Description** field as a guide.",
+                icon="💡"
+            )
 
     with sync_col:
         if not (AT_TOKEN and AT_BASE):
@@ -516,20 +466,7 @@ if "records" in st.session_state:
                         n, id_map = push_to_airtable(AT_TOKEN, AT_BASE, AT_TABLE, records, prog)
                         st.success(f"✅ {n} records synced!")
 
-                        if images:
-                            st.write("⏳ Waiting for records to propagate…")
-                            time.sleep(5)
-                            img_prog  = st.progress(0, text="Uploading images…")
-                            errors    = []
-                            n_imgs    = upload_images_to_records(
-                                AT_TOKEN, AT_BASE, AT_TABLE, id_map, images, img_prog, errors)
-                            if errors:
-                                for e in errors[:5]:
-                                    st.warning(e)
-                            if n_imgs:
-                                st.success(f"✅ {n_imgs} images attached!")
-                            else:
-                                st.error("❌ 0 images attached — see warnings above for details.")
+
 
                         st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
                     except Exception as e:
