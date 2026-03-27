@@ -223,8 +223,9 @@ def push_to_airtable(token: str, base_id: str, table: str,
             raise RuntimeError(f"Airtable {resp.status_code}: {resp.text[:300]}")
         for rec, row in zip(resp.json()["records"], chunk):
             id_map.append({
-                "record_id": rec["id"],
-                "hasImages": row.get("hasImages", False),
+                "record_id":        rec["id"],
+                "hasImages":        row.get("hasImages", False),
+                "imageDescription": row.get("imageDescription", ""),
             })
         pushed += len(chunk)
         progress.progress(pushed / total, text=f"Syncing records… {pushed}/{total}")
@@ -237,14 +238,15 @@ AT_CONTENT = "https://content.airtable.com/v0"
 def upload_images_to_records(token: str, base_id: str, table: str,
                               id_map: list[dict], images: list[dict],
                               progress, errors: list):
-    """Attach all images to every record flagged hasImages=True."""
     if not images:
         return 0
 
-    targets = [m for m in id_map if m.get("hasImages")]
+    # Prefer records flagged as having images or with an image description
+    targets = [m for m in id_map if m.get("hasImages") or m.get("imageDescription", "").strip()]
     if not targets:
-        # Fallback: attach to every record
-        targets = id_map
+        targets = id_map   # fallback: attach to all records
+
+    st.write(f"   Attaching {len(images)} images to {len(targets)} matching records…")
 
     url_tmpl = f"{AT_CONTENT}/{base_id}/{{record_id}}/uploadAttachment"
     headers  = {"Authorization": f"Bearer {token}"}
@@ -260,15 +262,16 @@ def upload_images_to_records(token: str, base_id: str, table: str,
                 url_tmpl.format(record_id=rid),
                 headers=headers,
                 files={
-                    "file":      (img["name"], img["data"], mime),
-                    "fieldName": (None, "Images"),
+                    "file":        (img["name"], img["data"], mime),
+                    "fieldName":   (None, "Images"),
                     "contentType": (None, mime),
                 },
             )
             if not resp.ok:
                 err_msg = f"⚠️ {img['name']} → {rid}: {resp.status_code} — {resp.text[:200]}"
                 errors.append(err_msg)
-                st.warning(err_msg)   # surface immediately
+                if len(errors) <= 3:   # only show first 3 to avoid flooding
+                    st.warning(err_msg)
             else:
                 uploaded += 1
             progress.progress(
@@ -502,6 +505,8 @@ if "records" in st.session_state:
                         st.success(f"✅ {n} records synced!")
 
                         if images:
+                            st.write("⏳ Waiting for records to propagate…")
+                            time.sleep(5)
                             img_prog  = st.progress(0, text="Uploading images…")
                             errors    = []
                             n_imgs    = upload_images_to_records(
