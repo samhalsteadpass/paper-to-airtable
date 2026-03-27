@@ -39,6 +39,7 @@ AT_FIELDS = [
     ("Mark Scheme Answer", "multilineText"),
     ("Image Description",  "multilineText"),
     ("Has Images",         "checkbox"),
+    ("Images",             "multipleAttachments"),
     ("Paper Name",         "singleLineText"),
     ("Exam Type",          "singleLineText"),
 ]
@@ -196,10 +197,13 @@ def ensure_table(token: str, base_id: str, table: str):
         st.warning(f"Table check skipped: {e}")
 
 def push_to_airtable(token: str, base_id: str, table: str,
-                     records: list[dict], progress) -> int:
-    url   = f"{AT_API}/{base_id}/{requests.utils.quote(table)}"
-    total = len(records)
+                     records: list[dict], progress) -> tuple[int, list[dict]]:
+    """Push records, return (count, [{record_id, pageNumber}])"""
+    url    = f"{AT_API}/{base_id}/{requests.utils.quote(table)}"
+    total  = len(records)
     pushed = 0
+    id_map = []   # [{record_id, pageNumber}]
+
     for i in range(0, total, 10):
         chunk = records[i:i+10]
         body  = {"records": [{"fields": {
@@ -217,9 +221,55 @@ def push_to_airtable(token: str, base_id: str, table: str,
         resp = requests.post(url, headers=at_headers(token), json=body)
         if not resp.ok:
             raise RuntimeError(f"Airtable {resp.status_code}: {resp.text[:300]}")
+        for rec, row in zip(resp.json()["records"], chunk):
+            id_map.append({"record_id": rec["id"], "pageNumber": row.get("pageNumber", 0)})
         pushed += len(chunk)
-        progress.progress(pushed / total, text=f"Syncing… {pushed}/{total}")
-    return pushed
+        progress.progress(pushed / total, text=f"Syncing records… {pushed}/{total}")
+
+    return pushed, id_map
+
+
+AT_CONTENT = "https://content.airtable.com/v0"
+
+def upload_images_to_records(token: str, base_id: str, table: str,
+                              id_map: list[dict], images: list[dict], progress):
+    """Upload extracted images to their matching Airtable records."""
+    # Build page → images lookup
+    page_imgs: dict[int, list[dict]] = {}
+    for img in images:
+        page_imgs.setdefault(img["page"], []).append(img)
+
+    records_with_images = [(m, page_imgs[m["pageNumber"]])
+                           for m in id_map if m["pageNumber"] in page_imgs]
+    if not records_with_images:
+        return 0
+
+    uploaded = 0
+    total    = sum(len(imgs) for _, imgs in records_with_images)
+    url_tmpl = f"{AT_CONTENT}/{base_id}/{{record_id}}/uploadAttachment"
+
+    # Auth header only — no Content-Type, requests sets it for multipart
+    headers  = {"Authorization": f"Bearer {token}"}
+
+    for mapping, imgs in records_with_images:
+        rid = mapping["record_id"]
+        for img in imgs:
+            ext       = Path(img["name"]).suffix.lstrip(".")
+            mime      = "image/png" if ext == "png" else f"image/{ext}"
+            resp = requests.post(
+                url_tmpl.format(record_id=rid),
+                headers=headers,
+                data={"contentType": mime},
+                files={"file": (img["name"], img["data"], mime)},
+                params={"fieldName": "Images"},
+            )
+            if not resp.ok:
+                st.warning(f"⚠️ Could not upload {img['name']}: {resp.status_code} {resp.text[:120]}")
+            else:
+                uploaded += 1
+            progress.progress(uploaded / total,
+                              text=f"Uploading images… {uploaded}/{total}")
+    return uploaded
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────
 st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
@@ -341,6 +391,7 @@ if st.button("✨ Extract Questions", type="primary",
                 "imageDescription":  q.get("imageDescription", ""),
                 "hasImages":         bool(q.get("hasImages", False) or
                                          any(i["page"] == q.get("pageNumber") for i in images)),
+                "pageNumber":        q.get("pageNumber", 0),
                 "paperName":         paper_name,
                 "examType":          exam_type,
             })
@@ -434,9 +485,18 @@ if "records" in st.session_state:
                 else:
                     try:
                         ensure_table(AT_TOKEN, AT_BASE, AT_TABLE)
+
                         prog = st.progress(0, text="Starting…")
-                        n = push_to_airtable(AT_TOKEN, AT_BASE, AT_TABLE, records, prog)
-                        st.success(f"✅ {n} records synced to Airtable!")
+                        n, id_map = push_to_airtable(AT_TOKEN, AT_BASE, AT_TABLE, records, prog)
+                        st.success(f"✅ {n} records synced!")
+
+                        if images:
+                            st.write(f"📎 Uploading {len(images)} images to Airtable…")
+                            img_prog = st.progress(0, text="Uploading images…")
+                            n_imgs = upload_images_to_records(
+                                AT_TOKEN, AT_BASE, AT_TABLE, id_map, images, img_prog)
+                            st.success(f"✅ {n_imgs} images attached!")
+
                         st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
                     except Exception as e:
                         st.error(f"Sync failed: {e}")
