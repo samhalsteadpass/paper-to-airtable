@@ -232,30 +232,34 @@ def push_to_airtable(token: str, base_id: str, table: str,
 AT_CONTENT = "https://content.airtable.com/v0"
 
 def upload_images_to_records(token: str, base_id: str, table: str,
-                              id_map: list[dict], images: list[dict], progress):
+                              id_map: list[dict], images: list[dict],
+                              progress, errors: list):
     """Upload extracted images to their matching Airtable records."""
-    # Build page → images lookup
     page_imgs: dict[int, list[dict]] = {}
     for img in images:
         page_imgs.setdefault(img["page"], []).append(img)
 
     records_with_images = [(m, page_imgs[m["pageNumber"]])
                            for m in id_map if m["pageNumber"] in page_imgs]
+
     if not records_with_images:
+        errors.append(
+            f"⚠️ No page matches found. "
+            f"Image pages: {sorted(page_imgs.keys())} | "
+            f"Record pages: {sorted(set(m['pageNumber'] for m in id_map))}"
+        )
         return 0
 
     uploaded = 0
     total    = sum(len(imgs) for _, imgs in records_with_images)
     url_tmpl = f"{AT_CONTENT}/{base_id}/{{record_id}}/uploadAttachment"
-
-    # Auth header only — no Content-Type, requests sets it for multipart
     headers  = {"Authorization": f"Bearer {token}"}
 
     for mapping, imgs in records_with_images:
         rid = mapping["record_id"]
         for img in imgs:
-            ext       = Path(img["name"]).suffix.lstrip(".")
-            mime      = "image/png" if ext == "png" else f"image/{ext}"
+            ext  = Path(img["name"]).suffix.lstrip(".")
+            mime = "image/png" if ext == "png" else f"image/{ext}"
             resp = requests.post(
                 url_tmpl.format(record_id=rid),
                 headers=headers,
@@ -264,11 +268,13 @@ def upload_images_to_records(token: str, base_id: str, table: str,
                 params={"fieldName": "Images"},
             )
             if not resp.ok:
-                st.warning(f"⚠️ Could not upload {img['name']}: {resp.status_code} {resp.text[:120]}")
+                errors.append(f"⚠️ {img['name']}: {resp.status_code} — {resp.text[:200]}")
             else:
                 uploaded += 1
-            progress.progress(uploaded / total,
-                              text=f"Uploading images… {uploaded}/{total}")
+            progress.progress(
+                (uploaded + len(errors)) / total,
+                text=f"Uploading images… {uploaded}/{total}"
+            )
     return uploaded
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────
@@ -342,15 +348,20 @@ if st.button("✨ Extract Questions", type="primary",
         # Questions — chunked
         st.write("🤖 Sending paper to Claude…")
         try:
-            chunks   = split_pdf(paper_bytes, CHUNK_PAGES)
+            chunks    = split_pdf(paper_bytes, CHUNK_PAGES)
             questions = []
             for i, chunk in enumerate(chunks, 1):
-                st.write(f"   Processing chunk {i}/{len(chunks)} ({CHUNK_PAGES} pages)…")
-                raw = ask_claude(client, pdf_to_b64(chunk),
-                                 QUESTION_PROMPT.format(name=paper_name, etype=exam_type))
-                questions.extend(json.loads(clean_json(raw)))
+                offset = (i - 1) * CHUNK_PAGES   # e.g. chunk 2 starts at page 9
+                st.write(f"   Processing chunk {i}/{len(chunks)} (pages {offset+1}–{offset+CHUNK_PAGES})…")
+                raw  = ask_claude(client, pdf_to_b64(chunk),
+                                  QUESTION_PROMPT.format(name=paper_name, etype=exam_type))
+                rows = json.loads(clean_json(raw))
+                # Correct page numbers to absolute PDF pages
+                for q in rows:
+                    q["pageNumber"] = (q.get("pageNumber") or 1) + offset
+                questions.extend(rows)
                 if i < len(chunks):
-                    time.sleep(5)   # brief pause between chunks
+                    time.sleep(5)
             st.write(f"   Extracted {len(questions)} questions")
         except Exception as e:
             status.update(label="Extraction failed", state="error")
@@ -491,11 +502,17 @@ if "records" in st.session_state:
                         st.success(f"✅ {n} records synced!")
 
                         if images:
-                            st.write(f"📎 Uploading {len(images)} images to Airtable…")
-                            img_prog = st.progress(0, text="Uploading images…")
-                            n_imgs = upload_images_to_records(
-                                AT_TOKEN, AT_BASE, AT_TABLE, id_map, images, img_prog)
-                            st.success(f"✅ {n_imgs} images attached!")
+                            img_prog  = st.progress(0, text="Uploading images…")
+                            errors    = []
+                            n_imgs    = upload_images_to_records(
+                                AT_TOKEN, AT_BASE, AT_TABLE, id_map, images, img_prog, errors)
+                            if errors:
+                                for e in errors[:5]:
+                                    st.warning(e)
+                            if n_imgs:
+                                st.success(f"✅ {n_imgs} images attached!")
+                            else:
+                                st.error("❌ 0 images attached — see warnings above for details.")
 
                         st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
                     except Exception as e:
