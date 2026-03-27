@@ -259,12 +259,16 @@ def upload_images_to_records(token: str, base_id: str, table: str,
             resp = requests.post(
                 url_tmpl.format(record_id=rid),
                 headers=headers,
-                data={"contentType": mime},
-                files={"file": (img["name"], img["data"], mime)},
-                params={"fieldName": "Images"},
+                files={
+                    "file":      (img["name"], img["data"], mime),
+                    "fieldName": (None, "Images"),
+                    "contentType": (None, mime),
+                },
             )
             if not resp.ok:
-                errors.append(f"⚠️ {img['name']} → {rid}: {resp.status_code} — {resp.text[:200]}")
+                err_msg = f"⚠️ {img['name']} → {rid}: {resp.status_code} — {resp.text[:200]}"
+                errors.append(err_msg)
+                st.warning(err_msg)   # surface immediately
             else:
                 uploaded += 1
             progress.progress(
