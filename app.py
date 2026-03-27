@@ -248,7 +248,7 @@ def upload_images_to_records(token: str, base_id: str, table: str,
 
     st.write(f"   Attaching {len(images)} images to {len(targets)} matching records…")
 
-    url_tmpl = f"{AT_CONTENT}/{base_id}/{{record_id}}/uploadAttachment"
+    url_tmpl = f"{AT_CONTENT}/{base_id}/{requests.utils.quote(table)}/{{record_id}}/uploadAttachment"
     headers  = {"Authorization": f"Bearer {token}"}
     total    = len(targets) * len(images)
     uploaded = 0
