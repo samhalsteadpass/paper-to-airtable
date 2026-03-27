@@ -22,7 +22,7 @@ import fitz          # PyMuPDF
 from PIL import Image
 
 # ── Config ────────────────────────────────────────────────────────────────
-MODEL      = "claude-opus-4-5-20251101"
+MODEL      = "claude-sonnet-4-6"
 MAX_TOKENS = 8000
 AT_API     = "https://api.airtable.com/v0"
 AT_META    = "https://api.airtable.com/v0/meta"
@@ -256,10 +256,14 @@ if st.button("✨ Extract Questions", type="primary",
         if ms_file:
             ms_file.seek(0)
             st.write("🤖 Sending mark scheme to Claude…")
-            raw_ms = ask_claude(client, pdf_to_b64(ms_file.read()), MS_PROMPT)
-            for item in json.loads(clean_json(raw_ms)):
-                ms_map[str(item["questionNumber"]).strip()] = item["markSchemeAnswer"]
-            st.write(f"   Matched {len(ms_map)} mark scheme entries")
+            try:
+                raw_ms = ask_claude(client, pdf_to_b64(ms_file.read()), MS_PROMPT)
+                for item in json.loads(clean_json(raw_ms)):
+                    ms_map[str(item["questionNumber"]).strip()] = item["markSchemeAnswer"]
+                st.write(f"   Matched {len(ms_map)} mark scheme entries")
+            except Exception as e:
+                st.warning(f"⚠️ Mark scheme extraction failed: {e}\nContinuing without mark scheme answers.")
+                ms_map = {}
 
         # Merge
         records = []
