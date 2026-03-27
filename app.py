@@ -115,16 +115,27 @@ Each element:
 """
 
 def ask_claude(client: anthropic.Anthropic, pdf_b64: str, prompt: str) -> str:
-    r = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=[{"role": "user", "content": [
-            {"type": "document",
-             "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
-            {"type": "text", "text": prompt},
-        ]}],
-    )
-    return "".join(b.text for b in r.content if b.type == "text")
+    try:
+        r = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            messages=[{"role": "user", "content": [
+                {"type": "document",
+                 "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+                {"type": "text", "text": prompt},
+            ]}],
+        )
+        return "".join(b.text for b in r.content if b.type == "text")
+    except anthropic.AuthenticationError:
+        raise RuntimeError("❌ Invalid Anthropic API key. Check your ANTHROPIC_API_KEY secret.")
+    except anthropic.PermissionDeniedError:
+        raise RuntimeError("❌ Anthropic API key doesn't have permission. Check it's active at console.anthropic.com.")
+    except anthropic.RateLimitError:
+        raise RuntimeError("❌ Anthropic rate limit hit. Wait a moment and try again.")
+    except anthropic.BadRequestError as e:
+        raise RuntimeError(f"❌ Bad request to Claude (PDF may be too large or malformed): {e}")
+    except anthropic.APIStatusError as e:
+        raise RuntimeError(f"❌ Anthropic API error {e.status_code}: {e.message}")
 
 # ── Airtable ──────────────────────────────────────────────────────────────
 def at_headers(token: str):
@@ -253,10 +264,15 @@ if st.button("✨ Extract Questions", type="primary",
 
         # Questions
         st.write("🤖 Sending paper to Claude…")
-        raw_qs = ask_claude(client, pdf_to_b64(paper_bytes),
-                            QUESTION_PROMPT.format(name=paper_name, etype=exam_type))
-        questions = json.loads(clean_json(raw_qs))
-        st.write(f"   Extracted {len(questions)} questions")
+        try:
+            raw_qs = ask_claude(client, pdf_to_b64(paper_bytes),
+                                QUESTION_PROMPT.format(name=paper_name, etype=exam_type))
+            questions = json.loads(clean_json(raw_qs))
+            st.write(f"   Extracted {len(questions)} questions")
+        except Exception as e:
+            status.update(label="Extraction failed", state="error")
+            st.error(str(e))
+            st.stop()
 
         # Mark scheme
         ms_map: dict[str, str] = {}
