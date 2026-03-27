@@ -30,6 +30,31 @@ RETRY_DELAY = 20       # seconds between retries
 AT_API     = "https://api.airtable.com/v0"
 AT_META    = "https://api.airtable.com/v0/meta"
 
+IMGBB_API = "https://api.imgbb.com/1/upload"
+
+def upload_to_imgbb(api_key: str, img: dict) -> str | None:
+    """Upload image bytes to imgbb, return public URL or None on failure."""
+    b64 = base64.standard_b64encode(img["data"]).decode()
+    resp = requests.post(IMGBB_API, data={
+        "key":   api_key,
+        "name":  img["name"],
+        "image": b64,
+    })
+    if resp.ok:
+        return resp.json()["data"]["url"]
+    return None
+
+def patch_record_images(token: str, base_id: str, table: str,
+                        record_id: str, urls: list[str]):
+    """Patch a single Airtable record's Images field with a list of URLs."""
+    resp = requests.patch(
+        f"{AT_API}/{base_id}/{requests.utils.quote(table)}/{record_id}",
+        headers=at_headers(token),
+        json={"fields": {"Images": [{"url": u} for u in urls]}},
+    )
+    if not resp.ok:
+        raise RuntimeError(f"{resp.status_code} — {resp.text[:200]}")
+
 AT_FIELDS = [
     ("Question Number",    "singleLineText"),
     ("Question Text",      "multilineText"),
@@ -242,9 +267,10 @@ st.title("📄 Past Paper → Airtable")
 st.caption("Upload exam PDFs, extract questions with AI, review, then sync to Airtable.")
 
 # Read secrets (pre-configured by admin on Streamlit Cloud)
-ANTH_KEY  = get_secret("ANTHROPIC_API_KEY")
-AT_TOKEN  = get_secret("AIRTABLE_TOKEN")
-AT_BASE   = get_secret("AIRTABLE_BASE_ID")
+ANTH_KEY   = get_secret("ANTHROPIC_API_KEY")
+AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
+AT_BASE    = get_secret("AIRTABLE_BASE_ID")
+IMGBB_KEY  = get_secret("IMGBB_API_KEY")
 
 # Sidebar — credentials (shown only if not in secrets)
 with st.sidebar:
@@ -265,6 +291,12 @@ with st.sidebar:
         AT_BASE = st.text_input("Airtable Base ID", placeholder="appXXXXXX")
     else:
         st.success("✓ Airtable Base ID loaded from secrets")
+
+    if not IMGBB_KEY:
+        IMGBB_KEY = st.text_input("imgbb API key", type="password",
+                                   placeholder="Get free key at imgbb.com/api")
+    else:
+        st.success("✓ imgbb key loaded from secrets")
 
     AT_TABLE = st.text_input("Table name", value="Questions")
 
