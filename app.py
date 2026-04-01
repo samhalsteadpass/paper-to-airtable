@@ -762,8 +762,9 @@ if st.button("✨ Extract Questions", type="primary",
 
 # ── Step 3: Review ─────────────────────────────────────────────────────
 if "records" in st.session_state:
-    records = st.session_state["records"]
-    images  = st.session_state.get("images", [])
+    records   = st.session_state["records"]
+    images    = st.session_state.get("images",    [])
+    image_map = st.session_state.get("image_map", {})
 
     st.subheader("3 · Review & edit")
     st.caption("Edit any cell before syncing.")
