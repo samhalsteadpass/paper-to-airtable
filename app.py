@@ -440,6 +440,20 @@ def extract_all_crops(pdf_bytes: bytes,
             pass
 
         # 3. Drawings — collect ALL paths, cluster, dedup
+        # Build a text-bbox index for this page to skip "do not write" regions
+        text_blocks = page.get_text("dict")["blocks"]
+        donotwrite_rects: list[fitz.Rect] = []
+        for block in text_blocks:
+            if block.get("type") != 0:
+                continue
+            text = " ".join(
+                span.get("text", "")
+                for line in block.get("lines", [])
+                for span in line.get("spans", [])
+            ).lower()
+            if "do not write" in text or "examiner" in text:
+                donotwrite_rects.append(fitz.Rect(block["bbox"]))
+
         raw_rects: list[fitz.Rect] = []
         for drawing in page.get_drawings():
             r = drawing.get("rect")
@@ -464,6 +478,13 @@ def extract_all_crops(pdf_bytes: bytes,
                 if is_debug:
                     debug_log.append(
                         f"SKIP contained-by-taken p{page_num}: "
+                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)")
+                continue
+            # Skip "do not write" margin boxes
+            if any(is_contained_by_any(dw, [r], pad=4) for dw in donotwrite_rects):
+                if is_debug:
+                    debug_log.append(
+                        f"SKIP do-not-write p{page_num}: "
                         f"{r} ({r.width:.0f}x{r.height:.0f}pt)")
                 continue
             valid.append(r)
