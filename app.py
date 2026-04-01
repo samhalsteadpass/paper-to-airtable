@@ -1,14 +1,18 @@
 """
 app_v3.py  –  Past Paper → Airtable  (OpenAI, Streamlit Cloud)
 ==============================================================
+Flow:
+  Step 1  Upload PDFs
+  Step 2  Extract All Visuals (PyMuPDF, 300 DPI) — view before GPT
+  Step 3  Extract Questions + Judge Visuals (GPT-4V)
+  Step 4  Review & edit
+  Step 5  Export / Sync to Airtable
+
 Extraction strategy:
   1. Raster images   — get_text("dict") image blocks, re-rendered at 300 DPI
-  2. Tables          — find_tables(), semantically correct bboxes, 300 DPI
-  3. Drawings        — individual drawing rects (NO merging), largest-first
-                       dedup (contained rects skipped), 300 DPI
-  4. GPT-4V          — judges each page's crops: relevant? which question?
-  5. Recovery        — any hasImages question with no visual gets a
-                       targeted GPT crop attempt using question + image desc
+  2. Tables          — find_tables(), skip if > 50% of page (false positives)
+  3. Drawings        — individual rects, NO merging, largest-first dedup
+  GPT judges: relevant? which question? + recovery pass for hasImages with no visual.
 
 Secrets:
     OPENAI_API_KEY   = "sk-..."
@@ -45,10 +49,10 @@ MAX_RETRIES       = 4
 BASE_BACKOFF      = 2
 IMAGE_MAX_SIZE    = (1200, 1200)
 JPEG_QUALITY      = 70
-RENDER_DPI        = 150    # DPI for sending full pages to GPT
-VISION_DPI        = 170    # DPI for judge/recovery page renders
-EXTRACT_DPI       = 300    # DPI for actual crops (high quality)
-CROP_PAD_PT       = 8      # padding in PDF points around every crop
+RENDER_DPI        = 150
+VISION_DPI        = 170
+EXTRACT_DPI       = 300
+CROP_PAD_PT       = 8
 
 AT_API    = "https://api.airtable.com/v0"
 AT_META   = "https://api.airtable.com/v0/meta"
@@ -290,7 +294,7 @@ def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
     doc.close()
     return not any(kw in text for kw in SKIP_PAGE_KEYWORDS)
 
-# ── PyMuPDF extraction helpers ────────────────────────────────────────────
+# ── PyMuPDF extraction ────────────────────────────────────────────────────
 def is_contained_by_any(rect: fitz.Rect,
                          others: list[fitz.Rect],
                          pad: float = 4.0) -> bool:
@@ -315,8 +319,11 @@ def crop_rect(page: fitz.Page, rect: fitz.Rect,
 def extract_all_crops(pdf_bytes: bytes,
                        debug_page: int = 0) -> tuple[list[dict], list[str]]:
     """
-    Extract all visual candidates using PyMuPDF with exact coordinates.
-    If debug_page > 0, return detailed logs for that page.
+    Extract all visual candidates from every question page.
+      1. Raster images  — image blocks from get_text("dict")
+      2. Tables         — find_tables(), skip false positives > 50% page area
+      3. Drawings       — individual rects, no merging, largest-first dedup
+    All crops rendered at 300 DPI with padding.
     """
     doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_crops: list[dict] = []
@@ -327,6 +334,7 @@ def extract_all_crops(pdf_bytes: bytes,
             continue
 
         pr           = page.rect
+        page_area    = pr.width * pr.height
         taken_rects: list[fitz.Rect] = []
         is_debug     = (debug_page == page_num)
 
@@ -346,16 +354,21 @@ def extract_all_crops(pdf_bytes: bytes,
                 data = crop_rect(page, bbox)
                 pil2 = Image.open(io.BytesIO(data))
                 taken_rects.append(bbox)
+                if is_debug:
+                    debug_log.append(f"RASTER p{page_num}: {bbox} ({pil2.width}x{pil2.height}px)")
                 all_crops.append({
-                    "page": page_num, "name": f"p{page_num}_raster{idx}.png",
-                    "source": "raster", "data": data,
-                    "width": pil2.width, "height": pil2.height, "bbox": bbox,
+                    "page":   page_num,
+                    "name":   f"p{page_num}_raster{idx}.png",
+                    "source": "raster",
+                    "data":   data,
+                    "width":  pil2.width,
+                    "height": pil2.height,
+                    "bbox":   bbox,
                 })
             except Exception:
                 pass
 
-        # 2. Tables — skip any that cover more than 50% of page (false positives)
-        page_area = pr.width * pr.height
+        # 2. Tables — skip false positives that cover > 50% of page
         try:
             for idx, table in enumerate(page.find_tables().tables, 1):
                 rect = fitz.Rect(table.bbox)
@@ -363,7 +376,10 @@ def extract_all_crops(pdf_bytes: bytes,
                     continue
                 if (rect.width * rect.height) > page_area * 0.50:
                     if is_debug:
-                        debug_log.append(f"SKIP false-positive table p{page_num}: {rect} ({rect.width:.0f}x{rect.height:.0f}pt)")
+                        debug_log.append(
+                            f"SKIP false-positive table p{page_num}: "
+                            f"{rect} ({rect.width:.0f}x{rect.height:.0f}pt)"
+                        )
                     continue
                 data = crop_rect(page, rect)
                 pil  = Image.open(io.BytesIO(data))
@@ -371,9 +387,13 @@ def extract_all_crops(pdf_bytes: bytes,
                 if is_debug:
                     debug_log.append(f"TABLE p{page_num}: {rect} ({rect.width:.0f}x{rect.height:.0f}pt)")
                 all_crops.append({
-                    "page": page_num, "name": f"p{page_num}_table{idx}.png",
-                    "source": "table", "data": data,
-                    "width": pil.width, "height": pil.height, "bbox": rect,
+                    "page":   page_num,
+                    "name":   f"p{page_num}_table{idx}.png",
+                    "source": "table",
+                    "data":   data,
+                    "width":  pil.width,
+                    "height": pil.height,
+                    "bbox":   rect,
                 })
         except Exception:
             pass
@@ -389,24 +409,37 @@ def extract_all_crops(pdf_bytes: bytes,
                 continue
             if r.width > pr.width * 0.88 or r.height > pr.height * 0.80:
                 if is_debug:
-                    debug_log.append(f"SKIP full-page p{page_num}: {r} ({r.width:.0f}x{r.height:.0f}pt)")
+                    debug_log.append(
+                        f"SKIP full-page p{page_num}: "
+                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
+                    )
                 continue
             if is_contained_by_any(r, taken_rects, pad=6):
                 if is_debug:
-                    debug_log.append(f"SKIP contained-by-taken p{page_num}: {r} ({r.width:.0f}x{r.height:.0f}pt)")
+                    debug_log.append(
+                        f"SKIP contained-by-taken p{page_num}: "
+                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
+                    )
                 continue
             drawing_rects.append(r)
 
+        # Largest-first dedup
         drawing_rects.sort(key=lambda r: r.width * r.height, reverse=True)
         kept: list[fitz.Rect] = []
         for r in drawing_rects:
             if not is_contained_by_any(r, kept, pad=4):
                 kept.append(r)
                 if is_debug:
-                    debug_log.append(f"KEEP drawing p{page_num}: {r} ({r.width:.0f}x{r.height:.0f}pt)")
+                    debug_log.append(
+                        f"KEEP drawing p{page_num}: "
+                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
+                    )
             else:
                 if is_debug:
-                    debug_log.append(f"SKIP contained-by-kept p{page_num}: {r} ({r.width:.0f}x{r.height:.0f}pt)")
+                    debug_log.append(
+                        f"SKIP contained-by-kept p{page_num}: "
+                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
+                    )
 
         for idx, rect in enumerate(kept, 1):
             try:
@@ -416,9 +449,13 @@ def extract_all_crops(pdf_bytes: bytes,
                     continue
                 taken_rects.append(rect)
                 all_crops.append({
-                    "page": page_num, "name": f"p{page_num}_draw{idx}.png",
-                    "source": "drawing", "data": data,
-                    "width": pil.width, "height": pil.height, "bbox": rect,
+                    "page":   page_num,
+                    "name":   f"p{page_num}_draw{idx}.png",
+                    "source": "drawing",
+                    "data":   data,
+                    "width":  pil.width,
+                    "height": pil.height,
+                    "bbox":   rect,
                 })
             except Exception:
                 pass
@@ -426,7 +463,7 @@ def extract_all_crops(pdf_bytes: bytes,
     doc.close()
     return all_crops, debug_log
 
-# ── GPT judges relevance + assigns question number ────────────────────────
+# ── GPT judging ───────────────────────────────────────────────────────────
 def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
                      page_num: int, crops: list[dict]) -> list[dict]:
     if not crops:
@@ -470,8 +507,7 @@ def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
 def extract_and_judge_visuals(openai_key: str,
                                pdf_bytes: bytes,
                                all_crops: list[dict]) -> tuple[list[dict], dict[str, dict]]:
-    client    = OpenAI(api_key=openai_key)
-    all_crops, _ = extract_all_crops(pdf_bytes)
+    client  = OpenAI(api_key=openai_key)
 
     by_page: dict[int, list[dict]] = {}
     for crop in all_crops:
@@ -503,7 +539,7 @@ def extract_and_judge_visuals(openai_key: str,
 
     return kept_visuals, full_mapping
 
-# ── Recovery: find visuals for hasImages questions with none ──────────────
+# ── Recovery ──────────────────────────────────────────────────────────────
 def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
                             record: dict) -> dict | None:
     page_num = clamp_int(record.get("pageNumber", 1), 1)
@@ -537,7 +573,6 @@ def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
         if (x2 - x1) > 0.95 and (y2 - y1) > 0.90:
             return None
 
-        # Render recovery crop at 300 DPI from fraction coords
         doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
         page = doc[page_num - 1]
         pr   = page.rect
@@ -737,7 +772,7 @@ def create_airtable_records(token: str, base_id: str, table: str,
 st.set_page_config(page_title="Past Paper → Airtable v3",
                    page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable v3")
-st.caption("PyMuPDF (no merging) + GPT-4V judge + recovery pass · 300 DPI crops")
+st.caption("PyMuPDF extracts (300 DPI, no merging) · View all · GPT judges · Recovery pass")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
@@ -781,12 +816,40 @@ with col2:
     st.markdown("&nbsp;", unsafe_allow_html=True)
     ms_file = st.file_uploader("Mark scheme PDF (optional)", type="pdf")
 
-# ── Step 2: Extract ────────────────────────────────────────────────────────
-st.subheader("2 · Extract with GPT")
+# ── Step 2: Extract visuals (PyMuPDF only) ─────────────────────────────────
+st.subheader("2 · Extract visuals")
 
+if st.button("📎 Extract All Visuals", type="secondary",
+             disabled=not (paper_file and paper_name)):
+    paper_file.seek(0)
+    paper_bytes_preview = paper_file.read()
+    all_crops, _ = extract_all_crops(paper_bytes_preview)
+    st.session_state["all_crops"]   = all_crops
+    st.session_state["paper_bytes"] = paper_bytes_preview
+    st.write(f"Found **{len(all_crops)}** raw candidates across "
+             f"{len(set(c['page'] for c in all_crops))} pages")
 
-if st.button("✨ Extract Questions", type="primary",
-             disabled=not (paper_file and paper_name and exam_type and OPENAI_KEY)):
+if "all_crops" in st.session_state:
+    all_crops_display = st.session_state["all_crops"]
+    with st.expander(f"🔍 All {len(all_crops_display)} extracted candidates (before GPT judging)"):
+        by_page_display: dict[int, list] = {}
+        for c in all_crops_display:
+            by_page_display.setdefault(c["page"], []).append(c)
+        for pg in sorted(by_page_display):
+            st.markdown(f"**Page {pg}** — {len(by_page_display[pg])} candidates")
+            cols = st.columns(4)
+            for i, crop in enumerate(by_page_display[pg]):
+                with cols[i % 4]:
+                    st.image(crop["data"],
+                             caption=f"{crop['name']} [{crop['source']}]\n"
+                                     f"{crop['width']}×{crop['height']}px",
+                             use_container_width=True)
+
+# ── Step 3: Extract questions + GPT judging ────────────────────────────────
+st.subheader("3 · Extract questions + judge visuals with GPT")
+if st.button("✨ Extract Questions & Judge Visuals", type="primary",
+             disabled=not (paper_name and exam_type and OPENAI_KEY
+                           and "all_crops" in st.session_state)):
 
     paper_bytes = st.session_state["paper_bytes"]
     ms_bytes    = ms_file.read() if ms_file else None
@@ -794,13 +857,10 @@ if st.button("✨ Extract Questions", type="primary",
 
     with st.status("Extracting…", expanded=True) as status:
 
-        # Use already-extracted crops — no re-extraction
-        all_crops_for_judging = st.session_state["all_crops"]
-
         st.write("🤖 GPT judging visuals…")
         extract_and_judge_visuals.clear()
-        images, image_map = extract_and_judge_visuals(OPENAI_KEY, paper_bytes,
-                                                       all_crops_for_judging)
+        images, image_map = extract_and_judge_visuals(
+            OPENAI_KEY, paper_bytes, st.session_state["all_crops"])
         mapped = sum(1 for v in image_map.values()
                      if v.get("questionNumber") not in {"none", ""})
         st.write(f"   {len(images)} visuals kept · {mapped} mapped to questions")
@@ -837,7 +897,7 @@ if st.button("✨ Extract Questions", type="primary",
                 "images":                 [],
             })
 
-        # Apply image mapping + fallback
+        # Image mapping + fallback
         if images:
             pq_index: dict[int, list[str]] = {}
             for r in records:
@@ -906,7 +966,7 @@ if st.button("✨ Extract Questions", type="primary",
                         r["imageMappingConfidence"] = img.get("confidence", "medium")
                         r["imageMappingNotes"]      = img.get("notes", "")
             recovered     = sum(1 for img in images if img.get("source") == "recovered")
-            still_missing = sum(1 for r   in records
+            still_missing = sum(1 for r in records
                                 if r.get("hasImages") and not r.get("images"))
             st.write(f"   Recovered {recovered} · {still_missing} still unresolved")
 
@@ -918,13 +978,13 @@ if st.button("✨ Extract Questions", type="primary",
             state="complete"
         )
 
-# ── Step 3: Review ─────────────────────────────────────────────────────────
+# ── Step 4: Review ─────────────────────────────────────────────────────────
 if "records" in st.session_state:
     records   = st.session_state["records"]
     images    = st.session_state.get("images",    [])
     image_map = st.session_state.get("image_map", {})
 
-    st.subheader("3 · Review & edit")
+    st.subheader("4 · Review & edit")
     st.caption("Edit any cell before syncing.")
 
     df = pd.DataFrame([{
@@ -979,8 +1039,8 @@ if "records" in st.session_state:
                              caption=f"{img['name']}\nQ{qn} · {img.get('kind','?')} [{src}]",
                              use_container_width=True)
 
-    # ── Step 4: Export / Sync ──────────────────────────────────────────────
-    st.subheader("4 · Export / Sync")
+    # ── Step 5: Export / Sync ──────────────────────────────────────────────
+    st.subheader("5 · Export / Sync")
     dl_col, sync_col = st.columns([1, 2])
 
     with dl_col:
