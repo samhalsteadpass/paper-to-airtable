@@ -468,7 +468,8 @@ def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
 
 @st.cache_data(show_spinner=False)
 def extract_and_judge_visuals(openai_key: str,
-                               pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
+                               pdf_bytes: bytes,
+                               all_crops: list[dict]) -> tuple[list[dict], dict[str, dict]]:
     client    = OpenAI(api_key=openai_key)
     all_crops, _ = extract_all_crops(pdf_bytes)
 
@@ -783,24 +784,23 @@ with col2:
 # ── Step 2: Extract ────────────────────────────────────────────────────────
 st.subheader("2 · Extract with GPT")
 
-with st.expander("🔧 Debug: inspect drawing extraction for a specific page"):
-    debug_pg = st.number_input("Page number to debug", min_value=1, value=8, step=1)
-    if st.button("Run debug extraction") and paper_file:
-        paper_file.seek(0)
-        _, dbg = extract_all_crops(paper_file.read(), debug_page=int(debug_pg))
-        st.code("\n".join(dbg) if dbg else "No debug output for this page.")
+
 if st.button("✨ Extract Questions", type="primary",
              disabled=not (paper_file and paper_name and exam_type and OPENAI_KEY)):
 
-    paper_bytes = paper_file.read()
+    paper_bytes = st.session_state["paper_bytes"]
     ms_bytes    = ms_file.read() if ms_file else None
     client      = OpenAI(api_key=OPENAI_KEY)
 
     with st.status("Extracting…", expanded=True) as status:
 
-        st.write("📎 Extracting visuals (PyMuPDF 300 DPI + GPT-4V judge)…")
+        # Use already-extracted crops — no re-extraction
+        all_crops_for_judging = st.session_state["all_crops"]
+
+        st.write("🤖 GPT judging visuals…")
         extract_and_judge_visuals.clear()
-        images, image_map = extract_and_judge_visuals(OPENAI_KEY, paper_bytes)
+        images, image_map = extract_and_judge_visuals(OPENAI_KEY, paper_bytes,
+                                                       all_crops_for_judging)
         mapped = sum(1 for v in image_map.values()
                      if v.get("questionNumber") not in {"none", ""})
         st.write(f"   {len(images)} visuals kept · {mapped} mapped to questions")
