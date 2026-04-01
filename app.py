@@ -94,6 +94,32 @@ Each element must be:
 }
 """
 
+GPT_SUPPLEMENT_PROMPT = """This is page {page_num} of an exam paper.
+
+PyMuPDF already extracted these visuals from this page:
+{already_found}
+
+Are there any question-relevant visuals on this page that are NOT in the list above?
+Include: formula boxes, lightly-drawn diagrams, number lines, geometric shapes, answer-box grids.
+Exclude: answer lines, page borders, headers, footers, barcodes, page numbers.
+
+If nothing is missing return an empty array: []
+
+Otherwise return ONLY a raw JSON array. No markdown. No explanation.
+Each element:
+{{
+  "label": "formula box",
+  "x": 0.25,
+  "y": 0.10,
+  "w": 0.30,
+  "h": 0.12
+}}
+
+x, y = top-left corner as fraction of page width/height (0.0–1.0)
+w, h = width/height as fraction of page dimensions
+Be generous — slightly oversized boxes are better than missing the visual.
+"""
+
 IMAGE_MAPPING_PROMPT = """This is page {page_num} of an exam paper.
 
 The following visuals were extracted from this page:
@@ -286,12 +312,73 @@ def render_clip(page, rect, dpi=190) -> tuple[bytes, int, int]:
     img  = Image.open(io.BytesIO(data))
     return data, img.width, img.height
 
+def gpt_supplement_page(client: OpenAI, pdf_bytes: bytes,
+                         page_num: int, already: list[dict]) -> list[dict]:
+    """
+    Ask GPT if there are any visuals on this page that PyMuPDF missed.
+    Returns additional visuals cropped with generous padding.
+    """
+    page_pil       = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
+    page_w, page_h = page_pil.size
+
+    already_str = "\n".join(f"- {i['name']} ({i['kind']})" for i in already) or "(none)"
+    prompt      = GPT_SUPPLEMENT_PROMPT.format(
+        page_num=page_num, already_found=already_str
+    )
+    content = [
+        {"type": "input_text",  "text": prompt},
+        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{encode_image(page_pil)}"},
+    ]
+    def _call():
+        return client.responses.create(
+            model=VISION_MODEL,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=1500,
+        )
+    raw  = openai_response_text(run_with_retry(_call))
+    rows = safe_json_loads(raw, [])
+
+    extras = []
+    for idx, row in enumerate(rows, 1):
+        try:
+            x = float(row["x"]); y = float(row["y"])
+            w = float(row["w"]); h = float(row["h"])
+
+            # Generous padding (5%) to compensate for GPT imprecision
+            pad = 0.05
+            x1  = max(0.0, x - pad);     y1 = max(0.0, y - pad)
+            x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
+
+            if (x2 - x1) > 0.95 and (y2 - y1) > 0.85:
+                continue
+            if (x2 - x1) < 0.03 or (y2 - y1) < 0.03:
+                continue
+
+            crop = page_pil.crop((
+                int(x1 * page_w), int(y1 * page_h),
+                int(x2 * page_w), int(y2 * page_h),
+            ))
+            buf = io.BytesIO()
+            crop.save(buf, format="PNG")
+            extras.append({
+                "page":   page_num,
+                "name":   f"p{page_num}_gpt{idx}.png",
+                "kind":   str(row.get("label", "gpt_visual")),
+                "data":   buf.getvalue(),
+                "width":  crop.width,
+                "height": crop.height,
+            })
+        except Exception:
+            continue
+    return extras
+
 @st.cache_data(show_spinner=False)
-def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
+def extract_visual_regions(openai_key: str, pdf_bytes: bytes) -> list[dict]:
     """
-    Extract embedded images, tables, and vector regions using PyMuPDF.
-    Pixel-perfect coordinates — no GPT coordinate guessing.
+    Stage 1: PyMuPDF extracts pixel-perfect images, tables, vector regions.
+    Stage 2: GPT-4V supplements anything PyMuPDF missed (formula boxes, light diagrams).
     """
+    client  = OpenAI(api_key=openai_key)
     doc     = fitz.open(stream=pdf_bytes, filetype="pdf")
     visuals = []
 
@@ -299,8 +386,9 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
         if not is_question_page(pdf_bytes, page_num):
             continue
 
-        table_rects = []
-        pr          = page.rect
+        page_visuals = []
+        table_rects  = []
+        pr           = page.rect
 
         # 1. Embedded raster images
         for idx, img_info in enumerate(page.get_images(full=True), 1):
@@ -310,9 +398,9 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
                 w, h = pil.size
                 if w < 80 or h < 80 or w*h < 12000:
                     continue
-                if w/max(h,1) > 4:          # skip barcodes
+                if w/max(h,1) > 4:
                     continue
-                visuals.append({
+                page_visuals.append({
                     "page":   page_num,
                     "name":   f"p{page_num}_img{idx}.{bi['ext']}",
                     "kind":   "image",
@@ -333,7 +421,7 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
                 data, w, h = render_clip(page, rect)
                 if content_pct(data) < VEC_MIN_CONTENT_PCT:
                     continue
-                visuals.append({
+                page_visuals.append({
                     "page":   page_num,
                     "name":   f"p{page_num}_table{idx}.png",
                     "kind":   "table",
@@ -344,7 +432,7 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
         except Exception:
             pass
 
-        # 3. Vector regions (diagrams, grids, formula boxes, number lines)
+        # 3. Vector regions
         try:
             drawing_rects = []
             for d in page.get_drawings():
@@ -368,12 +456,11 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
                 data, w, h = render_clip(page, rect)
                 if w < 60 or h < 60:
                     continue
-                asp = w / max(h, 1)
-                if asp > 10 or asp < 0.08:
+                if w / max(h, 1) > 10 or w / max(h, 1) < 0.08:
                     continue
                 if content_pct(data) < VEC_MIN_CONTENT_PCT:
                     continue
-                visuals.append({
+                page_visuals.append({
                     "page":   page_num,
                     "name":   f"p{page_num}_vec{idx}.png",
                     "kind":   "vector",
@@ -383,6 +470,15 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
                 })
         except Exception:
             pass
+
+        # 4. GPT supplement — catch anything PyMuPDF missed
+        try:
+            extras = gpt_supplement_page(client, pdf_bytes, page_num, page_visuals)
+            page_visuals.extend(extras)
+        except Exception:
+            pass
+
+        visuals.extend(page_visuals)
 
     doc.close()
     return visuals
@@ -641,13 +737,14 @@ if st.button("✨ Extract Questions", type="primary",
 
     with st.status("Extracting…", expanded=True) as status:
 
-        st.write("📎 Extracting visuals with PyMuPDF…")
+        st.write("📎 Extracting visuals (PyMuPDF + GPT supplement)…")
         extract_visual_regions.clear()
-        images = extract_visual_regions(paper_bytes)
+        images = extract_visual_regions(OPENAI_KEY, paper_bytes)
         st.write(f"   Found {len(images)} visuals "
                  f"({sum(1 for i in images if i['kind']=='image')} images, "
                  f"{sum(1 for i in images if i['kind']=='table')} tables, "
-                 f"{sum(1 for i in images if i['kind']=='vector')} vector regions)")
+                 f"{sum(1 for i in images if i['kind']=='vector')} vectors, "
+                 f"{sum(1 for i in images if i['kind'].startswith('gpt') or '_gpt' in i['name'])} GPT extras)")
 
         st.write("🤖 Extracting questions (parallel)…")
         questions, q_logs = extract_questions_parallel(client, paper_bytes)
