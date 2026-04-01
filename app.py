@@ -152,10 +152,10 @@ x, y = top-left corner as fraction of page width/height (0.0–1.0)
 w, h = width/height as fraction of page dimensions
 Be generous with the bounding box — slightly oversized is better than clipping.
 """
-    "do not write on this page",
-    "additional page, if required",
-    "there are no questions printed",
-    "copyright information",
+"do not write on this page",
+"additional page, if required",
+"there are no questions printed",
+"copyright information",
 ]
 
 # ── Secrets ───────────────────────────────────────────────────────────────
