@@ -1150,27 +1150,47 @@ if "records" in st.session_state:
             if st.button("🚀 Sync to Airtable", type="primary"):
                 _records  = st.session_state.get("records",   [])
                 _images   = st.session_state.get("images",    [])
-                _imgbb    = get_secret("IMGBB_API_KEY")
+                # ── FIX: use the already-resolved IMGBB_KEY (which includes
+                #         sidebar text input), not get_secret() which only
+                #         reads st.secrets and ignores sidebar-entered values. ──
+                _imgbb    = IMGBB_KEY
                 log_lines: list[str] = []
                 def log(msg): log_lines.append(msg)
 
+                log(f"imgbb key present: {bool(_imgbb)} | images to upload: {len(_images)}")
+
                 img_url_map: dict[str, str] = {}
 
-                # ── FIX 2: Sequential uploads with throttle to avoid imgbb
-                #           rate limits that caused silent failures and then
-                #           Airtable dropping attachments on re-validation. ──
+                # Sequential uploads with throttle to avoid imgbb rate limits.
                 if _images and _imgbb:
                     log(f"Uploading {len(_images)} visuals to imgbb…")
                     for img in _images:
-                        url = upload_to_imgbb(_imgbb, img)
-                        if url:
-                            img_url_map[img["name"]] = url
-                            log(f"  ✅ {img['name']}")
+                        b64  = base64.standard_b64encode(img["data"]).decode()
+                        resp = requests.post(
+                            IMGBB_API,
+                            data={
+                                "key":        _imgbb,
+                                "name":       img["name"],
+                                "image":      b64,
+                                "expiration": 0,
+                            },
+                            timeout=60,
+                        )
+                        if resp.ok:
+                            data = resp.json().get("data", {})
+                            url  = (data.get("image", {}).get("url")
+                                    or data.get("display_url")
+                                    or data.get("url"))
+                            if url:
+                                img_url_map[img["name"]] = url
+                                log(f"  ✅ {img['name']} → {url}")
+                            else:
+                                log(f"  ❌ {img['name']} — upload ok but no URL in response: {resp.text[:200]}")
                         else:
-                            log(f"  ❌ {img['name']} failed")
+                            log(f"  ❌ {img['name']} — HTTP {resp.status_code}: {resp.text[:200]}")
                         time.sleep(0.5)   # stay under imgbb rate limit
                 elif _images and not _imgbb:
-                    log("⚠️ IMGBB_API_KEY missing — visuals not attached.")
+                    log("⚠️ IMGBB_API_KEY missing — visuals not attached. Add it to sidebar or st.secrets.")
 
                 try:
                     existing = get_existing_fields(AT_TOKEN, AT_BASE, AT_TABLE)
