@@ -1,6 +1,7 @@
+openai
 streamlit
-anthropic
-pymupdf
 pillow
 requests
-pandas
+pdf2image
+pytesseract
+airtable-python-wrapper
