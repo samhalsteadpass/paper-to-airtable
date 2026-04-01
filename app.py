@@ -125,7 +125,33 @@ If relevant but question cannot be determined use questionNumber = "none"
 If not relevant, still include the entry with relevant = false and questionNumber = "none"
 """
 
-SKIP_PAGE_KEYWORDS = [
+FIND_MISSING_PROMPT = """This is page {page_num} of an exam paper.
+
+Question {qnum} is marked as having an associated visual, but none was found automatically.
+
+Question text: {question_text}
+Expected visual description: {image_desc}
+
+Find the visual that belongs to this question on the page.
+Return ONLY a raw JSON object. No markdown. No explanation.
+{{
+  "found": true,
+  "x": 0.25,
+  "y": 0.10,
+  "w": 0.40,
+  "h": 0.30,
+  "label": "centimetre grid",
+  "confidence": "high",
+  "notes": "Grid appears directly under Q3a"
+}}
+
+If you cannot find any visual for this question return:
+{{"found": false}}
+
+x, y = top-left corner as fraction of page width/height (0.0–1.0)
+w, h = width/height as fraction of page dimensions
+Be generous with the bounding box — slightly oversized is better than clipping.
+"""
     "do not write on this page",
     "additional page, if required",
     "there are no questions printed",
@@ -463,6 +489,106 @@ def extract_and_judge_visuals(openai_key: str,
 
     return kept_visuals, full_mapping
 
+def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
+                            record: dict) -> dict | None:
+    """
+    For a question flagged hasImages=True but with no extracted visual,
+    ask GPT to locate and crop it from the page.
+    Returns a new visual dict, or None if not found.
+    """
+    page_num = clamp_int(record.get("pageNumber", 1), 1)
+    qnum     = record.get("questionNumber", "?")
+    page_pil = render_page_pil(pdf_bytes, page_num, dpi=VISION_DPI)
+    pw, ph   = page_pil.size
+
+    prompt = FIND_MISSING_PROMPT.format(
+        page_num     = page_num,
+        qnum         = qnum,
+        question_text= record.get("questionText",     "")[:300],
+        image_desc   = record.get("imageDescription", "") or "Not specified",
+    )
+    content = [
+        {"type": "input_text",  "text": prompt},
+        {"type": "input_image",
+         "image_url": f"data:image/jpeg;base64,{encode_pil(page_pil)}"},
+    ]
+    raw  = call_gpt(client, content, VISION_MODEL, max_output_tokens=500)
+    data = safe_json_loads(raw, {})
+
+    if not data.get("found"):
+        return None
+
+    try:
+        x = float(data["x"]); y = float(data["y"])
+        w = float(data["w"]); h = float(data["h"])
+
+        pad = 0.02
+        x1  = max(0.0, x - pad);     y1 = max(0.0, y - pad)
+        x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
+
+        if (x2 - x1) > 0.95 and (y2 - y1) > 0.90:
+            return None
+
+        crop = page_pil.crop((
+            int(x1 * pw), int(y1 * ph),
+            int(x2 * pw), int(y2 * ph),
+        ))
+        buf = io.BytesIO()
+        crop.save(buf, format="PNG")
+
+        name = f"p{page_num}_recovered_{qnum}.png"
+        return {
+            "page":           page_num,
+            "name":           name,
+            "source":         "recovered",
+            "kind":           str(data.get("label", "visual")),
+            "data":           buf.getvalue(),
+            "width":          crop.width,
+            "height":         crop.height,
+            "questionNumber": qnum,
+            "confidence":     str(data.get("confidence", "medium")).lower(),
+            "notes":          str(data.get("notes", "Recovered: missing visual for hasImages question")),
+        }
+    except Exception:
+        return None
+
+
+def recover_all_missing(client: OpenAI, pdf_bytes: bytes,
+                         records: list[dict],
+                         images: list[dict],
+                         image_map: dict[str, dict]) -> tuple[list[dict], dict[str, dict]]:
+    """
+    Find every question with hasImages=True but no assigned images,
+    attempt GPT recovery for each, and return updated images + image_map.
+    """
+    missing = [r for r in records
+               if r.get("hasImages") and not r.get("images")]
+
+    if not missing:
+        return images, image_map
+
+    new_images  = list(images)
+    new_map     = dict(image_map)
+
+    def try_recover(record):
+        v = recover_missing_visual(client, pdf_bytes, record)
+        return record["questionNumber"], v
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(try_recover, r) for r in missing]
+        for f in as_completed(futures):
+            qnum, visual = f.result()
+            if visual:
+                new_images.append(visual)
+                new_map[visual["name"]] = {
+                    "questionNumber": qnum,
+                    "confidence":     visual["confidence"],
+                    "notes":          visual["notes"],
+                    "source":         "recovered",
+                }
+
+    return new_images, new_map
+
 # ── Question + mark scheme extraction ─────────────────────────────────────
 def extract_questions_parallel(client: OpenAI,
                                 pdf_bytes: bytes) -> tuple[list[dict], list[str]]:
@@ -751,6 +877,32 @@ if st.button("✨ Extract Questions", type="primary",
                                                    else "medium" if "medium" in confs
                                                    else "low")
                     r["imageMappingNotes"]      = "\n".join(notes)
+
+        # Recovery pass — ensure every hasImages question has a visual
+        missing_count = sum(1 for r in records
+                            if r.get("hasImages") and not r.get("images"))
+        if missing_count:
+            st.write(f"🔎 Recovering {missing_count} missing visual(s)…")
+            images, image_map = recover_all_missing(
+                client, paper_bytes, records, images, image_map)
+
+            # Re-apply mapping for recovered visuals
+            for img in images:
+                nm = img["name"]
+                if img.get("source") == "recovered":
+                    qn = img.get("questionNumber", "none")
+                    for r in records:
+                        if r["questionNumber"] == qn and not r.get("images"):
+                            r["hasImages"]              = True
+                            r["images"]                 = [nm]
+                            r["imageMappingConfidence"] = img.get("confidence", "medium")
+                            r["imageMappingNotes"]      = img.get("notes", "")
+
+            recovered = sum(1 for img in images if img.get("source") == "recovered")
+            still_missing = sum(1 for r in records
+                                if r.get("hasImages") and not r.get("images"))
+            st.write(f"   Recovered {recovered} visual(s) · "
+                     f"{still_missing} still unresolved")
 
         st.session_state["records"]   = records
         st.session_state["images"]    = images
