@@ -289,7 +289,7 @@ def rect_inside_any(rect, rect_list, pad=2) -> bool:
         for o in rect_list
     )
 
-def merge_rects(rects, x_gap=8, y_gap=4):
+def merge_rects(rects, x_gap=10, y_gap=10):
     rects, merged = [fitz.Rect(r) for r in rects], []
     while rects:
         cur, changed = rects.pop(0), True
@@ -349,7 +349,8 @@ def gpt_supplement_page(client: OpenAI, pdf_bytes: bytes,
             x1  = max(0.0, x - pad);     y1 = max(0.0, y - pad)
             x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
 
-            if (x2 - x1) > 0.95 and (y2 - y1) > 0.85:
+            # Skip if either dimension is near-full-page (OR not AND)
+            if (x2 - x1) > 0.88 or (y2 - y1) > 0.88:
                 continue
             if (x2 - x1) < 0.03 or (y2 - y1) < 0.03:
                 continue
@@ -449,9 +450,11 @@ def extract_visual_regions(openai_key: str, pdf_bytes: bytes) -> list[dict]:
             for idx, rect in enumerate(merge_rects(drawing_rects), 1):
                 if rect.width < 35 or rect.height < 35:
                     continue
+                # Skip full-page borders
                 if rect.width > pr.width * 0.95 and rect.height > pr.height * 0.85:
                     continue
-                if rect.width > pr.width * 0.85 and rect.height < 60:
+                # Skip wide-but-short strips — answer lines, header rules
+                if rect.height < 80 and rect.width > pr.width * 0.5:
                     continue
                 data, w, h = render_clip(page, rect)
                 if w < 60 or h < 60:
