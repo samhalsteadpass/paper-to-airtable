@@ -506,7 +506,7 @@ def extract_all_crops(pdf_bytes: bytes,
 
         for idx, rect in enumerate(kept, 1):
             try:
-                data = crop_rect(page, rect)
+                data = crop_rect(page, rect, pad_pt=DRAW_CROP_PAD_PT)
                 pil  = Image.open(io.BytesIO(data))
                 if pil.width < 20 or pil.height < 20:
                     continue
