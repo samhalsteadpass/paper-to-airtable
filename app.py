@@ -1,14 +1,16 @@
 """
-app_v2.py  –  Past Paper → Airtable  (OpenAI, Streamlit Cloud)
+app_v3.py  –  Past Paper → Airtable  (OpenAI, Streamlit Cloud)
 ==============================================================
-Architecture:
-  Stage 1 — PyMuPDF extracts ALL visuals from each page (no filtering).
-  Stage 2 — GPT-4V reviews each page's crops, judges relevance,
-             assigns question number, all in one call per page.
-  Stage 3 — Recovery pass: any hasImages question with no visual gets
-             a targeted GPT crop attempt using the image description.
+Extraction strategy:
+  1. Raster images   — get_text("dict") image blocks, re-rendered at 300 DPI
+  2. Tables          — find_tables(), semantically correct bboxes, 300 DPI
+  3. Drawings        — individual drawing rects (NO merging), largest-first
+                       dedup (contained rects skipped), 300 DPI
+  4. GPT-4V          — judges each page's crops: relevant? which question?
+  5. Recovery        — any hasImages question with no visual gets a
+                       targeted GPT crop attempt using question + image desc
 
-Secrets (.streamlit/secrets.toml or Streamlit Cloud dashboard):
+Secrets:
     OPENAI_API_KEY   = "sk-..."
     AIRTABLE_TOKEN   = "pat..."
     AIRTABLE_BASE_ID = "app..."
@@ -43,9 +45,10 @@ MAX_RETRIES       = 4
 BASE_BACKOFF      = 2
 IMAGE_MAX_SIZE    = (1200, 1200)
 JPEG_QUALITY      = 70
-RENDER_DPI        = 150
-VISION_DPI        = 170
-EXTRACT_DPI       = 300   # high DPI for crop quality
+RENDER_DPI        = 150    # DPI for sending full pages to GPT
+VISION_DPI        = 170    # DPI for judge/recovery page renders
+EXTRACT_DPI       = 300    # DPI for actual crops (high quality)
+CROP_PAD_PT       = 8      # padding in PDF points around every crop
 
 AT_API    = "https://api.airtable.com/v0"
 AT_META   = "https://api.airtable.com/v0/meta"
@@ -109,36 +112,33 @@ Each element must be:
 }
 """
 
-GPT_EXTRACT_PROMPT = """This is page {page_num} of an exam paper, rendered at high resolution.
+GPT_JUDGE_PROMPT = """You are reviewing extracted visual crops from page {page_num} of an exam paper.
 
-Find every visual element a student needs to answer a question on this page.
-Include: diagrams, graphs, grids, tables, formula boxes, info boxes, number lines,
-geometric shapes, coordinate axes, charts, completion tables.
-Exclude: blank answer lines, empty answer boxes, page borders, barcodes,
-headers, footers, page numbers, "do not write outside the box" text.
+For each crop, decide:
+1. Is it relevant? A relevant visual is something a student NEEDS to answer a question:
+   diagrams, graphs, grids, tables, formula boxes, info boxes, number lines, geometric shapes.
+   NOT relevant: blank answer lines, empty answer boxes, page borders, barcodes,
+   headers, footers, "do not write" boxes, page number boxes.
+
+2. If relevant, which question number does it belong to?
+   - A visual ABOVE a question still belongs to that question if referenced by it.
+   - A data table at the top of a page belongs to the first question below it that uses the data.
+   - Side-by-side boxes belong to the same question.
+   - Only use questionNumber = "none" if genuinely unsure.
 
 Return ONLY a raw JSON array. No markdown. No explanation.
 Each element:
 {{
-  "label": "multiplication table",
-  "questionNumber": "14",
+  "cropName": "p{page_num}_v1.png",
+  "relevant": true,
+  "questionNumber": "7a",
   "confidence": "high",
-  "notes": "Table of products for 61,63,65,67 — used by Q14a, 14b, 14c",
-  "x": 0.12,
-  "y": 0.05,
-  "w": 0.76,
-  "h": 0.38
+  "label": "pizza toppings completion table",
+  "notes": "Table with SM entry beside Q7a"
 }}
 
-x, y = top-left corner as fraction of page width/height (0.0–1.0)
-w, h = width/height as fraction of page dimensions
-
-Rules:
-- Be generous — slightly oversized is always better than clipping
-- A table ABOVE a question still belongs to that question if the question references it
-- Side-by-side boxes each get their own entry (do not combine them)
-- If no relevant visuals exist on this page return []
-- Only use questionNumber = "none" if genuinely unsure
+confidence: high, medium, or low
+If not relevant set relevant=false and questionNumber="none"
 """
 
 FIND_MISSING_PROMPT = """This is page {page_num} of an exam paper.
@@ -161,12 +161,9 @@ Return ONLY a raw JSON object. No markdown. No explanation.
   "notes": "Grid appears directly under Q3a"
 }}
 
-If you cannot find any visual for this question return:
-{{"found": false}}
-
+If you cannot find any visual return: {{"found": false}}
 x, y = top-left corner as fraction of page width/height (0.0-1.0)
-w, h = width/height as fraction of page dimensions
-Be generous with the bounding box.
+w, h = width/height as fraction of page dimensions. Be generous.
 """
 
 # ── Secrets ───────────────────────────────────────────────────────────────
@@ -255,10 +252,11 @@ def call_gpt(client: OpenAI, content: list, model: str,
     return openai_response_text(run_with_retry(_call))
 
 # ── PDF helpers ───────────────────────────────────────────────────────────
-def render_page_pil(pdf_bytes: bytes, page_num: int, dpi: int = RENDER_DPI) -> Image.Image:
+def render_page_pil(pdf_bytes: bytes, page_num: int,
+                    dpi: int = RENDER_DPI) -> Image.Image:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    mat = fitz.Matrix(dpi/72, dpi/72)
-    pix = doc[page_num-1].get_pixmap(matrix=mat, alpha=False)
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = doc[page_num - 1].get_pixmap(matrix=mat, alpha=False)
     doc.close()
     return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
@@ -274,9 +272,10 @@ def split_pdf(pdf_bytes: bytes, chunk_size: int) -> list[bytes]:
     doc.close()
     return chunks
 
-def pdf_chunk_to_pils(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> list[Image.Image]:
+def pdf_chunk_to_pils(pdf_bytes: bytes,
+                       dpi: int = RENDER_DPI) -> list[Image.Image]:
     doc, out = fitz.open(stream=pdf_bytes, filetype="pdf"), []
-    mat = fitz.Matrix(dpi/72, dpi/72)
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
     for page in doc:
         pix = page.get_pixmap(matrix=mat, alpha=False)
         out.append(Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB"))
@@ -287,14 +286,14 @@ def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
     if page_num == 1:
         return False
     doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = doc[page_num-1].get_text().lower()
+    text = doc[page_num - 1].get_text().lower()
     doc.close()
     return not any(kw in text for kw in SKIP_PAGE_KEYWORDS)
 
-# ── PyMuPDF extraction: pixel-perfect coords, 300 DPI crops ──────────────
+# ── PyMuPDF extraction helpers ────────────────────────────────────────────
 def is_contained_by_any(rect: fitz.Rect,
-                         others: list[fitz.Rect], pad: float = 4.0) -> bool:
-    """Return True if rect is fully inside any of the others."""
+                         others: list[fitz.Rect],
+                         pad: float = 4.0) -> bool:
     for o in others:
         if (rect.x0 >= o.x0 - pad and rect.y0 >= o.y0 - pad and
                 rect.x1 <= o.x1 + pad and rect.y1 <= o.y1 + pad):
@@ -304,7 +303,6 @@ def is_contained_by_any(rect: fitz.Rect,
 def crop_rect(page: fitz.Page, rect: fitz.Rect,
               pad_pt: float = CROP_PAD_PT,
               dpi: int = EXTRACT_DPI) -> bytes:
-    """Crop rect from page with padding, rendered at high DPI."""
     pr     = page.rect
     padded = fitz.Rect(
         max(pr.x0, rect.x0 - pad_pt), max(pr.y0, rect.y0 - pad_pt),
@@ -316,12 +314,10 @@ def crop_rect(page: fitz.Page, rect: fitz.Rect,
 
 def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
     """
-    PyMuPDF extracts all visual candidates with exact pixel coordinates.
-    - Raster images: from get_text("dict") image blocks
-    - Tables: from find_tables() — semantically correct bboxes
-    - Drawings: individual drawing rects directly (no merging),
-                deduped so contained rects are skipped
-    All crops rendered at 300 DPI with padding.
+    Extract all visual candidates using PyMuPDF with exact coordinates.
+      1. Raster image blocks  — re-rendered at 300 DPI from page
+      2. find_tables()        — semantic table bboxes, 300 DPI
+      3. Individual drawings  — NO merging; largest-first dedup
     """
     doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_crops: list[dict] = []
@@ -333,7 +329,7 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
         pr           = page.rect
         taken_rects: list[fitz.Rect] = []
 
-        # ── 1. Raster images ───────────────────────────────────────────
+        # 1. Raster images
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
         for idx, block in enumerate(blocks, 1):
             if block.get("type") != 1:
@@ -343,8 +339,7 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
                 if not img_bytes:
                     continue
                 pil = Image.open(io.BytesIO(img_bytes))
-                w, h = pil.size
-                if w < 40 or h < 40:
+                if pil.width < 40 or pil.height < 40:
                     continue
                 bbox = fitz.Rect(block.get("bbox", [0, 0, 0, 0]))
                 data = crop_rect(page, bbox)
@@ -362,7 +357,7 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
             except Exception:
                 pass
 
-        # ── 2. Tables via find_tables() ────────────────────────────────
+        # 2. Tables
         try:
             for idx, table in enumerate(page.find_tables().tables, 1):
                 rect = fitz.Rect(table.bbox)
@@ -383,26 +378,22 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
         except Exception:
             pass
 
-        # ── 3. Individual drawing rects — NO merging ───────────────────
-        # Collect all drawing rects, sort largest first
+        # 3. Individual drawing rects — no merging
         drawing_rects: list[fitz.Rect] = []
         for drawing in page.get_drawings():
             r = drawing.get("rect")
             if not r:
                 continue
             r = fitz.Rect(r)
-            # Skip tiny noise
             if r.width < 20 or r.height < 20:
                 continue
-            # Skip near-full-page (borders)
             if r.width > pr.width * 0.88 or r.height > pr.height * 0.80:
                 continue
-            # Skip if already covered by a table or raster image
             if is_contained_by_any(r, taken_rects, pad=6):
                 continue
             drawing_rects.append(r)
 
-        # Sort largest area first, then deduplicate contained rects
+        # Largest-first dedup: skip a rect if it's contained by one we already keep
         drawing_rects.sort(key=lambda r: r.width * r.height, reverse=True)
         kept: list[fitz.Rect] = []
         for r in drawing_rects:
@@ -434,10 +425,6 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
 # ── GPT judges relevance + assigns question number ────────────────────────
 def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
                      page_num: int, crops: list[dict]) -> list[dict]:
-    """
-    Send the rendered page + all crops to GPT.
-    GPT decides relevant/not and assigns question numbers.
-    """
     if not crops:
         return []
 
@@ -478,10 +465,6 @@ def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
 @st.cache_data(show_spinner=False)
 def extract_and_judge_visuals(openai_key: str,
                                pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
-    """
-    PyMuPDF extracts pixel-perfect crops at 300 DPI.
-    GPT judges relevance and assigns question numbers.
-    """
     client    = OpenAI(api_key=openai_key)
     all_crops = extract_all_crops(pdf_bytes)
 
@@ -515,7 +498,7 @@ def extract_and_judge_visuals(openai_key: str,
 
     return kept_visuals, full_mapping
 
-# ── Stage 3: Recovery ─────────────────────────────────────────────────────
+# ── Recovery: find visuals for hasImages questions with none ──────────────
 def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
                             record: dict) -> dict | None:
     page_num = clamp_int(record.get("pageNumber", 1), 1)
@@ -548,18 +531,28 @@ def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
         x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
         if (x2 - x1) > 0.95 and (y2 - y1) > 0.90:
             return None
-        crop = page_pil.crop((int(x1*pw), int(y1*ph), int(x2*pw), int(y2*ph)))
-        buf  = io.BytesIO()
-        crop.save(buf, format="PNG")
+
+        # Render recovery crop at 300 DPI from fraction coords
+        doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[page_num - 1]
+        pr   = page.rect
+        rect = fitz.Rect(
+            pr.x0 + x1 * pr.width,  pr.y0 + y1 * pr.height,
+            pr.x0 + x2 * pr.width,  pr.y0 + y2 * pr.height,
+        )
+        crop_data = crop_rect(page, rect, pad_pt=4)
+        doc.close()
+
+        pil  = Image.open(io.BytesIO(crop_data))
         name = f"p{page_num}_recovered_{qnum}.png"
         return {
             "page":           page_num,
             "name":           name,
             "source":         "recovered",
             "kind":           str(data.get("label", "visual")),
-            "data":           buf.getvalue(),
-            "width":          crop.width,
-            "height":         crop.height,
+            "data":           crop_data,
+            "width":          pil.width,
+            "height":         pil.height,
             "questionNumber": qnum,
             "confidence":     str(data.get("confidence", "medium")).lower(),
             "notes":          str(data.get("notes", "Recovered: missing visual")),
@@ -571,8 +564,7 @@ def recover_all_missing(client: OpenAI, pdf_bytes: bytes,
                          records: list[dict],
                          images: list[dict],
                          image_map: dict[str, dict]) -> tuple[list[dict], dict[str, dict]]:
-    missing = [r for r in records
-               if r.get("hasImages") and not r.get("images")]
+    missing = [r for r in records if r.get("hasImages") and not r.get("images")]
     if not missing:
         return images, image_map
 
@@ -737,10 +729,10 @@ def create_airtable_records(token: str, base_id: str, table: str,
     return created
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────
-st.set_page_config(page_title="Past Paper → Airtable v2",
+st.set_page_config(page_title="Past Paper → Airtable v3",
                    page_icon="📄", layout="wide")
-st.title("📄 Past Paper → Airtable v2")
-st.caption("PyMuPDF extracts everything · GPT-4V judges & maps · Recovery pass ensures no missing visuals")
+st.title("📄 Past Paper → Airtable v3")
+st.caption("PyMuPDF (no merging) + GPT-4V judge + recovery pass · 300 DPI crops")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
@@ -795,21 +787,18 @@ if st.button("✨ Extract Questions", type="primary",
 
     with st.status("Extracting…", expanded=True) as status:
 
-        # Stage 1 + 2: extract and judge visuals
-        st.write("📎 Extracting & judging visuals (PyMuPDF + GPT-4V)…")
+        st.write("📎 Extracting visuals (PyMuPDF 300 DPI + GPT-4V judge)…")
         extract_and_judge_visuals.clear()
         images, image_map = extract_and_judge_visuals(OPENAI_KEY, paper_bytes)
         mapped = sum(1 for v in image_map.values()
                      if v.get("questionNumber") not in {"none", ""})
         st.write(f"   {len(images)} visuals kept · {mapped} mapped to questions")
 
-        # Extract questions
         st.write("🤖 Extracting questions (parallel)…")
         questions, q_logs = extract_questions_parallel(client, paper_bytes)
         for line in q_logs:
             st.write(f"   {line}")
 
-        # Extract mark scheme
         ms_map: dict[str, str] = {}
         if ms_bytes:
             st.write("🧠 Extracting mark scheme (parallel)…")
@@ -817,7 +806,6 @@ if st.button("✨ Extract Questions", type="primary",
             for line in ms_logs:
                 st.write(f"   {line}")
 
-        # Build records
         records = []
         for q in questions:
             qnum = normalise_qnum(q.get("questionNumber", ""))
@@ -853,9 +841,7 @@ if st.button("✨ Extract Questions", type="primary",
                 nm = img["name"]
                 if image_map.get(nm, {}).get("questionNumber") in {"", "none", None}:
                     img_page = img["page"]
-                    # Try exact page match first
                     qs = pq_index.get(img_page, [])
-                    # If no exact match, find nearest page that has questions
                     if not qs:
                         nearby = sorted(pq_index.keys(),
                                         key=lambda p: abs(p - img_page))
@@ -891,14 +877,13 @@ if st.button("✨ Extract Questions", type="primary",
                                                    "medium" if "medium" in confs else "low")
                     r["imageMappingNotes"]      = "\n".join(notes)
 
-        # Stage 3: recovery pass
+        # Recovery pass
         missing_count = sum(1 for r in records
                             if r.get("hasImages") and not r.get("images"))
         if missing_count:
-            st.write(f"🔎 Recovery pass: {missing_count} hasImages question(s) with no visual…")
+            st.write(f"🔎 Recovery: {missing_count} hasImages question(s) with no visual…")
             images, image_map = recover_all_missing(
                 client, paper_bytes, records, images, image_map)
-
             for img in images:
                 if img.get("source") != "recovered":
                     continue
@@ -909,9 +894,8 @@ if st.button("✨ Extract Questions", type="primary",
                         r["images"]                 = [img["name"]]
                         r["imageMappingConfidence"] = img.get("confidence", "medium")
                         r["imageMappingNotes"]      = img.get("notes", "")
-
             recovered     = sum(1 for img in images if img.get("source") == "recovered")
-            still_missing = sum(1 for r in records
+            still_missing = sum(1 for r   in records
                                 if r.get("hasImages") and not r.get("images"))
             st.write(f"   Recovered {recovered} · {still_missing} still unresolved")
 
