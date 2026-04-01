@@ -34,34 +34,14 @@ CHUNK_PAGES       = 2
 MAX_WORKERS       = 3
 MAX_RETRIES       = 4
 BASE_BACKOFF      = 2
-
 MAX_IMAGES_PER_REQUEST = 2
-IMAGE_MAX_SIZE         = (1200, 1200)
-JPEG_QUALITY           = 70
-RENDER_DPI             = 150
-VISION_DPI             = 170
+IMAGE_MAX_SIZE    = (1200, 1200)
+JPEG_QUALITY      = 70
+RENDER_DPI        = 150
+VISION_DPI        = 170
 
-# Pages to skip — cover, blank, and additional answer pages
-SKIP_PAGE_KEYWORDS = [
-    "do not write on this page",
-    "additional page, if required",
-    "there are no questions printed",
-    "copyright information",
-]
-
-def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
-    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = doc[page_num - 1].get_text().lower()
-    doc.close()
-    if page_num == 1:
-        return False
-    for kw in SKIP_PAGE_KEYWORDS:
-        if kw in text:
-            return False
-    return True
-
-AT_API  = "https://api.airtable.com/v0"
-AT_META = "https://api.airtable.com/v0/meta"
+AT_API    = "https://api.airtable.com/v0"
+AT_META   = "https://api.airtable.com/v0/meta"
 IMGBB_API = "https://api.imgbb.com/1/upload"
 
 AT_FIELDS = [
@@ -113,6 +93,35 @@ Each element must be:
   "markSchemeAnswer": "Full acceptable answer, notes, working, allow/reject guidance and key words"
 }
 """
+
+VISUAL_DETECT_PROMPT = """This is page {page_num} of an exam paper.
+
+Identify every visual element that a student needs to answer a question.
+Include: diagrams, graphs, grids, tables, formula boxes, number lines, geometric shapes, charts.
+Exclude: answer lines, page borders, headers, footers, barcodes, page numbers, "do not write" text.
+
+Return ONLY a raw JSON array. No markdown. No explanation.
+Each element:
+{{
+  "label": "centimetre grid",
+  "x": 0.25,
+  "y": 0.10,
+  "w": 0.30,
+  "h": 0.25
+}}
+
+x, y = top-left corner as fraction of page width/height (0.0 to 1.0)
+w, h = width and height as fraction of page width/height
+If there are no relevant visuals on this page return an empty array: []
+"""
+
+# Pages to skip
+SKIP_PAGE_KEYWORDS = [
+    "do not write on this page",
+    "additional page, if required",
+    "there are no questions printed",
+    "copyright information",
+]
 
 # ── Secrets ───────────────────────────────────────────────────────────────
 def get_secret(key: str, fallback: str = "") -> str:
@@ -229,178 +238,117 @@ def pdf_chunk_to_pil_images(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> list[Ima
     doc.close()
     return out
 
-# ── Visual region helpers ─────────────────────────────────────────────────
-def content_pct(png_data: bytes) -> float:
-    """Return % of non-white pixels. Used to skip blank line regions."""
-    img  = Image.open(io.BytesIO(png_data)).convert("RGB")
-    stat = ImageStat.Stat(img)
-    # mean brightness per channel — near 255 = mostly white
-    mean_brightness = sum(stat.mean) / 3
-    return 100.0 - (mean_brightness / 255.0 * 100.0)
-
-def rect_inside_any(rect, rect_list, pad=2) -> bool:
-    r = fitz.Rect(rect)
-    return any(
-        r.x0 >= fitz.Rect(o).x0 - pad and r.y0 >= fitz.Rect(o).y0 - pad and
-        r.x1 <= fitz.Rect(o).x1 + pad and r.y1 <= fitz.Rect(o).y1 + pad
-        for o in rect_list
-    )
-
-def merge_rects(rects, x_gap=VEC_MERGE_X_GAP, y_gap=VEC_MERGE_Y_GAP):
-    rects, merged = [fitz.Rect(r) for r in rects], []
-    while rects:
-        cur, changed = rects.pop(0), True
-        while changed:
-            changed, remaining = False, []
-            for r in rects:
-                exp = fitz.Rect(cur.x0-x_gap, cur.y0-y_gap, cur.x1+x_gap, cur.y1+y_gap)
-                if exp.intersects(r):
-                    cur |= r; changed = True
-                else:
-                    remaining.append(r)
-            rects = remaining
-        merged.append(cur)
-    return merged
-
-def render_clip(page, rect, dpi=190) -> tuple[bytes, int, int]:
-    mat = fitz.Matrix(dpi/72, dpi/72)
-    pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
-    data = pix.tobytes("png")
-    img  = Image.open(io.BytesIO(data))
-    return data, img.width, img.height
-
-def looks_useful_pil(pil: Image.Image) -> bool:
-    w, h = pil.size
-    if w < 80 or h < 80 or w * h < 12000:
+def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
+    """Return False for cover, blank, and trailing answer/copyright pages."""
+    if page_num == 1:
         return False
-    asp = w / max(h, 1)
-    if asp > 7 or asp < 0.14:
-        return False
-    try:
-        if not pil.convert("L").getbbox():
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = doc[page_num - 1].get_text().lower()
+    doc.close()
+    for kw in SKIP_PAGE_KEYWORDS:
+        if kw in text:
             return False
-    except Exception:
-        pass
     return True
 
-@st.cache_data(show_spinner=False)
-def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
-    """
-    Extract embedded images, tables, and vector regions from a PDF.
-    Filters out answer-line regions (high whitespace) and full-page borders.
-    """
-    doc     = fitz.open(stream=pdf_bytes, filetype="pdf")
+# ── GPT-Vision visual extraction ──────────────────────────────────────────
+def extract_visuals_from_page(client: OpenAI, pdf_bytes: bytes,
+                               page_num: int) -> list[dict]:
+    """Ask GPT-4V to locate all question-relevant visuals on a page, then crop them."""
+    page_pil       = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
+    page_w, page_h = page_pil.size
+
+    content = [
+        {"type": "input_text",
+         "text": VISUAL_DETECT_PROMPT.format(page_num=page_num)},
+        {"type": "input_image",
+         "image_url": f"data:image/jpeg;base64,{encode_image(page_pil)}"},
+    ]
+    def _call():
+        return client.responses.create(
+            model=VISION_MODEL,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=2000,
+        )
+    raw  = openai_response_text(run_with_retry(_call))
+    rows = safe_json_loads(raw, [])
+
     visuals = []
-
-    for page_num, page in enumerate(doc, 1):
-        table_rects = []
-        pr          = page.rect
-
-        # 1. Embedded raster images
-        for idx, img_info in enumerate(page.get_images(full=True), 1):
-            try:
-                bi  = doc.extract_image(img_info[0])
-                pil = Image.open(io.BytesIO(bi["image"]))
-                if not looks_useful_pil(pil):
-                    continue
-                # Skip barcodes (very wide and short)
-                asp = pil.width / max(pil.height, 1)
-                if asp > 4:
-                    continue
-                visuals.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_img{idx}.{bi['ext']}",
-                    "kind":   "image",
-                    "data":   bi["image"],
-                    "width":  pil.width,
-                    "height": pil.height,
-                })
-            except Exception:
-                pass
-
-        # 2. Tables
+    for idx, row in enumerate(rows, 1):
         try:
-            for idx, table in enumerate(page.find_tables().tables, 1):
-                rect = fitz.Rect(table.bbox)
-                table_rects.append(rect)
-                if rect.width < 40 or rect.height < 40:
-                    continue
-                data, w, h = render_clip(page, rect)
-                if content_pct(data) < VEC_MIN_CONTENT_PCT:
-                    continue
-                visuals.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_table{idx}.png",
-                    "kind":   "table",
-                    "data":   data,
-                    "width":  w,
-                    "height": h,
-                })
+            x = float(row["x"]); y = float(row["y"])
+            w = float(row["w"]); h = float(row["h"])
+
+            # Add small padding, clamp to page
+            pad = 0.01
+            x1  = max(0.0, x - pad);     y1 = max(0.0, y - pad)
+            x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
+
+            # Skip full-page or tiny boxes
+            if (x2 - x1) > 0.95 and (y2 - y1) > 0.85:
+                continue
+            if (x2 - x1) < 0.03 or (y2 - y1) < 0.03:
+                continue
+
+            crop = page_pil.crop((
+                int(x1 * page_w), int(y1 * page_h),
+                int(x2 * page_w), int(y2 * page_h),
+            ))
+            buf = io.BytesIO()
+            crop.save(buf, format="PNG")
+
+            visuals.append({
+                "page":   page_num,
+                "name":   f"p{page_num}_v{idx}.png",
+                "kind":   str(row.get("label", f"visual{idx}")),
+                "data":   buf.getvalue(),
+                "width":  crop.width,
+                "height": crop.height,
+            })
         except Exception:
-            pass
-
-        # 3. Vector regions (diagrams, answer boxes, grids)
-        try:
-            drawing_rects = []
-            for d in page.get_drawings():
-                rect = d.get("rect")
-                if not rect:
-                    continue
-                rect = fitz.Rect(rect)
-                if rect.width < 18 or rect.height < 18:
-                    continue
-                if rect_inside_any(rect, table_rects):
-                    continue
-                drawing_rects.append(rect)
-
-            for idx, rect in enumerate(merge_rects(drawing_rects), 1):
-                # Skip if too small
-                if rect.width < VEC_MIN_DIM or rect.height < VEC_MIN_DIM:
-                    continue
-                # Skip near-full-page regions (page borders, margin boxes)
-                if rect.width > pr.width * VEC_MAX_PAGE_FRAC and rect.height > pr.height * VEC_MAX_PAGE_FRAC:
-                    continue
-                # Skip wide-but-short strips (header/footer lines)
-                if rect.width > pr.width * 0.85 and rect.height < 60:
-                    continue
-
-                data, w, h = render_clip(page, rect)
-
-                if w < 60 or h < 60:
-                    continue
-                asp = w / max(h, 1)
-                if asp > 10 or asp < 0.08:
-                    continue
-
-                # Skip if region is mostly blank (answer lines merged together)
-                if content_pct(data) < VEC_MIN_CONTENT_PCT:
-                    continue
-
-                visuals.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_vec{idx}.png",
-                    "kind":   "vector",
-                    "data":   data,
-                    "width":  w,
-                    "height": h,
-                })
-        except Exception:
-            pass
-
-    doc.close()
+            continue
     return visuals
 
-# ── Parallel extraction ───────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def extract_visual_regions(client_key: str, pdf_bytes: bytes) -> list[dict]:
+    """Run GPT-4V visual extraction on all question pages in parallel."""
+    client = OpenAI(api_key=client_key)
+    doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total  = len(doc)
+    doc.close()
+
+    question_pages = [p for p in range(1, total + 1)
+                      if is_question_page(pdf_bytes, p)]
+
+    results: dict[int, list] = {}
+
+    def process(page_num):
+        try:
+            return page_num, extract_visuals_from_page(client, pdf_bytes, page_num)
+        except Exception:
+            return page_num, []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for pn, visuals in [f.result() for f in
+                            as_completed([ex.submit(process, p)
+                                          for p in question_pages])]:
+            results[pn] = visuals
+
+    all_visuals = []
+    for p in sorted(results):
+        all_visuals.extend(results[p])
+    return all_visuals
+
+# ── Parallel question extraction ──────────────────────────────────────────
 def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes) -> tuple[list[dict], list[str]]:
     pdf_chunks = split_pdf(pdf_bytes, CHUNK_PAGES)
     logs: list[str] = []
 
     def process_one(index: int, chunk_bytes: bytes):
-        offset  = index * CHUNK_PAGES
-        images  = pdf_chunk_to_pil_images(chunk_bytes)
-        raw     = call_gpt_vision(client, images, QUESTION_PROMPT, model=TEXT_MODEL)
-        rows    = safe_json_loads(raw, [])
-        fixed   = []
+        offset = index * CHUNK_PAGES
+        images = pdf_chunk_to_pil_images(chunk_bytes)
+        raw    = call_gpt_vision(client, images, QUESTION_PROMPT, model=TEXT_MODEL)
+        rows   = safe_json_loads(raw, [])
+        fixed  = []
         for row in rows:
             fixed.append({
                 "questionNumber":   normalise_qnum(row.get("questionNumber",   "")),
@@ -459,7 +407,7 @@ def map_images_for_page(client: OpenAI, pdf_bytes: bytes,
                         page_num: int, page_imgs: list[dict]) -> dict[str, dict]:
     page_pil = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
     img_list = "\n".join(
-        f"- {img['name']} ({img['width']}x{img['height']}, kind={img.get('kind','unknown')})"
+        f"- {img['name']} ({img['width']}x{img['height']}, kind={img.get('kind','?')})"
         for img in page_imgs
     )
     prompt = f"""This is page {page_num} of an exam paper.
@@ -469,9 +417,9 @@ The following visuals were extracted from this page:
 
 For each visual, identify which question number it belongs to by reading the page layout.
 Return ONLY a JSON array:
-[{{"imageName": "p{page_num}_table1.png", "questionNumber": "3b", "confidence": "high", "notes": "Table is beside Q3b"}}]
+[{{"imageName": "p{page_num}_v1.png", "questionNumber": "3b", "confidence": "high", "notes": "Table is beside Q3b"}}]
 
-confidence values: high, medium, low.
+confidence: high, medium, or low.
 If no question can be assigned use questionNumber = "none".
 """
     raw  = call_gpt_vision(client, [page_pil], prompt, model=VISION_MODEL,
@@ -649,14 +597,15 @@ if st.button("✨ Extract Questions", type="primary",
              disabled=not (paper_file and paper_name and exam_type and OPENAI_KEY)):
     paper_bytes = paper_file.read()
     ms_bytes    = ms_file.read() if ms_file else None
+    client      = OpenAI(api_key=OPENAI_KEY)
 
     with st.status("Extracting…", expanded=True) as status:
         st.write("📎 Extracting visuals with GPT-4V…")
         images = extract_visual_regions(OPENAI_KEY, paper_bytes)
-        st.write(f"   Found {len(images)} visuals across {len(set(i['page'] for i in images))} pages")
+        st.write(f"   Found {len(images)} visuals across "
+                 f"{len(set(i['page'] for i in images))} pages")
 
         st.write("🤖 Extracting questions (parallel)…")
-        client    = OpenAI(api_key=OPENAI_KEY)
         questions, q_logs = extract_questions_parallel(client, paper_bytes)
         for line in q_logs:
             st.write(f"   {line}")
@@ -728,8 +677,8 @@ if st.button("✨ Extract Questions", type="primary",
 
 # ── Step 3: Review ────────────────────────────────────────────────────────
 if "records" in st.session_state:
-    records   = st.session_state["records"]
-    images    = st.session_state.get("images", [])
+    records = st.session_state["records"]
+    images  = st.session_state.get("images", [])
 
     st.subheader("3 · Review & edit")
     st.caption("Edit any cell before syncing.")
@@ -780,7 +729,7 @@ if "records" in st.session_state:
             for idx, img in enumerate(images):
                 with cols[idx % 4]:
                     st.image(img["data"],
-                             caption=f"{img['name']} ({img.get('kind','?')})",
+                             caption=f"{img['name']} — {img.get('kind','?')}",
                              use_container_width=True)
 
     # ── Step 4: Export / Sync ─────────────────────────────────────────────
@@ -819,9 +768,9 @@ if "records" in st.session_state:
             st.caption(f"Token: `{token_preview}` | Base: `{AT_BASE}` | Table: `{AT_TABLE}`")
 
             if st.button("🚀 Sync to Airtable", type="primary"):
-                _records  = st.session_state.get("records", [])
-                _images   = st.session_state.get("images",  [])
-                _imgbb    = get_secret("IMGBB_API_KEY")
+                _records = st.session_state.get("records", [])
+                _images  = st.session_state.get("images",  [])
+                _imgbb   = get_secret("IMGBB_API_KEY")
                 log_lines: list[str] = []
                 def log(msg): log_lines.append(msg)
 
@@ -842,7 +791,6 @@ if "records" in st.session_state:
                 elif _images and not _imgbb:
                     log("⚠️ IMGBB_API_KEY missing — visuals will not be attached.")
 
-                # Build Airtable payload
                 try:
                     existing = get_existing_fields(AT_TOKEN, AT_BASE, AT_TABLE)
                     payload  = []
