@@ -320,6 +320,7 @@ def render_clip(page: fitz.Page, rect: fitz.Rect, dpi: int = EXTRACT_DPI) -> byt
 def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
     """
     Extract every possible visual candidate from every question page.
+    Order: raster images → find_tables() → path regions (skip if overlaps a table).
     No relevance filtering — GPT judges that in Stage 2.
     """
     doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -331,7 +332,7 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
 
         pr = page.rect
 
-        # 1. Embedded raster images
+        # ── 1. Embedded raster images ──────────────────────────────────
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
         for idx, block in enumerate(blocks, 1):
             if block.get("type") != 1:
@@ -351,11 +352,40 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
                     "data":   img_bytes,
                     "width":  w,
                     "height": h,
+                    "bbox":   fitz.Rect(block.get("bbox", [0,0,0,0])),
                 })
             except Exception:
                 pass
 
-        # 2. All path regions
+        # ── 2. Tables via find_tables() — semantic, pixel-perfect ──────
+        table_rects: list[fitz.Rect] = []
+        try:
+            for idx, table in enumerate(page.find_tables().tables, 1):
+                rect = fitz.Rect(table.bbox)
+                # Expand slightly to catch full border
+                rect = fitz.Rect(rect.x0 - 3, rect.y0 - 3,
+                                 rect.x1 + 3, rect.y1 + 3)
+                table_rects.append(rect)
+                if rect.width < 30 or rect.height < 30:
+                    continue
+                data = render_clip(page, rect)
+                pil  = Image.open(io.BytesIO(data))
+                w, h = pil.size
+                if w < 20 or h < 20:
+                    continue
+                all_crops.append({
+                    "page":   page_num,
+                    "name":   f"p{page_num}_table{idx}.png",
+                    "source": "table",
+                    "data":   data,
+                    "width":  w,
+                    "height": h,
+                    "bbox":   rect,
+                })
+        except Exception:
+            pass
+
+        # ── 3. Path regions — skip anything that overlaps a table ──────
         path_rects: list[fitz.Rect] = []
         for path in page.get_drawings():
             r = path.get("rect")
@@ -364,6 +394,9 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
             r = fitz.Rect(r)
             if r.width < 10 or r.height < 10:
                 continue
+            # Skip if this path is inside or overlaps a table we already have
+            if any(rects_overlap(r, tr, pad=6) for tr in table_rects):
+                continue
             path_rects.append(r)
 
         for idx, rect in enumerate(merge_rects(path_rects), 1):
@@ -371,6 +404,9 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
             if rect.width > pr.width * 0.93 and rect.height > pr.height * 0.83:
                 continue
             if rect.width < 15 or rect.height < 15:
+                continue
+            # Skip if overlaps a table bbox (belt-and-braces)
+            if any(rects_overlap(rect, tr, pad=6) for tr in table_rects):
                 continue
             try:
                 data = render_clip(page, rect)
@@ -385,6 +421,7 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
                     "data":   data,
                     "width":  w,
                     "height": h,
+                    "bbox":   rect,
                 })
             except Exception:
                 pass
