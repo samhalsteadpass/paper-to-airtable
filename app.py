@@ -118,6 +118,11 @@ For each crop, decide:
    "do not write" boxes, page number boxes.
 
 2. If relevant, which question number does it belong to?
+   - Read the full page image carefully to find which question the visual is associated with.
+   - A visual that appears ABOVE a question still belongs to that question if it is referenced by it.
+   - A data table at the top of a page belongs to the first question below it that uses that data.
+   - If two visuals are clearly for the same question, assign both to that question number.
+   - Only use questionNumber = "none" if you genuinely cannot determine the question.
 
 Return ONLY a raw JSON array. No markdown. No explanation.
 Each element:
@@ -131,7 +136,6 @@ Each element:
 }}
 
 confidence: high, medium, or low
-If relevant but question cannot be determined use questionNumber = "none"
 If not relevant, still include the entry with relevant = false and questionNumber = "none"
 """
 
@@ -854,11 +858,19 @@ if st.button("✨ Extract Questions", type="primary",
             for img in images:
                 nm = img["name"]
                 if image_map.get(nm, {}).get("questionNumber") in {"", "none", None}:
-                    qs = pq_index.get(img["page"], [])
+                    img_page = img["page"]
+                    # Try exact page match first
+                    qs = pq_index.get(img_page, [])
+                    # If no exact match, find nearest page that has questions
+                    if not qs:
+                        nearby = sorted(pq_index.keys(),
+                                        key=lambda p: abs(p - img_page))
+                        if nearby:
+                            qs = pq_index[nearby[0]]
                     image_map[nm] = {
                         "questionNumber": qs[-1] if qs else "none",
                         "confidence":     "low",
-                        "notes":          "Fallback: last question on page",
+                        "notes":          "Fallback: nearest question by page",
                         "source":         "fallback",
                     }
 
