@@ -812,15 +812,19 @@ def upload_attachment_to_record(token: str, base_id: str, record_id: str,
     Upload image bytes directly to an Airtable record's attachment field.
     Images live in Airtable's own storage — they never disappear.
     Endpoint: POST https://content.airtable.com/v0/{baseId}/{recordId}/uploadAttachment
+    Requires both Authorization AND x-airtable-application-id headers.
     """
     url = f"https://content.airtable.com/v0/{base_id}/{record_id}/uploadAttachment"
-    headers = {"Authorization": f"Bearer {token}"}
-    files   = {
+    headers = {
+        "Authorization":             f"Bearer {token}",
+        "x-airtable-application-id": base_id,
+    }
+    files = {
         "file":      (img["name"], img["data"], "image/png"),
         "fieldName": (None, field_name),
     }
     resp = requests.post(url, headers=headers, files=files, timeout=120)
-    return resp.ok, f"HTTP {resp.status_code}: {resp.text[:300]}"
+    return resp.ok, f"URL={url} | HTTP {resp.status_code}: {resp.text[:300]}"
 
 def create_airtable_records(token: str, base_id: str, table: str,
                              records: list[dict]) -> list[dict]:
@@ -1174,6 +1178,10 @@ if "records" in st.session_state:
                     log(f"Pushing {len(payload)} records…")
                     created = create_airtable_records(AT_TOKEN, AT_BASE, AT_TABLE, payload)
                     log(f"✅ {len(created)} records created")
+                    if created:
+                        sample = created[0]
+                        log(f"  Sample record: id={sample['id']} "
+                            f"Q={sample.get('fields',{}).get('Question Number','?')}")
 
                     # ── Step B: upload images directly into each record ────
                     # Map questionNumber → Airtable record ID from what was just created
