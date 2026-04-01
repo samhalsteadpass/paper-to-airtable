@@ -9,9 +9,10 @@ Flow:
   Step 5  Export / Sync to Airtable
 
 Extraction strategy:
-  1. Raster images   — get_text("dict") image blocks, re-rendered at 300 DPI
-  2. Tables          — find_tables(), skip if > 50% of page (false positives)
-  3. Drawings        — individual rects, NO merging, largest-first dedup
+  1. Raster images  — get_text("dict") image blocks, re-rendered at 300 DPI
+  2. Tables         — find_tables(), skip if > 50% of page (false positives)
+  3. Drawings       — ALL paths collected, clustered by proximity (20pt),
+                      largest-first dedup applied to clusters
   GPT judges: relevant? which question? + recovery pass for hasImages with no visual.
 
 Secrets:
@@ -294,7 +295,7 @@ def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
     doc.close()
     return not any(kw in text for kw in SKIP_PAGE_KEYWORDS)
 
-# ── PyMuPDF extraction ────────────────────────────────────────────────────
+# ── PyMuPDF extraction helpers ────────────────────────────────────────────
 def is_contained_by_any(rect: fitz.Rect,
                          others: list[fitz.Rect],
                          pad: float = 4.0) -> bool:
@@ -307,14 +308,12 @@ def is_contained_by_any(rect: fitz.Rect,
 def cluster_rects(rects: list[fitz.Rect],
                    proximity: float = 20.0) -> list[fitz.Rect]:
     """
-    Cluster rects that are within `proximity` pt of each other.
-    Returns the bounding box of each cluster.
-    This groups individual line segments that form a single visual element.
+    Cluster rects within proximity pt of each other into bounding boxes.
+    Groups individual line segments (e.g. SM table) into one bbox.
     """
     if not rects:
         return []
 
-    # Expand each rect by proximity, union overlapping, shrink back
     expanded = [fitz.Rect(r.x0 - proximity, r.y0 - proximity,
                            r.x1 + proximity, r.y1 + proximity)
                 for r in rects]
@@ -322,30 +321,30 @@ def cluster_rects(rects: list[fitz.Rect],
     clusters: list[fitz.Rect] = []
     used = [False] * len(expanded)
 
-    for i, exp in enumerate(expanded):
+    for i in range(len(rects)):
         if used[i]:
             continue
-        # Start a new cluster from original rect i
         cluster = fitz.Rect(rects[i])
         used[i] = True
         changed = True
         while changed:
             changed = False
-            for j, exp2 in enumerate(expanded):
+            for j in range(len(rects)):
                 if used[j]:
                     continue
-                # Check if expanded rect j overlaps current cluster (expanded)
-                cluster_exp = fitz.Rect(cluster.x0 - proximity,
-                                        cluster.y0 - proximity,
-                                        cluster.x1 + proximity,
-                                        cluster.y1 + proximity)
-                if cluster_exp.intersects(exp2):
+                cluster_exp = fitz.Rect(
+                    cluster.x0 - proximity, cluster.y0 - proximity,
+                    cluster.x1 + proximity, cluster.y1 + proximity,
+                )
+                if cluster_exp.intersects(expanded[j]):
                     cluster |= rects[j]
                     used[j] = True
                     changed = True
         clusters.append(cluster)
 
     return clusters
+
+def crop_rect(page: fitz.Page, rect: fitz.Rect,
               pad_pt: float = CROP_PAD_PT,
               dpi: int = EXTRACT_DPI) -> bytes:
     pr     = page.rect
@@ -357,14 +356,14 @@ def cluster_rects(rects: list[fitz.Rect],
     pix = page.get_pixmap(matrix=mat, clip=padded, alpha=False)
     return pix.tobytes("png")
 
+# ── PyMuPDF extraction ────────────────────────────────────────────────────
 def extract_all_crops(pdf_bytes: bytes,
                        debug_page: int = 0) -> tuple[list[dict], list[str]]:
     """
     Extract all visual candidates from every question page.
-      1. Raster images  — image blocks from get_text("dict")
+      1. Raster images  — image blocks from get_text("dict"), 300 DPI
       2. Tables         — find_tables(), skip false positives > 50% page area
-      3. Drawings       — individual rects, no merging, largest-first dedup
-    All crops rendered at 300 DPI with padding.
+      3. Drawings       — ALL paths clustered by proximity, largest-first dedup
     """
     doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_crops: list[dict] = []
@@ -374,10 +373,10 @@ def extract_all_crops(pdf_bytes: bytes,
         if not is_question_page(pdf_bytes, page_num):
             continue
 
-        pr           = page.rect
-        page_area    = pr.width * pr.height
+        pr        = page.rect
+        page_area = pr.width * pr.height
         taken_rects: list[fitz.Rect] = []
-        is_debug     = (debug_page == page_num)
+        is_debug  = (debug_page == page_num)
 
         # 1. Raster images
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
@@ -396,7 +395,8 @@ def extract_all_crops(pdf_bytes: bytes,
                 pil2 = Image.open(io.BytesIO(data))
                 taken_rects.append(bbox)
                 if is_debug:
-                    debug_log.append(f"RASTER p{page_num}: {bbox} ({pil2.width}x{pil2.height}px)")
+                    debug_log.append(
+                        f"RASTER p{page_num}: {bbox} ({pil2.width}x{pil2.height}px)")
                 all_crops.append({
                     "page":   page_num,
                     "name":   f"p{page_num}_raster{idx}.png",
@@ -409,7 +409,7 @@ def extract_all_crops(pdf_bytes: bytes,
             except Exception:
                 pass
 
-        # 2. Tables — skip false positives that cover > 50% of page
+        # 2. Tables — skip false positives > 50% of page area
         try:
             for idx, table in enumerate(page.find_tables().tables, 1):
                 rect = fitz.Rect(table.bbox)
@@ -419,14 +419,14 @@ def extract_all_crops(pdf_bytes: bytes,
                     if is_debug:
                         debug_log.append(
                             f"SKIP false-positive table p{page_num}: "
-                            f"{rect} ({rect.width:.0f}x{rect.height:.0f}pt)"
-                        )
+                            f"{rect} ({rect.width:.0f}x{rect.height:.0f}pt)")
                     continue
                 data = crop_rect(page, rect)
                 pil  = Image.open(io.BytesIO(data))
                 taken_rects.append(rect)
                 if is_debug:
-                    debug_log.append(f"TABLE p{page_num}: {rect} ({rect.width:.0f}x{rect.height:.0f}pt)")
+                    debug_log.append(
+                        f"TABLE p{page_num}: {rect} ({rect.width:.0f}x{rect.height:.0f}pt)")
                 all_crops.append({
                     "page":   page_num,
                     "name":   f"p{page_num}_table{idx}.png",
@@ -439,26 +439,22 @@ def extract_all_crops(pdf_bytes: bytes,
         except Exception:
             pass
 
-        # 3. Drawings — collect ALL paths (including thin lines), then cluster
-        raw_drawing_rects: list[fitz.Rect] = []
+        # 3. Drawings — collect ALL paths, cluster, dedup
+        raw_rects: list[fitz.Rect] = []
         for drawing in page.get_drawings():
             r = drawing.get("rect")
             if not r:
                 continue
             r = fitz.Rect(r)
-            # Only skip sub-pixel noise
-            if r.width < 2 or r.height < 2:
+            if r.width < 2 or r.height < 2:        # skip sub-pixel noise
                 continue
-            # Skip near-full-page
             if r.width > pr.width * 0.88 or r.height > pr.height * 0.80:
                 continue
-            raw_drawing_rects.append(r)
+            raw_rects.append(r)
 
-        # Cluster nearby paths into bounding boxes
-        clustered = cluster_rects(raw_drawing_rects, proximity=20.0)
+        clustered = cluster_rects(raw_rects, proximity=20.0)
 
-        # Now apply size filters and dedup on clusters
-        valid_clusters = []
+        valid: list[fitz.Rect] = []
         for r in clustered:
             if r.width < 20 or r.height < 20:
                 continue
@@ -468,28 +464,24 @@ def extract_all_crops(pdf_bytes: bytes,
                 if is_debug:
                     debug_log.append(
                         f"SKIP contained-by-taken p{page_num}: "
-                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
-                    )
+                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)")
                 continue
-            valid_clusters.append(r)
+            valid.append(r)
 
-        # Largest-first dedup
-        valid_clusters.sort(key=lambda r: r.width * r.height, reverse=True)
+        valid.sort(key=lambda r: r.width * r.height, reverse=True)
         kept: list[fitz.Rect] = []
-        for r in valid_clusters:
+        for r in valid:
             if not is_contained_by_any(r, kept, pad=4):
                 kept.append(r)
                 if is_debug:
                     debug_log.append(
                         f"KEEP cluster p{page_num}: "
-                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
-                    )
+                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)")
             else:
                 if is_debug:
                     debug_log.append(
                         f"SKIP contained-by-kept p{page_num}: "
-                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
-                    )
+                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)")
 
         for idx, rect in enumerate(kept, 1):
             try:
@@ -534,9 +526,7 @@ def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
     raw  = call_gpt(client, content, VISION_MODEL, max_output_tokens=3000)
     rows = safe_json_loads(raw, [])
 
-    judgements: dict[str, dict] = {
-        str(r.get("cropName", "") or "").strip(): r for r in rows
-    }
+    judgements = {str(r.get("cropName", "") or "").strip(): r for r in rows}
 
     kept: list[dict] = []
     for crop in crops:
@@ -558,16 +548,14 @@ def extract_and_judge_visuals(openai_key: str,
                                pdf_bytes: bytes,
                                all_crops: list[dict]) -> tuple[list[dict], dict[str, dict]]:
     client  = OpenAI(api_key=openai_key)
-
     by_page: dict[int, list[dict]] = {}
     for crop in all_crops:
         by_page.setdefault(crop["page"], []).append(crop)
 
     results: dict[int, list] = {}
 
-    def process_page(page_num: int, crops: list[dict]):
-        judged = judge_page_crops(client, pdf_bytes, page_num, crops)
-        return page_num, judged
+    def process_page(pn: int, crops: list[dict]):
+        return pn, judge_page_crops(client, pdf_bytes, pn, crops)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for pn, judged in [f.result() for f in
@@ -618,8 +606,8 @@ def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
         x = float(data["x"]); y = float(data["y"])
         w = float(data["w"]); h = float(data["h"])
         pad = 0.02
-        x1  = max(0.0, x - pad);     y1 = max(0.0, y - pad)
-        x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
+        x1 = max(0.0, x - pad);     y1 = max(0.0, y - pad)
+        x2 = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
         if (x2 - x1) > 0.95 and (y2 - y1) > 0.90:
             return None
 
@@ -822,7 +810,7 @@ def create_airtable_records(token: str, base_id: str, table: str,
 st.set_page_config(page_title="Past Paper → Airtable v3",
                    page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable v3")
-st.caption("PyMuPDF extracts (300 DPI, no merging) · View all · GPT judges · Recovery pass")
+st.caption("PyMuPDF extracts (300 DPI, clustered) · View all · GPT judges · Recovery pass")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
