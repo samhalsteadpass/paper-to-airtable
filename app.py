@@ -806,25 +806,25 @@ def get_existing_fields(token: str, base_id: str, table: str) -> set[str]:
     return set()
 
 # ── Direct Airtable attachment upload (no third-party host needed) ────────
-def upload_attachment_to_record(token: str, base_id: str, record_id: str,
-                                 field_name: str, img: dict) -> tuple[bool, str]:
+# ── Cloudinary upload (permanent, free, no auth needed for unsigned) ──────
+CLOUDINARY_API = "https://api.cloudinary.com/v1_1"
+
+def upload_to_cloudinary(cloud_name: str, upload_preset: str,
+                          img: dict) -> str | None:
     """
-    Upload image bytes directly to an Airtable record's attachment field.
-    Images live in Airtable's own storage — they never disappear.
-    Endpoint: POST https://content.airtable.com/v0/{baseId}/{recordId}/uploadAttachment
-    Requires both Authorization AND x-airtable-application-id headers.
+    Upload via an unsigned Cloudinary upload preset.
+    Images are permanent — Cloudinary never deletes them.
     """
-    url = f"https://content.airtable.com/v0/{base_id}/{record_id}/uploadAttachment"
-    headers = {
-        "Authorization":             f"Bearer {token}",
-        "x-airtable-application-id": base_id,
-    }
-    files = {
-        "file":      (img["name"], img["data"], "image/png"),
-        "fieldName": (None, field_name),
-    }
-    resp = requests.post(url, headers=headers, files=files, timeout=120)
-    return resp.ok, f"URL={url} | HTTP {resp.status_code}: {resp.text[:300]}"
+    public_id = img["name"].rsplit(".", 1)[0].replace(".", "_")
+    resp = requests.post(
+        f"{CLOUDINARY_API}/{cloud_name}/image/upload",
+        data={"upload_preset": upload_preset, "public_id": public_id},
+        files={"file": (img["name"], img["data"], "image/png")},
+        timeout=120,
+    )
+    if resp.ok:
+        return resp.json().get("secure_url")
+    return None
 
 def create_airtable_records(token: str, base_id: str, table: str,
                              records: list[dict]) -> list[dict]:
@@ -845,10 +845,11 @@ st.set_page_config(page_title="Past Paper → Airtable v3",
 st.title("📄 Past Paper → Airtable v3")
 st.caption("PyMuPDF extracts (300 DPI, clustered) · View all · GPT judges · Recovery pass")
 
-OPENAI_KEY = get_secret("OPENAI_API_KEY")
-AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
-AT_BASE    = get_secret("AIRTABLE_BASE_ID")
-IMGBB_KEY  = get_secret("IMGBB_API_KEY")
+OPENAI_KEY        = get_secret("OPENAI_API_KEY")
+AT_TOKEN          = get_secret("AIRTABLE_TOKEN")
+AT_BASE           = get_secret("AIRTABLE_BASE_ID")
+CLOUDINARY_CLOUD  = get_secret("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_PRESET = get_secret("CLOUDINARY_UPLOAD_PRESET")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -865,7 +866,19 @@ with st.sidebar:
     else:
         st.success("✓ Airtable Base ID loaded")
     # imgbb no longer used — images upload directly to Airtable
+    if not CLOUDINARY_CLOUD:
+        CLOUDINARY_CLOUD = st.text_input("Cloudinary Cloud Name", placeholder="my-cloud")
+    else:
+        st.success("✓ Cloudinary cloud name loaded")
+    if not CLOUDINARY_PRESET:
+        CLOUDINARY_PRESET = st.text_input("Cloudinary Upload Preset", placeholder="my-preset")
+    else:
+        st.success("✓ Cloudinary upload preset loaded")
     AT_TABLE = st.text_input("Table name", value="Questions")
+    st.divider()
+    st.markdown("**Secrets needed** (sidebar or `st.secrets`)")
+    st.markdown("- `OPENAI_API_KEY`\n- `AIRTABLE_TOKEN`\n- `AIRTABLE_BASE_ID`\n"
+                "- `CLOUDINARY_CLOUD_NAME`\n- `CLOUDINARY_UPLOAD_PRESET`")
     st.divider()
     st.markdown("**Required Airtable fields**")
     for name, ftype in AT_FIELDS:
@@ -1148,15 +1161,32 @@ if "records" in st.session_state:
                 log_lines: list[str] = []
                 def log(msg): log_lines.append(msg)
 
-                # Build image lookup by name
                 img_by_name = {img["name"]: img for img in _images}
+
+                # ── Step A: upload all images to Cloudinary ───────────────
+                img_url_map: dict[str, str] = {}
+                if _images and CLOUDINARY_CLOUD and CLOUDINARY_PRESET:
+                    log(f"Uploading {len(_images)} images to Cloudinary…")
+                    for img in _images:
+                        url = upload_to_cloudinary(
+                            CLOUDINARY_CLOUD, CLOUDINARY_PRESET, img)
+                        if url:
+                            img_url_map[img["name"]] = url
+                            log(f"  ✅ {img['name']} → {url}")
+                        else:
+                            log(f"  ❌ {img['name']} failed")
+                elif _images and not (CLOUDINARY_CLOUD and CLOUDINARY_PRESET):
+                    log("⚠️ Cloudinary not configured — images skipped. "
+                        "Add Cloud Name + Upload Preset to sidebar or st.secrets.")
 
                 try:
                     existing = get_existing_fields(AT_TOKEN, AT_BASE, AT_TABLE)
 
-                    # ── Step A: push all records WITHOUT images first ──────
+                    # ── Step B: create all records WITH image URLs ─────────
                     payload = []
                     for r in _records:
+                        urls   = [img_url_map[n] for n in r.get("images", [])
+                                  if n in img_url_map]
                         fields = {
                             "Question Number":          r.get("questionNumber",         ""),
                             "Question Text":            r.get("questionText",           ""),
@@ -1165,7 +1195,8 @@ if "records" in st.session_state:
                             "Subtopic":                 r.get("subtopic",               ""),
                             "Mark Scheme Answer":       r.get("markSchemeAnswer",       ""),
                             "Image Description":        r.get("imageDescription",       ""),
-                            "Has Images":               bool(r.get("hasImages",         False)),
+                            "Has Images":               bool(urls or r.get("hasImages", False)),
+                            "Images":                   [{"url": u} for u in urls],
                             "Paper Name":               r.get("paperName",   paper_name),
                             "Exam Type":                r.get("examType",    exam_type),
                             "Page Number":              clamp_int(r.get("pageNumber", 1), 1),
@@ -1177,49 +1208,7 @@ if "records" in st.session_state:
 
                     log(f"Pushing {len(payload)} records…")
                     created = create_airtable_records(AT_TOKEN, AT_BASE, AT_TABLE, payload)
-                    log(f"✅ {len(created)} records created")
-                    if created:
-                        sample = created[0]
-                        log(f"  Sample record: id={sample['id']} "
-                            f"Q={sample.get('fields',{}).get('Question Number','?')}")
-
-                    # ── Step B: upload images directly into each record ────
-                    # Map questionNumber → Airtable record ID from what was just created
-                    if "Images" in existing and _images:
-                        at_table_url = f"{AT_API}/{AT_BASE}/{requests.utils.quote(AT_TABLE, safe='')}"
-
-                        # Build qnum → record_id map from created records
-                        qnum_to_record_id: dict[str, str] = {}
-                        for rec in created:
-                            qn = rec.get("fields", {}).get("Question Number", "")
-                            if qn:
-                                qnum_to_record_id[normalise_qnum(qn)] = rec["id"]
-
-                        upload_count = 0
-                        fail_count   = 0
-                        for r in _records:
-                            img_names = r.get("images", [])
-                            if not img_names:
-                                continue
-                            qn        = normalise_qnum(r.get("questionNumber", ""))
-                            record_id = qnum_to_record_id.get(qn)
-                            if not record_id:
-                                log(f"  ⚠️ No record ID for Q{qn} — skipping images")
-                                continue
-                            for name in img_names:
-                                img = img_by_name.get(name)
-                                if not img:
-                                    continue
-                                ok, detail = upload_attachment_to_record(
-                                    AT_TOKEN, AT_BASE, record_id, "Images", img)
-                                if ok:
-                                    upload_count += 1
-                                    log(f"  ✅ {name} → Q{qn} (record {record_id})")
-                                else:
-                                    fail_count += 1
-                                    log(f"  ❌ {name} → Q{qn} | {detail}")
-                        log(f"Images: {upload_count} uploaded · {fail_count} failed")
-
+                    log(f"✅ {len(created)} records synced!")
                 except Exception as e:
                     log(f"❌ Sync failed: {e}")
 
