@@ -506,7 +506,7 @@ def extract_all_crops(pdf_bytes: bytes,
 
         for idx, rect in enumerate(kept, 1):
             try:
-                data = crop_rect(page, rect, pad_pt=DRAW_CROP_PAD_PT)
+                data = crop_rect(page, rect, pad_pt=CROP_PAD_PT)
                 pil  = Image.open(io.BytesIO(data))
                 if pil.width < 20 or pil.height < 20:
                     continue
@@ -805,13 +805,27 @@ def get_existing_fields(token: str, base_id: str, table: str) -> set[str]:
             return {f["name"] for f in t.get("fields", [])}
     return set()
 
+# ── FIX 1: Use direct CDN image URL and set expiration=0 (never expire) ──
 def upload_to_imgbb(api_key: str, img: dict) -> str | None:
     b64  = base64.standard_b64encode(img["data"]).decode()
-    resp = requests.post(IMGBB_API,
-                         data={"key": api_key, "name": img["name"], "image": b64},
-                         timeout=60)
+    resp = requests.post(
+        IMGBB_API,
+        data={
+            "key":        api_key,
+            "name":       img["name"],
+            "image":      b64,
+            "expiration": 0,   # 0 = never expire
+        },
+        timeout=60,
+    )
     if resp.ok:
-        return resp.json()["data"]["url"]
+        data = resp.json().get("data", {})
+        # Use direct CDN URL — not the viewer page URL — so Airtable can
+        # re-validate the attachment without hitting a redirect or HTML page.
+        url = (data.get("image", {}).get("url")
+               or data.get("display_url")
+               or data.get("url"))
+        return url
     return None
 
 def create_airtable_records(token: str, base_id: str, table: str,
@@ -950,7 +964,7 @@ if st.button("✨ Extract Questions & Judge Visuals", type="primary",
                 "hasImages":              bool(q.get("hasImages",   False)),
                 "pageNumber":             clamp_int(q.get("pageNumber", 1), 1),
                 "paperName":              paper_name,
-                "examType":               exam_type,
+                "examType":              exam_type,
                 "imageMappingConfidence": "",
                 "imageMappingNotes":      "",
                 "images":                 [],
@@ -1141,18 +1155,20 @@ if "records" in st.session_state:
                 def log(msg): log_lines.append(msg)
 
                 img_url_map: dict[str, str] = {}
+
+                # ── FIX 2: Sequential uploads with throttle to avoid imgbb
+                #           rate limits that caused silent failures and then
+                #           Airtable dropping attachments on re-validation. ──
                 if _images and _imgbb:
                     log(f"Uploading {len(_images)} visuals to imgbb…")
-                    def upload_one(img):
-                        return img["name"], upload_to_imgbb(_imgbb, img)
-                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                        for name, url in [f.result() for f in as_completed(
-                                [ex.submit(upload_one, img) for img in _images])]:
-                            if url:
-                                img_url_map[name] = url
-                                log(f"  ✅ {name}")
-                            else:
-                                log(f"  ❌ {name} failed")
+                    for img in _images:
+                        url = upload_to_imgbb(_imgbb, img)
+                        if url:
+                            img_url_map[img["name"]] = url
+                            log(f"  ✅ {img['name']}")
+                        else:
+                            log(f"  ❌ {img['name']} failed")
+                        time.sleep(0.5)   # stay under imgbb rate limit
                 elif _images and not _imgbb:
                     log("⚠️ IMGBB_API_KEY missing — visuals not attached.")
 
