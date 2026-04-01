@@ -296,10 +296,12 @@ def rects_overlap(a: fitz.Rect, b: fitz.Rect, pad: float = 4.0) -> bool:
 
 def merge_rects(rects: list[fitz.Rect],
                 pad: float = 6.0,
-                max_h_gap: float = 30.0) -> list[fitz.Rect]:
+                max_h_gap: float = 30.0,
+                max_v_gap: float = 25.0) -> list[fitz.Rect]:
     """
-    Merge overlapping rects. Rects with horizontal gap > max_h_gap
-    are NOT merged — keeps side-by-side boxes separate.
+    Merge overlapping rects.
+    Rects with horizontal gap > max_h_gap are NOT merged (keeps side-by-side boxes separate).
+    Rects with vertical gap > max_v_gap are NOT merged (keeps Q7a table and Q7b boxes separate).
     """
     rects, merged = list(rects), []
     while rects:
@@ -308,7 +310,8 @@ def merge_rects(rects: list[fitz.Rect],
             changed, remaining = False, []
             for r in rects:
                 h_gap = max(r.x0 - cur.x1, cur.x0 - r.x1, 0.0)
-                if h_gap <= max_h_gap and rects_overlap(cur, r, pad):
+                v_gap = max(r.y0 - cur.y1, cur.y0 - r.y1, 0.0)
+                if h_gap <= max_h_gap and v_gap <= max_v_gap and rects_overlap(cur, r, pad):
                     cur |= r; changed = True
                 else:
                     remaining.append(r)
@@ -366,9 +369,11 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
         try:
             for idx, table in enumerate(page.find_tables().tables, 1):
                 rect = fitz.Rect(table.bbox)
-                # Expand slightly to catch full border
-                rect = fitz.Rect(rect.x0 - 3, rect.y0 - 3,
-                                 rect.x1 + 3, rect.y1 + 3)
+                # Expand generously — find_tables() often clips the outer border
+                rect = fitz.Rect(rect.x0 - 15, rect.y0 - 15,
+                                 rect.x1 + 15, rect.y1 + 15)
+                # Clamp to page bounds
+                rect = rect & pr
                 table_rects.append(rect)
                 if rect.width < 30 or rect.height < 30:
                     continue
@@ -404,8 +409,8 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
             path_rects.append(r)
 
         for idx, rect in enumerate(merge_rects(path_rects), 1):
-            # Skip obvious full-page borders
-            if rect.width > pr.width * 0.93 and rect.height > pr.height * 0.83:
+            # Skip near-full-page regions (use OR so partial near-full-page also skipped)
+            if rect.width > pr.width * 0.88 or rect.height > pr.height * 0.80:
                 continue
             if rect.width < 15 or rect.height < 15:
                 continue
