@@ -23,7 +23,7 @@ import fitz
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import Image, ImageStat
+from PIL import Image
 from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────
@@ -41,13 +41,6 @@ JPEG_QUALITY           = 70
 RENDER_DPI             = 150
 VISION_DPI             = 170
 
-# Vector region filters
-VEC_MIN_DIM         = 35        # px — ignore tiny rects
-VEC_MERGE_X_GAP     = 8        # reduced: prevents merging across columns
-VEC_MERGE_Y_GAP     = 4        # reduced: prevents answer lines merging vertically
-VEC_MAX_PAGE_FRAC   = 0.90     # skip if wider AND taller than this fraction of page
-VEC_MIN_CONTENT_PCT = 1.5      # lowered: catches formula boxes, number lines, light diagrams
-
 # Pages to skip — cover, blank, and additional answer pages
 SKIP_PAGE_KEYWORDS = [
     "do not write on this page",
@@ -57,17 +50,14 @@ SKIP_PAGE_KEYWORDS = [
 ]
 
 def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
-    """Return False for cover page, blank pages, and trailing answer/copyright pages."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
     text = doc[page_num - 1].get_text().lower()
     doc.close()
-    # Skip if page contains no question-like content
+    if page_num == 1:
+        return False
     for kw in SKIP_PAGE_KEYWORDS:
         if kw in text:
             return False
-    # Skip page 1 (cover page — never has questions)
-    if page_num == 1:
-        return False
     return True
 
 AT_API  = "https://api.airtable.com/v0"
@@ -661,12 +651,9 @@ if st.button("✨ Extract Questions", type="primary",
     ms_bytes    = ms_file.read() if ms_file else None
 
     with st.status("Extracting…", expanded=True) as status:
-        st.write("📎 Extracting visual regions…")
-        images = extract_visual_regions(paper_bytes)
-        st.write(f"   Found {len(images)} visuals "
-                 f"({sum(1 for i in images if i['kind']=='image')} images, "
-                 f"{sum(1 for i in images if i['kind']=='table')} tables, "
-                 f"{sum(1 for i in images if i['kind']=='vector')} vector regions)")
+        st.write("📎 Extracting visuals with GPT-4V…")
+        images = extract_visual_regions(OPENAI_KEY, paper_bytes)
+        st.write(f"   Found {len(images)} visuals across {len(set(i['page'] for i in images))} pages")
 
         st.write("🤖 Extracting questions (parallel)…")
         client    = OpenAI(api_key=OPENAI_KEY)
