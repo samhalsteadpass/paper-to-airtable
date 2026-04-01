@@ -123,7 +123,6 @@ If no question can be assigned use questionNumber = "none"
 If there are no relevant visuals on this page return an empty array: []
 """
 
-# Pages to skip
 SKIP_PAGE_KEYWORDS = [
     "do not write on this page",
     "additional page, if required",
@@ -247,7 +246,6 @@ def pdf_chunk_to_pil_images(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> list[Ima
     return out
 
 def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
-    """Return False for cover, blank, and trailing answer/copyright pages."""
     if page_num == 1:
         return False
     doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -258,10 +256,14 @@ def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
             return False
     return True
 
-# ── GPT-Vision visual extraction ──────────────────────────────────────────
+# ── GPT-Vision visual extraction + mapping (single call per page) ─────────
 def extract_visuals_from_page(client: OpenAI, pdf_bytes: bytes,
-                               page_num: int) -> list[dict]:
-    """Ask GPT-4V to locate all question-relevant visuals on a page, then crop them."""
+                               page_num: int) -> tuple[list[dict], dict[str, dict]]:
+    """
+    Single GPT-4.1 call per page:
+    - Locates and crops all question-relevant visuals
+    - Returns their question mapping at the same time
+    """
     page_pil       = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
     page_w, page_h = page_pil.size
 
@@ -280,18 +282,18 @@ def extract_visuals_from_page(client: OpenAI, pdf_bytes: bytes,
     raw  = openai_response_text(run_with_retry(_call))
     rows = safe_json_loads(raw, [])
 
-    visuals = []
+    visuals: list[dict]      = []
+    mapping: dict[str, dict] = {}
+
     for idx, row in enumerate(rows, 1):
         try:
             x = float(row["x"]); y = float(row["y"])
             w = float(row["w"]); h = float(row["h"])
 
-            # Add small padding, clamp to page
             pad = 0.01
             x1  = max(0.0, x - pad);     y1 = max(0.0, y - pad)
             x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
 
-            # Skip full-page or tiny boxes
             if (x2 - x1) > 0.95 and (y2 - y1) > 0.85:
                 continue
             if (x2 - x1) < 0.03 or (y2 - y1) < 0.03:
@@ -304,21 +306,33 @@ def extract_visuals_from_page(client: OpenAI, pdf_bytes: bytes,
             buf = io.BytesIO()
             crop.save(buf, format="PNG")
 
+            name = f"p{page_num}_v{idx}.png"
+            qnum = normalise_qnum(row.get("questionNumber", "none"))
+            conf = str(row.get("confidence", "low") or "low").strip().lower()
+            note = str(row.get("notes", "") or "").strip()
+
             visuals.append({
                 "page":   page_num,
-                "name":   f"p{page_num}_v{idx}.png",
+                "name":   name,
                 "kind":   str(row.get("label", f"visual{idx}")),
                 "data":   buf.getvalue(),
                 "width":  crop.width,
                 "height": crop.height,
             })
+            mapping[name] = {
+                "questionNumber": qnum or "none",
+                "confidence":     conf if conf in {"high", "medium", "low"} else "low",
+                "notes":          note,
+                "source":         "vision",
+            }
         except Exception:
             continue
-    return visuals
+
+    return visuals, mapping
 
 @st.cache_data(show_spinner=False)
-def extract_visual_regions(client_key: str, pdf_bytes: bytes) -> list[dict]:
-    """Run GPT-4V visual extraction on all question pages in parallel."""
+def extract_visual_regions(client_key: str, pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
+    """Run combined GPT-4.1 visual extraction + mapping on all question pages in parallel."""
     client = OpenAI(api_key=client_key)
     doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
     total  = len(doc)
@@ -327,24 +341,30 @@ def extract_visual_regions(client_key: str, pdf_bytes: bytes) -> list[dict]:
     question_pages = [p for p in range(1, total + 1)
                       if is_question_page(pdf_bytes, p)]
 
-    results: dict[int, list] = {}
+    vis_results: dict[int, list] = {}
+    map_results: dict[int, dict] = {}
 
     def process(page_num):
         try:
-            return page_num, extract_visuals_from_page(client, pdf_bytes, page_num)
+            visuals, mapping = extract_visuals_from_page(client, pdf_bytes, page_num)
+            return page_num, visuals, mapping
         except Exception:
-            return page_num, []
+            return page_num, [], {}
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for pn, visuals in [f.result() for f in
-                            as_completed([ex.submit(process, p)
-                                          for p in question_pages])]:
-            results[pn] = visuals
+        for pn, visuals, mapping in [f.result() for f in
+                                      as_completed([ex.submit(process, p)
+                                                    for p in question_pages])]:
+            vis_results[pn] = visuals
+            map_results[pn] = mapping
 
-    all_visuals = []
-    for p in sorted(results):
-        all_visuals.extend(results[p])
-    return all_visuals
+    all_visuals: list[dict]       = []
+    full_mapping: dict[str, dict] = {}
+    for p in sorted(vis_results):
+        all_visuals.extend(vis_results[p])
+        full_mapping.update(map_results[p])
+
+    return all_visuals, full_mapping
 
 # ── Parallel question extraction ──────────────────────────────────────────
 def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes) -> tuple[list[dict], list[str]]:
@@ -409,84 +429,6 @@ def extract_markscheme_parallel(client: OpenAI, pdf_bytes: bytes) -> tuple[dict[
     for i in range(len(pdf_chunks)):
         ms_map.update(ordered.get(i, {}))
     return ms_map, logs
-
-# ── Image → question mapping ──────────────────────────────────────────────
-def map_images_for_page(client: OpenAI, pdf_bytes: bytes,
-                        page_num: int, page_imgs: list[dict]) -> dict[str, dict]:
-    page_pil = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
-    img_list = "\n".join(
-        f"- {img['name']} ({img['width']}x{img['height']}, kind={img.get('kind','?')})"
-        for img in page_imgs
-    )
-    prompt = f"""This is page {page_num} of an exam paper.
-
-The following visuals were extracted from this page:
-{img_list}
-
-For each visual, identify which question number it belongs to by reading the page layout.
-Return ONLY a JSON array:
-[{{"imageName": "p{page_num}_v1.png", "questionNumber": "3b", "confidence": "high", "notes": "Table is beside Q3b"}}]
-
-confidence: high, medium, or low.
-If no question can be assigned use questionNumber = "none".
-"""
-    raw  = call_gpt_vision(client, [page_pil], prompt, model=VISION_MODEL,
-                           max_images=1, max_output_tokens=2500)
-    rows = safe_json_loads(raw, [])
-    result: dict[str, dict] = {}
-    for row in rows:
-        name = str(row.get("imageName",     "") or "").strip()
-        qnum = normalise_qnum(row.get("questionNumber", "none"))
-        conf = str(row.get("confidence",    "low") or "low").strip().lower()
-        note = str(row.get("notes",         "")   or "").strip()
-        if name:
-            result[name] = {
-                "questionNumber": qnum or "none",
-                "confidence":     conf if conf in {"high","medium","low"} else "low",
-                "notes":          note,
-                "source":         "vision",
-            }
-    return result
-
-def build_page_q_index(records: list[dict]) -> dict[int, list[str]]:
-    index: dict[int, list[str]] = {}
-    for r in records:
-        page = clamp_int(r.get("pageNumber", 0))
-        qn   = normalise_qnum(r.get("questionNumber", ""))
-        if page and qn:
-            index.setdefault(page, [])
-            if qn not in index[page]:
-                index[page].append(qn)
-    return index
-
-@st.cache_data(show_spinner=False)
-def map_images_to_questions(pdf_bytes: bytes, openai_key: str,
-                             images: list[dict], records: list[dict]) -> dict[str, dict]:
-    client      = OpenAI(api_key=openai_key)
-    page_groups: dict[int, list] = {}
-    for img in images:
-        page_groups.setdefault(img["page"], []).append(img)
-
-    mapping: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(map_images_for_page, client, pdf_bytes, pn, imgs)
-                   for pn, imgs in page_groups.items()]
-        for f in as_completed(futures):
-            mapping.update(f.result())
-
-    # Fallback: assign unmapped images to last question on their page
-    pq_index = build_page_q_index(records)
-    for img in images:
-        name = img["name"]
-        if name not in mapping or mapping[name].get("questionNumber") in {"", "none"}:
-            qs = pq_index.get(img["page"], [])
-            mapping[name] = {
-                "questionNumber": qs[-1] if qs else "none",
-                "confidence":     "low",
-                "notes":          "Fallback: last question on page",
-                "source":         "fallback",
-            }
-    return mapping
 
 # ── Airtable helpers ──────────────────────────────────────────────────────
 def at_headers(token: str):
@@ -608,6 +550,7 @@ if st.button("✨ Extract Questions", type="primary",
     client      = OpenAI(api_key=OPENAI_KEY)
 
     with st.status("Extracting…", expanded=True) as status:
+
         st.write("📎 Extracting visuals with GPT-4V…")
         extract_visual_regions.clear()
         images, image_map = extract_visual_regions(OPENAI_KEY, paper_bytes)
@@ -633,24 +576,24 @@ if st.button("✨ Extract Questions", type="primary",
         for q in questions:
             qnum = normalise_qnum(q.get("questionNumber", ""))
             records.append({
-                "questionNumber":          qnum,
-                "questionText":            q.get("questionText",     ""),
-                "markAllocation":          clamp_int(q.get("markAllocation", 0)),
-                "topic":                   q.get("topic",            ""),
-                "subtopic":                q.get("subtopic",         ""),
-                "markSchemeAnswer":        ms_map.get(qnum,          ""),
-                "imageDescription":        q.get("imageDescription", ""),
-                "hasImages":               bool(q.get("hasImages",   False)),
-                "pageNumber":              clamp_int(q.get("pageNumber", 1), 1),
-                "paperName":               paper_name,
-                "examType":                exam_type,
-                "imageMappingConfidence":  "",
-                "imageMappingNotes":       "",
-                "images":                  [],
+                "questionNumber":         qnum,
+                "questionText":           q.get("questionText",     ""),
+                "markAllocation":         clamp_int(q.get("markAllocation", 0)),
+                "topic":                  q.get("topic",            ""),
+                "subtopic":               q.get("subtopic",         ""),
+                "markSchemeAnswer":       ms_map.get(qnum,          ""),
+                "imageDescription":       q.get("imageDescription", ""),
+                "hasImages":              bool(q.get("hasImages",   False)),
+                "pageNumber":             clamp_int(q.get("pageNumber", 1), 1),
+                "paperName":              paper_name,
+                "examType":               exam_type,
+                "imageMappingConfidence": "",
+                "imageMappingNotes":      "",
+                "images":                 [],
             })
 
+        # Apply fallback mapping for any visuals GPT didn't assign
         if images:
-            # Apply fallback mapping for any visuals GPT didn't assign
             pq_index: dict[int, list[str]] = {}
             for r in records:
                 page = clamp_int(r.get("pageNumber", 0))
@@ -694,8 +637,6 @@ if st.button("✨ Extract Questions", type="primary",
                                                    else "medium" if "medium" in confs
                                                    else "low")
                     r["imageMappingNotes"]      = "\n".join(notes)
-        else:
-            image_map = {}
 
         st.session_state["records"]   = records
         st.session_state["images"]    = images
