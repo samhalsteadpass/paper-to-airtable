@@ -245,7 +245,7 @@ def extract_images(pdf_bytes: bytes) -> list[dict]:
 def ask_gpt_for_questions(client: OpenAI, image_b64_list: list[str], prompt: str) -> str:
     content: list[dict] = []
     for img_b64 in image_b64_list:
-        content.append({"type": "input_image", "image_base64": img_b64})
+        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{base64_img}"})
     content.append({"type": "input_text", "text": prompt})
     resp = create_openai_response(client, TEXT_MODEL, content)
     return openai_response_text(resp)
@@ -254,7 +254,7 @@ def ask_gpt_for_questions(client: OpenAI, image_b64_list: list[str], prompt: str
 def ask_gpt_for_markscheme(client: OpenAI, image_b64_list: list[str], prompt: str) -> str:
     content: list[dict] = []
     for img_b64 in image_b64_list:
-        content.append({"type": "input_image", "image_base64": img_b64})
+        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{base64_img}"})
     content.append({"type": "input_text", "text": prompt})
     resp = create_openai_response(client, TEXT_MODEL, content)
     return openai_response_text(resp)
