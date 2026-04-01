@@ -306,7 +306,7 @@ def rect_inside_any(rect, rect_list, pad=2):
     return False
 
 
-def merge_rects(rects, x_gap=12, y_gap=12):
+def merge_rects(rects, x_gap=6, y_gap=6):
     if not rects:
         return []
 
@@ -347,6 +347,20 @@ def render_clip(page, rect, dpi=170):
     data = pix.tobytes("png")
     img = Image.open(io.BytesIO(data))
     return data, img.width, img.height
+
+
+def is_page_sized_rect(rect, page_rect, width_ratio=0.85, height_ratio=0.85):
+    return (
+        rect.width >= page_rect.width * width_ratio and
+        rect.height >= page_rect.height * height_ratio
+    )
+
+
+def is_global_rule(rect, page_rect):
+    very_thin = rect.height < 3 or rect.width < 3
+    near_full_width = rect.width >= page_rect.width * 0.8
+    near_full_height = rect.height >= page_rect.height * 0.8
+    return very_thin and (near_full_width or near_full_height)
 
 
 def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
@@ -405,6 +419,7 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
         # 3) Vector drawing regions, answer boxes, grids, diagrams
         try:
             drawing_rects = []
+            page_rect = page.rect
 
             for d in page.get_drawings():
                 rect = d.get("rect")
@@ -419,16 +434,21 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
                 if rect_inside_any(rect, table_rects):
                     continue
 
+                if is_page_sized_rect(rect, page_rect):
+                    continue
+
+                if is_global_rule(rect, page_rect):
+                    continue
+
                 drawing_rects.append(rect)
 
-            merged = merge_rects(drawing_rects, x_gap=10, y_gap=10)
+            merged = merge_rects(drawing_rects, x_gap=6, y_gap=6)
 
             for idx, rect in enumerate(merged, 1):
                 if rect.width < 35 or rect.height < 35:
                     continue
 
-                page_rect = page.rect
-                if rect.width > page_rect.width * 0.95 and rect.height > page_rect.height * 0.95:
+                if is_page_sized_rect(rect, page_rect, width_ratio=0.8, height_ratio=0.8):
                     continue
 
                 data, width, height = render_clip(page, rect, dpi=190)
@@ -438,6 +458,10 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
 
                 aspect = width / max(height, 1)
                 if aspect > 10 or aspect < 0.08:
+                    continue
+
+                gray = Image.open(io.BytesIO(data)).convert("L")
+                if not gray.getbbox():
                     continue
 
                 visuals.append({
