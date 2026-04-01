@@ -312,15 +312,15 @@ def crop_rect(page: fitz.Page, rect: fitz.Rect,
     pix = page.get_pixmap(matrix=mat, clip=padded, alpha=False)
     return pix.tobytes("png")
 
-def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
+def extract_all_crops(pdf_bytes: bytes,
+                       debug_page: int = 0) -> tuple[list[dict], list[str]]:
     """
     Extract all visual candidates using PyMuPDF with exact coordinates.
-      1. Raster image blocks  — re-rendered at 300 DPI from page
-      2. find_tables()        — semantic table bboxes, 300 DPI
-      3. Individual drawings  — NO merging; largest-first dedup
+    If debug_page > 0, return detailed logs for that page.
     """
     doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_crops: list[dict] = []
+    debug_log: list[str]  = []
 
     for page_num, page in enumerate(doc, 1):
         if not is_question_page(pdf_bytes, page_num):
@@ -328,6 +328,7 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
 
         pr           = page.rect
         taken_rects: list[fitz.Rect] = []
+        is_debug     = (debug_page == page_num)
 
         # 1. Raster images
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
@@ -346,13 +347,9 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
                 pil2 = Image.open(io.BytesIO(data))
                 taken_rects.append(bbox)
                 all_crops.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_raster{idx}.png",
-                    "source": "raster",
-                    "data":   data,
-                    "width":  pil2.width,
-                    "height": pil2.height,
-                    "bbox":   bbox,
+                    "page": page_num, "name": f"p{page_num}_raster{idx}.png",
+                    "source": "raster", "data": data,
+                    "width": pil2.width, "height": pil2.height, "bbox": bbox,
                 })
             except Exception:
                 pass
@@ -366,14 +363,12 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
                 data = crop_rect(page, rect)
                 pil  = Image.open(io.BytesIO(data))
                 taken_rects.append(rect)
+                if is_debug:
+                    debug_log.append(f"TABLE p{page_num}: {rect} ({rect.width:.0f}x{rect.height:.0f}pt)")
                 all_crops.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_table{idx}.png",
-                    "source": "table",
-                    "data":   data,
-                    "width":  pil.width,
-                    "height": pil.height,
-                    "bbox":   rect,
+                    "page": page_num, "name": f"p{page_num}_table{idx}.png",
+                    "source": "table", "data": data,
+                    "width": pil.width, "height": pil.height, "bbox": rect,
                 })
         except Exception:
             pass
@@ -388,17 +383,25 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
             if r.width < 20 or r.height < 20:
                 continue
             if r.width > pr.width * 0.88 or r.height > pr.height * 0.80:
+                if is_debug:
+                    debug_log.append(f"SKIP full-page p{page_num}: {r} ({r.width:.0f}x{r.height:.0f}pt)")
                 continue
             if is_contained_by_any(r, taken_rects, pad=6):
+                if is_debug:
+                    debug_log.append(f"SKIP contained-by-taken p{page_num}: {r} ({r.width:.0f}x{r.height:.0f}pt)")
                 continue
             drawing_rects.append(r)
 
-        # Largest-first dedup: skip a rect if it's contained by one we already keep
         drawing_rects.sort(key=lambda r: r.width * r.height, reverse=True)
         kept: list[fitz.Rect] = []
         for r in drawing_rects:
             if not is_contained_by_any(r, kept, pad=4):
                 kept.append(r)
+                if is_debug:
+                    debug_log.append(f"KEEP drawing p{page_num}: {r} ({r.width:.0f}x{r.height:.0f}pt)")
+            else:
+                if is_debug:
+                    debug_log.append(f"SKIP contained-by-kept p{page_num}: {r} ({r.width:.0f}x{r.height:.0f}pt)")
 
         for idx, rect in enumerate(kept, 1):
             try:
@@ -408,19 +411,15 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
                     continue
                 taken_rects.append(rect)
                 all_crops.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_draw{idx}.png",
-                    "source": "drawing",
-                    "data":   data,
-                    "width":  pil.width,
-                    "height": pil.height,
-                    "bbox":   rect,
+                    "page": page_num, "name": f"p{page_num}_draw{idx}.png",
+                    "source": "drawing", "data": data,
+                    "width": pil.width, "height": pil.height, "bbox": rect,
                 })
             except Exception:
                 pass
 
     doc.close()
-    return all_crops
+    return all_crops, debug_log
 
 # ── GPT judges relevance + assigns question number ────────────────────────
 def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
@@ -466,7 +465,7 @@ def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
 def extract_and_judge_visuals(openai_key: str,
                                pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
     client    = OpenAI(api_key=openai_key)
-    all_crops = extract_all_crops(pdf_bytes)
+    all_crops, _ = extract_all_crops(pdf_bytes)
 
     by_page: dict[int, list[dict]] = {}
     for crop in all_crops:
@@ -778,6 +777,13 @@ with col2:
 
 # ── Step 2: Extract ────────────────────────────────────────────────────────
 st.subheader("2 · Extract with GPT")
+
+with st.expander("🔧 Debug: inspect drawing extraction for a specific page"):
+    debug_pg = st.number_input("Page number to debug", min_value=1, value=8, step=1)
+    if st.button("Run debug extraction") and paper_file:
+        paper_file.seek(0)
+        _, dbg = extract_all_crops(paper_file.read(), debug_page=int(debug_pg))
+        st.code("\n".join(dbg) if dbg else "No debug output for this page.")
 if st.button("✨ Extract Questions", type="primary",
              disabled=not (paper_file and paper_name and exam_type and OPENAI_KEY)):
 
