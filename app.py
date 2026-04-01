@@ -794,26 +794,3 @@ if "records" in st.session_state:
             except Exception as e:
                 log(f"❌ Sync failed: {e}")
                 st.text("\n".join(log_lines))
-
-st.markdown("""
-### Required secrets
-
-```toml
-OPENAI_API_KEY = "sk-..."
-AIRTABLE_TOKEN = "pat..."
-AIRTABLE_BASE_ID = "app..."
-IMGBB_API_KEY = "..."
-```
-
-### What changed in this version
-
-- Anthropic was replaced with OpenAI.
-- PDF pages are rendered to images for GPT.
-- Question extraction runs in parallel.
-- Image mapping runs in parallel.
-- Useless images are filtered before mapping.
-- Results are cached to avoid repeating expensive work.
-- Image mapping includes confidence and notes.
-- A page-level fallback mapping is used if vision cannot confidently assign an image.
-- Airtable sync attaches hosted images directly to the Images field.
-""")
