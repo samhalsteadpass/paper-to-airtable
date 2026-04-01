@@ -304,7 +304,48 @@ def is_contained_by_any(rect: fitz.Rect,
             return True
     return False
 
-def crop_rect(page: fitz.Page, rect: fitz.Rect,
+def cluster_rects(rects: list[fitz.Rect],
+                   proximity: float = 20.0) -> list[fitz.Rect]:
+    """
+    Cluster rects that are within `proximity` pt of each other.
+    Returns the bounding box of each cluster.
+    This groups individual line segments that form a single visual element.
+    """
+    if not rects:
+        return []
+
+    # Expand each rect by proximity, union overlapping, shrink back
+    expanded = [fitz.Rect(r.x0 - proximity, r.y0 - proximity,
+                           r.x1 + proximity, r.y1 + proximity)
+                for r in rects]
+
+    clusters: list[fitz.Rect] = []
+    used = [False] * len(expanded)
+
+    for i, exp in enumerate(expanded):
+        if used[i]:
+            continue
+        # Start a new cluster from original rect i
+        cluster = fitz.Rect(rects[i])
+        used[i] = True
+        changed = True
+        while changed:
+            changed = False
+            for j, exp2 in enumerate(expanded):
+                if used[j]:
+                    continue
+                # Check if expanded rect j overlaps current cluster (expanded)
+                cluster_exp = fitz.Rect(cluster.x0 - proximity,
+                                        cluster.y0 - proximity,
+                                        cluster.x1 + proximity,
+                                        cluster.y1 + proximity)
+                if cluster_exp.intersects(exp2):
+                    cluster |= rects[j]
+                    used[j] = True
+                    changed = True
+        clusters.append(cluster)
+
+    return clusters
               pad_pt: float = CROP_PAD_PT,
               dpi: int = EXTRACT_DPI) -> bytes:
     pr     = page.rect
@@ -398,21 +439,30 @@ def extract_all_crops(pdf_bytes: bytes,
         except Exception:
             pass
 
-        # 3. Individual drawing rects — no merging
-        drawing_rects: list[fitz.Rect] = []
+        # 3. Drawings — collect ALL paths (including thin lines), then cluster
+        raw_drawing_rects: list[fitz.Rect] = []
         for drawing in page.get_drawings():
             r = drawing.get("rect")
             if not r:
                 continue
             r = fitz.Rect(r)
+            # Only skip sub-pixel noise
+            if r.width < 2 or r.height < 2:
+                continue
+            # Skip near-full-page
+            if r.width > pr.width * 0.88 or r.height > pr.height * 0.80:
+                continue
+            raw_drawing_rects.append(r)
+
+        # Cluster nearby paths into bounding boxes
+        clustered = cluster_rects(raw_drawing_rects, proximity=20.0)
+
+        # Now apply size filters and dedup on clusters
+        valid_clusters = []
+        for r in clustered:
             if r.width < 20 or r.height < 20:
                 continue
             if r.width > pr.width * 0.88 or r.height > pr.height * 0.80:
-                if is_debug:
-                    debug_log.append(
-                        f"SKIP full-page p{page_num}: "
-                        f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
-                    )
                 continue
             if is_contained_by_any(r, taken_rects, pad=6):
                 if is_debug:
@@ -421,17 +471,17 @@ def extract_all_crops(pdf_bytes: bytes,
                         f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
                     )
                 continue
-            drawing_rects.append(r)
+            valid_clusters.append(r)
 
         # Largest-first dedup
-        drawing_rects.sort(key=lambda r: r.width * r.height, reverse=True)
+        valid_clusters.sort(key=lambda r: r.width * r.height, reverse=True)
         kept: list[fitz.Rect] = []
-        for r in drawing_rects:
+        for r in valid_clusters:
             if not is_contained_by_any(r, kept, pad=4):
                 kept.append(r)
                 if is_debug:
                     debug_log.append(
-                        f"KEEP drawing p{page_num}: "
+                        f"KEEP cluster p{page_num}: "
                         f"{r} ({r.width:.0f}x{r.height:.0f}pt)"
                     )
             else:
