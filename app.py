@@ -805,28 +805,22 @@ def get_existing_fields(token: str, base_id: str, table: str) -> set[str]:
             return {f["name"] for f in t.get("fields", [])}
     return set()
 
-# ── FIX 1: Use direct CDN image URL and set expiration=0 (never expire) ──
-def upload_to_imgbb(api_key: str, img: dict) -> str | None:
-    b64  = base64.standard_b64encode(img["data"]).decode()
-    resp = requests.post(
-        IMGBB_API,
-        data={
-            "key":        api_key,
-            "name":       img["name"],
-            "image":      b64,
-            "expiration": 0,   # 0 = never expire
-        },
-        timeout=60,
-    )
-    if resp.ok:
-        data = resp.json().get("data", {})
-        # Use direct CDN URL — not the viewer page URL — so Airtable can
-        # re-validate the attachment without hitting a redirect or HTML page.
-        url = (data.get("image", {}).get("url")
-               or data.get("display_url")
-               or data.get("url"))
-        return url
-    return None
+# ── Direct Airtable attachment upload (no third-party host needed) ────────
+def upload_attachment_to_record(token: str, base_id: str, record_id: str,
+                                 field_name: str, img: dict) -> bool:
+    """
+    Upload image bytes directly to an Airtable record's attachment field.
+    Images live in Airtable's own storage — they never disappear.
+    Endpoint: POST https://content.airtable.com/v0/{baseId}/{recordId}/uploadAttachment
+    """
+    url = f"https://content.airtable.com/v0/{base_id}/{record_id}/uploadAttachment"
+    headers = {"Authorization": f"Bearer {token}"}
+    files   = {
+        "file":      (img["name"], img["data"], "image/png"),
+        "fieldName": (None, field_name),
+    }
+    resp = requests.post(url, headers=headers, files=files, timeout=120)
+    return resp.ok
 
 def create_airtable_records(token: str, base_id: str, table: str,
                              records: list[dict]) -> list[dict]:
@@ -866,10 +860,7 @@ with st.sidebar:
         AT_BASE = st.text_input("Airtable Base ID", placeholder="appXXXXXX")
     else:
         st.success("✓ Airtable Base ID loaded")
-    if not IMGBB_KEY:
-        IMGBB_KEY = st.text_input("imgbb API key", type="password", placeholder="imgbb.com/api")
-    else:
-        st.success("✓ imgbb key loaded")
+    # imgbb no longer used — images upload directly to Airtable
     AT_TABLE = st.text_input("Table name", value="Questions")
     st.divider()
     st.markdown("**Required Airtable fields**")
@@ -1148,56 +1139,20 @@ if "records" in st.session_state:
             st.caption(f"Token: `{token_preview}` | Base: `{AT_BASE}` | Table: `{AT_TABLE}`")
 
             if st.button("🚀 Sync to Airtable", type="primary"):
-                _records  = st.session_state.get("records",   [])
-                _images   = st.session_state.get("images",    [])
-                # ── FIX: use the already-resolved IMGBB_KEY (which includes
-                #         sidebar text input), not get_secret() which only
-                #         reads st.secrets and ignores sidebar-entered values. ──
-                _imgbb    = IMGBB_KEY
+                _records  = st.session_state.get("records", [])
+                _images   = st.session_state.get("images",  [])
                 log_lines: list[str] = []
                 def log(msg): log_lines.append(msg)
 
-                log(f"imgbb key present: {bool(_imgbb)} | images to upload: {len(_images)}")
-
-                img_url_map: dict[str, str] = {}
-
-                # Sequential uploads with throttle to avoid imgbb rate limits.
-                if _images and _imgbb:
-                    log(f"Uploading {len(_images)} visuals to imgbb…")
-                    for img in _images:
-                        b64  = base64.standard_b64encode(img["data"]).decode()
-                        resp = requests.post(
-                            IMGBB_API,
-                            data={
-                                "key":        _imgbb,
-                                "name":       img["name"],
-                                "image":      b64,
-                                "expiration": 0,
-                            },
-                            timeout=60,
-                        )
-                        if resp.ok:
-                            data = resp.json().get("data", {})
-                            url  = (data.get("image", {}).get("url")
-                                    or data.get("display_url")
-                                    or data.get("url"))
-                            if url:
-                                img_url_map[img["name"]] = url
-                                log(f"  ✅ {img['name']} → {url}")
-                            else:
-                                log(f"  ❌ {img['name']} — upload ok but no URL in response: {resp.text[:200]}")
-                        else:
-                            log(f"  ❌ {img['name']} — HTTP {resp.status_code}: {resp.text[:200]}")
-                        time.sleep(0.5)   # stay under imgbb rate limit
-                elif _images and not _imgbb:
-                    log("⚠️ IMGBB_API_KEY missing — visuals not attached. Add it to sidebar or st.secrets.")
+                # Build image lookup by name
+                img_by_name = {img["name"]: img for img in _images}
 
                 try:
                     existing = get_existing_fields(AT_TOKEN, AT_BASE, AT_TABLE)
-                    payload  = []
+
+                    # ── Step A: push all records WITHOUT images first ──────
+                    payload = []
                     for r in _records:
-                        urls   = [img_url_map[n] for n in r.get("images", [])
-                                  if n in img_url_map]
                         fields = {
                             "Question Number":          r.get("questionNumber",         ""),
                             "Question Text":            r.get("questionText",           ""),
@@ -1206,8 +1161,7 @@ if "records" in st.session_state:
                             "Subtopic":                 r.get("subtopic",               ""),
                             "Mark Scheme Answer":       r.get("markSchemeAnswer",       ""),
                             "Image Description":        r.get("imageDescription",       ""),
-                            "Has Images":               bool(urls or r.get("hasImages", False)),
-                            "Images":                   [{"url": u} for u in urls],
+                            "Has Images":               bool(r.get("hasImages",         False)),
                             "Paper Name":               r.get("paperName",   paper_name),
                             "Exam Type":                r.get("examType",    exam_type),
                             "Page Number":              clamp_int(r.get("pageNumber", 1), 1),
@@ -1219,7 +1173,45 @@ if "records" in st.session_state:
 
                     log(f"Pushing {len(payload)} records…")
                     created = create_airtable_records(AT_TOKEN, AT_BASE, AT_TABLE, payload)
-                    log(f"✅ {len(created)} records synced!")
+                    log(f"✅ {len(created)} records created")
+
+                    # ── Step B: upload images directly into each record ────
+                    # Map questionNumber → Airtable record ID from what was just created
+                    if "Images" in existing and _images:
+                        at_table_url = f"{AT_API}/{AT_BASE}/{requests.utils.quote(AT_TABLE, safe='')}"
+
+                        # Build qnum → record_id map from created records
+                        qnum_to_record_id: dict[str, str] = {}
+                        for rec in created:
+                            qn = rec.get("fields", {}).get("Question Number", "")
+                            if qn:
+                                qnum_to_record_id[normalise_qnum(qn)] = rec["id"]
+
+                        upload_count = 0
+                        fail_count   = 0
+                        for r in _records:
+                            img_names = r.get("images", [])
+                            if not img_names:
+                                continue
+                            qn        = normalise_qnum(r.get("questionNumber", ""))
+                            record_id = qnum_to_record_id.get(qn)
+                            if not record_id:
+                                log(f"  ⚠️ No record ID for Q{qn} — skipping images")
+                                continue
+                            for name in img_names:
+                                img = img_by_name.get(name)
+                                if not img:
+                                    continue
+                                ok = upload_attachment_to_record(
+                                    AT_TOKEN, AT_BASE, record_id, "Images", img)
+                                if ok:
+                                    upload_count += 1
+                                    log(f"  ✅ {name} → Q{qn} (record {record_id})")
+                                else:
+                                    fail_count += 1
+                                    log(f"  ❌ {name} → Q{qn} failed")
+                        log(f"Images: {upload_count} uploaded · {fail_count} failed")
+
                 except Exception as e:
                     log(f"❌ Sync failed: {e}")
 
