@@ -5,6 +5,8 @@ Architecture:
   Stage 1 — PyMuPDF extracts ALL visuals from each page (no filtering).
   Stage 2 — GPT-4V reviews each page's crops, judges relevance,
              assigns question number, all in one call per page.
+  Stage 3 — Recovery pass: any hasImages question with no visual gets
+             a targeted GPT crop attempt using the image description.
 
 Secrets (.streamlit/secrets.toml or Streamlit Cloud dashboard):
     OPENAI_API_KEY   = "sk-..."
@@ -43,7 +45,7 @@ IMAGE_MAX_SIZE    = (1200, 1200)
 JPEG_QUALITY      = 70
 RENDER_DPI        = 150
 VISION_DPI        = 170
-EXTRACT_DPI       = 190   # DPI for cropping individual visuals
+EXTRACT_DPI       = 190
 
 AT_API    = "https://api.airtable.com/v0"
 AT_META   = "https://api.airtable.com/v0/meta"
@@ -66,6 +68,14 @@ AT_FIELDS = [
     ("Image Mapping Notes",      "multilineText"),
 ]
 
+SKIP_PAGE_KEYWORDS = [
+    "do not write on this page",
+    "additional page, if required",
+    "there are no questions printed",
+    "copyright information",
+]
+
+# ── Prompts ───────────────────────────────────────────────────────────────
 QUESTION_PROMPT = """Extract EVERY question from this exam paper.
 Return ONLY a raw JSON array. No markdown fences. No explanation.
 
@@ -148,15 +158,10 @@ Return ONLY a raw JSON object. No markdown. No explanation.
 If you cannot find any visual for this question return:
 {{"found": false}}
 
-x, y = top-left corner as fraction of page width/height (0.0–1.0)
+x, y = top-left corner as fraction of page width/height (0.0-1.0)
 w, h = width/height as fraction of page dimensions
-Be generous with the bounding box — slightly oversized is better than clipping.
+Be generous with the bounding box.
 """
-    "do not write on this page",
-    "additional page, if required",
-    "there are no questions printed",
-    "copyright information",
-]
 
 # ── Secrets ───────────────────────────────────────────────────────────────
 def get_secret(key: str, fallback: str = "") -> str:
@@ -307,8 +312,7 @@ def merge_rects(rects: list[fitz.Rect],
         merged.append(cur)
     return merged
 
-def render_clip(page: fitz.Page, rect: fitz.Rect,
-                dpi: int = EXTRACT_DPI) -> bytes:
+def render_clip(page: fitz.Page, rect: fitz.Rect, dpi: int = EXTRACT_DPI) -> bytes:
     mat = fitz.Matrix(dpi/72, dpi/72)
     pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
     return pix.tobytes("png")
@@ -317,9 +321,8 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
     """
     Extract every possible visual candidate from every question page.
     No relevance filtering — GPT judges that in Stage 2.
-    Returns list of {page, name, data, width, height}.
     """
-    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_crops: list[dict] = []
 
     for page_num, page in enumerate(doc, 1):
@@ -328,7 +331,7 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
 
         pr = page.rect
 
-        # 1. Embedded raster images (from get_text dict for accurate bytes)
+        # 1. Embedded raster images
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
         for idx, block in enumerate(blocks, 1):
             if block.get("type") != 1:
@@ -352,14 +355,13 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
             except Exception:
                 pass
 
-        # 2. All path regions — merge nearby, keep side-by-side separate
+        # 2. All path regions
         path_rects: list[fitz.Rect] = []
         for path in page.get_drawings():
             r = path.get("rect")
             if not r:
                 continue
             r = fitz.Rect(r)
-            # Skip sub-pixel noise
             if r.width < 10 or r.height < 10:
                 continue
             path_rects.append(r)
@@ -368,7 +370,6 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
             # Skip obvious full-page borders
             if rect.width > pr.width * 0.93 and rect.height > pr.height * 0.83:
                 continue
-            # Skip sub-pixel
             if rect.width < 15 or rect.height < 15:
                 continue
             try:
@@ -393,19 +394,17 @@ def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
 
 # ── Stage 2: GPT judges relevance + assigns question number ───────────────
 def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
-                     page_num: int,
-                     crops: list[dict]) -> list[dict]:
+                     page_num: int, crops: list[dict]) -> list[dict]:
     """
     Send the rendered page + all crops to GPT-4V.
     GPT decides: relevant? which question?
-    Returns only the relevant crops, enriched with mapping metadata.
+    Returns only the relevant crops with mapping metadata.
     """
     if not crops:
         return []
 
     page_pil = render_page_pil(pdf_bytes, page_num, dpi=VISION_DPI)
 
-    # Build content: page image first, then each crop
     content: list[dict] = [
         {"type": "input_text",
          "text": GPT_JUDGE_PROMPT.format(page_num=page_num)},
@@ -415,17 +414,15 @@ def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
     for crop in crops:
         content.append({"type": "input_text",  "text": f"Crop: {crop['name']}"})
         content.append({"type": "input_image",
-                         "image_url": f"data:image/jpeg;base64,{encode_bytes(crop['data'])}"})
+                        "image_url": f"data:image/jpeg;base64,{encode_bytes(crop['data'])}"})
 
     raw  = call_gpt(client, content, VISION_MODEL, max_output_tokens=3000)
     rows = safe_json_loads(raw, [])
 
-    # Build lookup from GPT response
-    judgements: dict[str, dict] = {}
-    for row in rows:
-        name = str(row.get("cropName", "") or "").strip()
-        if name:
-            judgements[name] = row
+    judgements: dict[str, dict] = {
+        str(r.get("cropName", "") or "").strip(): r
+        for r in rows
+    }
 
     kept: list[dict] = []
     for crop in crops:
@@ -435,11 +432,10 @@ def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
         qnum = normalise_qnum(j.get("questionNumber", "none"))
         kept.append({
             **crop,
-            "kind":       str(j.get("label",      "visual")),
+            "kind":           str(j.get("label",      "visual")),
             "questionNumber": qnum or "none",
-            "confidence": str(j.get("confidence", "low")).lower(),
-            "notes":      str(j.get("notes",      "")),
-            "source_gpt": True,
+            "confidence":     str(j.get("confidence", "low")).lower(),
+            "notes":          str(j.get("notes",      "")),
         })
     return kept
 
@@ -447,36 +443,31 @@ def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
 def extract_and_judge_visuals(openai_key: str,
                                pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
     """
-    Stage 1: PyMuPDF extracts all crops (no filtering).
+    Stage 1: PyMuPDF extracts all crops.
     Stage 2: GPT judges each page's crops in parallel.
     Returns (visuals, image_map).
     """
-    client = OpenAI(api_key=openai_key)
-
-    # Stage 1
+    client    = OpenAI(api_key=openai_key)
     all_crops = extract_all_crops(pdf_bytes)
 
-    # Group by page
     by_page: dict[int, list[dict]] = {}
     for crop in all_crops:
         by_page.setdefault(crop["page"], []).append(crop)
 
-    # Stage 2 — parallel per page
-    kept_visuals: list[dict]       = []
-    full_mapping: dict[str, dict]  = {}
+    results: dict[int, list] = {}
 
     def process_page(page_num: int, crops: list[dict]):
         judged = judge_page_crops(client, pdf_bytes, page_num, crops)
         return page_num, judged
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(process_page, pn, crops): pn
-                   for pn, crops in by_page.items()}
-        results: dict[int, list] = {}
-        for f in as_completed(futures):
-            pn, judged = f.result()
+        for pn, judged in [f.result() for f in
+                            as_completed([ex.submit(process_page, pn, crops)
+                                          for pn, crops in by_page.items()])]:
             results[pn] = judged
 
+    kept_visuals: list[dict]       = []
+    full_mapping: dict[str, dict]  = {}
     for pn in sorted(results):
         for v in results[pn]:
             kept_visuals.append(v)
@@ -489,23 +480,19 @@ def extract_and_judge_visuals(openai_key: str,
 
     return kept_visuals, full_mapping
 
+# ── Stage 3: Recovery — find visuals for hasImages questions with none ────
 def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
                             record: dict) -> dict | None:
-    """
-    For a question flagged hasImages=True but with no extracted visual,
-    ask GPT to locate and crop it from the page.
-    Returns a new visual dict, or None if not found.
-    """
     page_num = clamp_int(record.get("pageNumber", 1), 1)
     qnum     = record.get("questionNumber", "?")
     page_pil = render_page_pil(pdf_bytes, page_num, dpi=VISION_DPI)
     pw, ph   = page_pil.size
 
     prompt = FIND_MISSING_PROMPT.format(
-        page_num     = page_num,
-        qnum         = qnum,
-        question_text= record.get("questionText",     "")[:300],
-        image_desc   = record.get("imageDescription", "") or "Not specified",
+        page_num      = page_num,
+        qnum          = qnum,
+        question_text = record.get("questionText",     "")[:300],
+        image_desc    = record.get("imageDescription", "") or "Not specified",
     )
     content = [
         {"type": "input_text",  "text": prompt},
@@ -521,21 +508,14 @@ def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
     try:
         x = float(data["x"]); y = float(data["y"])
         w = float(data["w"]); h = float(data["h"])
-
         pad = 0.02
         x1  = max(0.0, x - pad);     y1 = max(0.0, y - pad)
         x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
-
         if (x2 - x1) > 0.95 and (y2 - y1) > 0.90:
             return None
-
-        crop = page_pil.crop((
-            int(x1 * pw), int(y1 * ph),
-            int(x2 * pw), int(y2 * ph),
-        ))
-        buf = io.BytesIO()
+        crop = page_pil.crop((int(x1*pw), int(y1*ph), int(x2*pw), int(y2*ph)))
+        buf  = io.BytesIO()
         crop.save(buf, format="PNG")
-
         name = f"p{page_num}_recovered_{qnum}.png"
         return {
             "page":           page_num,
@@ -547,37 +527,31 @@ def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
             "height":         crop.height,
             "questionNumber": qnum,
             "confidence":     str(data.get("confidence", "medium")).lower(),
-            "notes":          str(data.get("notes", "Recovered: missing visual for hasImages question")),
+            "notes":          str(data.get("notes", "Recovered: missing visual")),
         }
     except Exception:
         return None
-
 
 def recover_all_missing(client: OpenAI, pdf_bytes: bytes,
                          records: list[dict],
                          images: list[dict],
                          image_map: dict[str, dict]) -> tuple[list[dict], dict[str, dict]]:
-    """
-    Find every question with hasImages=True but no assigned images,
-    attempt GPT recovery for each, and return updated images + image_map.
-    """
     missing = [r for r in records
                if r.get("hasImages") and not r.get("images")]
-
     if not missing:
         return images, image_map
 
-    new_images  = list(images)
-    new_map     = dict(image_map)
+    new_images = list(images)
+    new_map    = dict(image_map)
 
     def try_recover(record):
         v = recover_missing_visual(client, pdf_bytes, record)
         return record["questionNumber"], v
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(try_recover, r) for r in missing]
-        for f in as_completed(futures):
-            qnum, visual = f.result()
+        for qnum, visual in [f.result() for f in
+                              as_completed([ex.submit(try_recover, r)
+                                            for r in missing])]:
             if visual:
                 new_images.append(visual)
                 new_map[visual["name"]] = {
@@ -596,14 +570,14 @@ def extract_questions_parallel(client: OpenAI,
     logs: list[str] = []
 
     def process(i: int, chunk: bytes):
-        offset = i * CHUNK_PAGES
-        pils   = pdf_chunk_to_pils(chunk)
+        offset  = i * CHUNK_PAGES
+        pils    = pdf_chunk_to_pils(chunk)
         content = [{"type": "input_text", "text": QUESTION_PROMPT}]
         for p in pils:
             content.append({"type": "input_image",
                              "image_url": f"data:image/jpeg;base64,{encode_pil(p)}"})
-        raw  = call_gpt(client, content, TEXT_MODEL)
-        rows = safe_json_loads(raw, [])
+        raw   = call_gpt(client, content, TEXT_MODEL)
+        rows  = safe_json_loads(raw, [])
         fixed = [{
             "questionNumber":   normalise_qnum(r.get("questionNumber",   "")),
             "questionText":     str(r.get("questionText",     "") or ""),
@@ -621,7 +595,8 @@ def extract_questions_parallel(client: OpenAI,
         for i, rows, msg in [f.result() for f in
                               as_completed([ex.submit(process, i, c)
                                             for i, c in enumerate(chunks)])]:
-            ordered[i] = rows; logs.append(msg)
+            ordered[i] = rows
+            logs.append(msg)
 
     collected = []
     for i in range(len(chunks)):
@@ -634,16 +609,18 @@ def extract_markscheme_parallel(client: OpenAI,
     logs: list[str] = []
 
     def process(i: int, chunk: bytes):
-        pils = pdf_chunk_to_pils(chunk)
+        pils    = pdf_chunk_to_pils(chunk)
         content = [{"type": "input_text", "text": MS_PROMPT}]
         for p in pils:
             content.append({"type": "input_image",
                              "image_url": f"data:image/jpeg;base64,{encode_pil(p)}"})
-        raw  = call_gpt(client, content, TEXT_MODEL)
-        rows = safe_json_loads(raw, [])
-        local = {normalise_qnum(r.get("questionNumber", "")): str(r.get("markSchemeAnswer", "") or "")
-                 for r in rows
-                 if r.get("questionNumber") and r.get("markSchemeAnswer")}
+        raw   = call_gpt(client, content, TEXT_MODEL)
+        rows  = safe_json_loads(raw, [])
+        local = {
+            normalise_qnum(r.get("questionNumber", "")): str(r.get("markSchemeAnswer", "") or "")
+            for r in rows
+            if r.get("questionNumber") and r.get("markSchemeAnswer")
+        }
         return i, local, f"MS chunk {i+1}/{len(chunks)}: {len(local)} entries"
 
     ordered: dict[int, dict] = {}
@@ -651,7 +628,8 @@ def extract_markscheme_parallel(client: OpenAI,
         for i, local, msg in [f.result() for f in
                                as_completed([ex.submit(process, i, c)
                                              for i, c in enumerate(chunks)])]:
-            ordered[i] = local; logs.append(msg)
+            ordered[i] = local
+            logs.append(msg)
 
     ms_map: dict[str, str] = {}
     for i in range(len(chunks)):
@@ -679,16 +657,14 @@ def ensure_table(token: str, base_id: str, table: str):
                                "options": {"precision": 0}})
             elif ftype == "checkbox":
                 fields.append({"name": name, "type": "checkbox",
-                               "options": {"icon": "check",
-                                           "color": "greenBright"}})
+                               "options": {"icon": "check", "color": "greenBright"}})
             elif ftype == "multipleAttachments":
                 fields.append({"name": name, "type": "multipleAttachments"})
             else:
                 fields.append({"name": name, "type": ftype})
         r2 = requests.post(f"{AT_META}/bases/{base_id}/tables",
                            headers=at_headers(token),
-                           json={"name": table, "fields": fields},
-                           timeout=60)
+                           json={"name": table, "fields": fields}, timeout=60)
         if not r2.ok:
             st.warning(f"Could not auto-create table ({r2.status_code}).")
     except Exception as e:
@@ -706,8 +682,8 @@ def get_existing_fields(token: str, base_id: str, table: str) -> set[str]:
 def upload_to_imgbb(api_key: str, img: dict) -> str | None:
     b64  = base64.standard_b64encode(img["data"]).decode()
     resp = requests.post(IMGBB_API,
-                         data={"key": api_key, "name": img["name"],
-                               "image": b64}, timeout=60)
+                         data={"key": api_key, "name": img["name"], "image": b64},
+                         timeout=60)
     if resp.ok:
         return resp.json()["data"]["url"]
     return None
@@ -729,7 +705,7 @@ def create_airtable_records(token: str, base_id: str, table: str,
 st.set_page_config(page_title="Past Paper → Airtable v2",
                    page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable v2")
-st.caption("PyMuPDF extracts everything · GPT-4V judges relevance & maps to questions · Airtable sync")
+st.caption("PyMuPDF extracts everything · GPT-4V judges & maps · Recovery pass ensures no missing visuals")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
@@ -739,13 +715,11 @@ IMGBB_KEY  = get_secret("IMGBB_API_KEY")
 with st.sidebar:
     st.header("⚙️ Configuration")
     if not OPENAI_KEY:
-        OPENAI_KEY = st.text_input("OpenAI API key", type="password",
-                                    placeholder="sk-...")
+        OPENAI_KEY = st.text_input("OpenAI API key", type="password", placeholder="sk-...")
     else:
         st.success("✓ OpenAI key loaded")
     if not AT_TOKEN:
-        AT_TOKEN = st.text_input("Airtable Token", type="password",
-                                  placeholder="patXXXXXX")
+        AT_TOKEN = st.text_input("Airtable Token", type="password", placeholder="patXXXXXX")
     else:
         st.success("✓ Airtable token loaded")
     if not AT_BASE:
@@ -753,8 +727,7 @@ with st.sidebar:
     else:
         st.success("✓ Airtable Base ID loaded")
     if not IMGBB_KEY:
-        IMGBB_KEY = st.text_input("imgbb API key", type="password",
-                                   placeholder="imgbb.com/api")
+        IMGBB_KEY = st.text_input("imgbb API key", type="password", placeholder="imgbb.com/api")
     else:
         st.success("✓ imgbb key loaded")
     AT_TABLE = st.text_input("Table name", value="Questions")
@@ -763,7 +736,7 @@ with st.sidebar:
     for name, ftype in AT_FIELDS:
         st.markdown(f"- `{name}` — {ftype}")
 
-# ── Step 1: Upload ─────────────────────────────────────────────────────
+# ── Step 1: Upload ─────────────────────────────────────────────────────────
 st.subheader("1 · Upload PDFs")
 col1, col2 = st.columns(2)
 with col1:
@@ -776,7 +749,7 @@ with col2:
     st.markdown("&nbsp;", unsafe_allow_html=True)
     ms_file = st.file_uploader("Mark scheme PDF (optional)", type="pdf")
 
-# ── Step 2: Extract ────────────────────────────────────────────────────
+# ── Step 2: Extract ────────────────────────────────────────────────────────
 st.subheader("2 · Extract with GPT")
 if st.button("✨ Extract Questions", type="primary",
              disabled=not (paper_file and paper_name and exam_type and OPENAI_KEY)):
@@ -787,22 +760,21 @@ if st.button("✨ Extract Questions", type="primary",
 
     with st.status("Extracting…", expanded=True) as status:
 
-        # Visuals
-        st.write("📎 Extracting all visual candidates (PyMuPDF)…")
+        # Stage 1 + 2: extract and judge visuals
+        st.write("📎 Extracting & judging visuals (PyMuPDF + GPT-4V)…")
         extract_and_judge_visuals.clear()
         images, image_map = extract_and_judge_visuals(OPENAI_KEY, paper_bytes)
-        kept   = len(images)
         mapped = sum(1 for v in image_map.values()
                      if v.get("questionNumber") not in {"none", ""})
-        st.write(f"   {kept} visuals kept · {mapped} mapped to questions")
+        st.write(f"   {len(images)} visuals kept · {mapped} mapped to questions")
 
-        # Questions
+        # Extract questions
         st.write("🤖 Extracting questions (parallel)…")
         questions, q_logs = extract_questions_parallel(client, paper_bytes)
         for line in q_logs:
             st.write(f"   {line}")
 
-        # Mark scheme
+        # Extract mark scheme
         ms_map: dict[str, str] = {}
         if ms_bytes:
             st.write("🧠 Extracting mark scheme (parallel)…")
@@ -810,7 +782,7 @@ if st.button("✨ Extract Questions", type="primary",
             for line in ms_logs:
                 st.write(f"   {line}")
 
-        # Merge into records
+        # Build records
         records = []
         for q in questions:
             qnum = normalise_qnum(q.get("questionNumber", ""))
@@ -842,7 +814,6 @@ if st.button("✨ Extract Questions", type="primary",
                     if qn not in pq_index[page]:
                         pq_index[page].append(qn)
 
-            # Fallback for unassigned
             for img in images:
                 nm = img["name"]
                 if image_map.get(nm, {}).get("questionNumber") in {"", "none", None}:
@@ -873,46 +844,43 @@ if st.button("✨ Extract Questions", type="primary",
                 if imgs:
                     r["hasImages"]              = True
                     r["images"]                 = imgs
-                    r["imageMappingConfidence"] = ("high" if "high" in confs
-                                                   else "medium" if "medium" in confs
-                                                   else "low")
+                    r["imageMappingConfidence"] = ("high"   if "high"   in confs else
+                                                   "medium" if "medium" in confs else "low")
                     r["imageMappingNotes"]      = "\n".join(notes)
 
-        # Recovery pass — ensure every hasImages question has a visual
+        # Stage 3: recovery pass
         missing_count = sum(1 for r in records
                             if r.get("hasImages") and not r.get("images"))
         if missing_count:
-            st.write(f"🔎 Recovering {missing_count} missing visual(s)…")
+            st.write(f"🔎 Recovery pass: {missing_count} hasImages question(s) with no visual…")
             images, image_map = recover_all_missing(
                 client, paper_bytes, records, images, image_map)
 
-            # Re-apply mapping for recovered visuals
             for img in images:
-                nm = img["name"]
-                if img.get("source") == "recovered":
-                    qn = img.get("questionNumber", "none")
-                    for r in records:
-                        if r["questionNumber"] == qn and not r.get("images"):
-                            r["hasImages"]              = True
-                            r["images"]                 = [nm]
-                            r["imageMappingConfidence"] = img.get("confidence", "medium")
-                            r["imageMappingNotes"]      = img.get("notes", "")
+                if img.get("source") != "recovered":
+                    continue
+                qn = img.get("questionNumber", "none")
+                for r in records:
+                    if r["questionNumber"] == qn and not r.get("images"):
+                        r["hasImages"]              = True
+                        r["images"]                 = [img["name"]]
+                        r["imageMappingConfidence"] = img.get("confidence", "medium")
+                        r["imageMappingNotes"]      = img.get("notes", "")
 
-            recovered = sum(1 for img in images if img.get("source") == "recovered")
+            recovered     = sum(1 for img in images if img.get("source") == "recovered")
             still_missing = sum(1 for r in records
                                 if r.get("hasImages") and not r.get("images"))
-            st.write(f"   Recovered {recovered} visual(s) · "
-                     f"{still_missing} still unresolved")
+            st.write(f"   Recovered {recovered} · {still_missing} still unresolved")
 
         st.session_state["records"]   = records
         st.session_state["images"]    = images
         st.session_state["image_map"] = image_map
         status.update(
-            label=f"✅ Done — {len(records)} questions, {len(images)} visuals",
+            label=f"✅ Done — {len(records)} questions · {len(images)} visuals",
             state="complete"
         )
 
-# ── Step 3: Review ─────────────────────────────────────────────────────
+# ── Step 3: Review ─────────────────────────────────────────────────────────
 if "records" in st.session_state:
     records   = st.session_state["records"]
     images    = st.session_state.get("images",    [])
@@ -960,20 +928,20 @@ if "records" in st.session_state:
             records[i]["markAllocation"] = clamp_int(row["Marks"], 0)
             records[i]["pageNumber"]     = clamp_int(row["Page Number"], 1)
             raw_names = str(row.get("Image Names") or "")
-            records[i]["images"] = [x.strip() for x in
-                                    raw_names.split(",") if x.strip()]
+            records[i]["images"] = [x.strip() for x in raw_names.split(",") if x.strip()]
 
     if images:
         with st.expander(f"🖼 Kept visuals ({len(images)})"):
             cols = st.columns(4)
             for idx, img in enumerate(images):
                 with cols[idx % 4]:
-                    qn = image_map.get(img["name"], {}).get("questionNumber", "?")
+                    qn  = image_map.get(img["name"], {}).get("questionNumber", "?")
+                    src = img.get("source", "?")
                     st.image(img["data"],
-                             caption=f"{img['name']}\nQ{qn} · {img.get('kind','?')}",
+                             caption=f"{img['name']}\nQ{qn} · {img.get('kind','?')} [{src}]",
                              use_container_width=True)
 
-    # ── Step 4: Export / Sync ──────────────────────────────────────────
+    # ── Step 4: Export / Sync ──────────────────────────────────────────────
     st.subheader("4 · Export / Sync")
     dl_col, sync_col = st.columns([1, 2])
 
@@ -1009,13 +977,12 @@ if "records" in st.session_state:
             st.caption(f"Token: `{token_preview}` | Base: `{AT_BASE}` | Table: `{AT_TABLE}`")
 
             if st.button("🚀 Sync to Airtable", type="primary"):
-                _records = st.session_state.get("records", [])
-                _images  = st.session_state.get("images",  [])
-                _imgbb   = get_secret("IMGBB_API_KEY")
+                _records  = st.session_state.get("records",   [])
+                _images   = st.session_state.get("images",    [])
+                _imgbb    = get_secret("IMGBB_API_KEY")
                 log_lines: list[str] = []
                 def log(msg): log_lines.append(msg)
 
-                # Upload to imgbb in parallel
                 img_url_map: dict[str, str] = {}
                 if _images and _imgbb:
                     log(f"Uploading {len(_images)} visuals to imgbb…")
