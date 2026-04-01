@@ -807,7 +807,7 @@ def get_existing_fields(token: str, base_id: str, table: str) -> set[str]:
 
 # ── Direct Airtable attachment upload (no third-party host needed) ────────
 def upload_attachment_to_record(token: str, base_id: str, record_id: str,
-                                 field_name: str, img: dict) -> bool:
+                                 field_name: str, img: dict) -> tuple[bool, str]:
     """
     Upload image bytes directly to an Airtable record's attachment field.
     Images live in Airtable's own storage — they never disappear.
@@ -820,7 +820,7 @@ def upload_attachment_to_record(token: str, base_id: str, record_id: str,
         "fieldName": (None, field_name),
     }
     resp = requests.post(url, headers=headers, files=files, timeout=120)
-    return resp.ok
+    return resp.ok, f"HTTP {resp.status_code}: {resp.text[:300]}"
 
 def create_airtable_records(token: str, base_id: str, table: str,
                              records: list[dict]) -> list[dict]:
@@ -1202,14 +1202,14 @@ if "records" in st.session_state:
                                 img = img_by_name.get(name)
                                 if not img:
                                     continue
-                                ok = upload_attachment_to_record(
+                                ok, detail = upload_attachment_to_record(
                                     AT_TOKEN, AT_BASE, record_id, "Images", img)
                                 if ok:
                                     upload_count += 1
                                     log(f"  ✅ {name} → Q{qn} (record {record_id})")
                                 else:
                                     fail_count += 1
-                                    log(f"  ❌ {name} → Q{qn} failed")
+                                    log(f"  ❌ {name} → Q{qn} | {detail}")
                         log(f"Images: {upload_count} uploaded · {fail_count} failed")
 
                 except Exception as e:
