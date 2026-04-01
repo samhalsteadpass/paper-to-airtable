@@ -567,10 +567,10 @@ def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
 @st.cache_data(show_spinner=False)
 def extract_and_judge_visuals(openai_key: str,
                                pdf_bytes: bytes,
-                               all_crops: list[dict]) -> tuple[list[dict], dict[str, dict]]:
+                               _all_crops: list[dict]) -> tuple[list[dict], dict[str, dict]]:
     client  = OpenAI(api_key=openai_key)
     by_page: dict[int, list[dict]] = {}
-    for crop in all_crops:
+    for crop in _all_crops:
         by_page.setdefault(crop["page"], []).append(crop)
 
     results: dict[int, list] = {}
