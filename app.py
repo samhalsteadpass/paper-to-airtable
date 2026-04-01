@@ -83,6 +83,73 @@ def extract_images(pdf_bytes: bytes) -> list[dict]:
     doc.close()
     return images
 
+def render_page_as_png(pdf_bytes: bytes, page_num: int, dpi: int = 150) -> bytes:
+    """Render a single PDF page (1-indexed) to PNG bytes."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = doc[page_num - 1].get_pixmap(matrix=mat, alpha=False)
+    doc.close()
+    return pix.tobytes("png")
+
+def map_images_to_questions(client: anthropic.Anthropic,
+                             pdf_bytes: bytes,
+                             images: list[dict]) -> dict[str, str]:
+    """
+    For each page that contains images, send the rendered page to Claude
+    and ask which question each image belongs to.
+    Returns {img_name: questionNumber}.
+    """
+    # Group images by page
+    pages_with_images: dict[int, list[dict]] = {}
+    for img in images:
+        pages_with_images.setdefault(img["page"], []).append(img)
+
+    mapping: dict[str, str] = {}
+
+    for page_num, page_imgs in pages_with_images.items():
+        png_bytes = render_page_as_png(pdf_bytes, page_num)
+        png_b64   = base64.standard_b64encode(png_bytes).decode()
+
+        img_list  = "\n".join(
+            f"- Image {i+1}: {img['name']} ({img['width']}×{img['height']}px)"
+            for i, img in enumerate(page_imgs)
+        )
+
+        prompt = f"""This is page {page_num} of an exam paper.
+
+The following images were extracted from this page:
+{img_list}
+
+For each image, identify which question number it belongs to by reading the page layout.
+Return ONLY a raw JSON array — no markdown fences, no preamble.
+
+Each element:
+{{"imageName": "p{page_num}_img1.png", "questionNumber": "3b"}}
+
+If an image is a general header/footer/logo with no specific question, use "none".
+"""
+        try:
+            r = client.messages.create(
+                model=MODEL,
+                max_tokens=1000,
+                messages=[{"role": "user", "content": [
+                    {"type":   "image",
+                     "source": {"type": "base64", "media_type": "image/png", "data": png_b64}},
+                    {"type": "text", "text": prompt},
+                ]}],
+            )
+            raw  = "".join(b.text for b in r.content if b.type == "text")
+            rows = json.loads(clean_json(raw))
+            for row in rows:
+                qnum = str(row.get("questionNumber", "none")).strip()
+                name = str(row.get("imageName", "")).strip()
+                if name and qnum != "none":
+                    mapping[name] = qnum
+        except Exception as e:
+            st.warning(f"⚠️ Could not map images on page {page_num}: {e}")
+
+    return mapping
+
 def split_pdf(pdf_bytes: bytes, chunk_size: int) -> list[bytes]:
     doc, chunks = fitz.open(stream=pdf_bytes, filetype="pdf"), []
     for start in range(0, len(doc), chunk_size):
@@ -271,6 +338,13 @@ if st.button("✨ Extract Questions", type="primary",
             ms_file.seek(0)
         st.write(f"   Found {len(images)} images")
 
+        # Map images to questions via Claude vision
+        img_question_map: dict[str, str] = {}
+        if images:
+            st.write("🔍 Mapping images to questions (Claude vision)…")
+            img_question_map = map_images_to_questions(client, paper_bytes, images)
+            st.write(f"   Mapped {len(img_question_map)}/{len(images)} images to specific questions")
+
         st.write("🤖 Sending paper to Claude…")
         try:
             chunks    = split_pdf(paper_bytes, CHUNK_PAGES)
@@ -332,8 +406,9 @@ if st.button("✨ Extract Questions", type="primary",
                 "examType":         exam_type,
             })
 
-        st.session_state["records"] = records
-        st.session_state["images"]  = images
+        st.session_state["records"]          = records
+        st.session_state["images"]           = images
+        st.session_state["img_question_map"] = img_question_map
         status.update(label=f"✅ Done — {len(records)} questions extracted", state="complete")
 
 # ── Step 3: Review ────────────────────────────────────────────────────────
@@ -411,9 +486,10 @@ if "records" in st.session_state:
             st.caption(f"Token: `{token_preview}` | Base: `{AT_BASE}` | Table: `{AT_TABLE}`")
 
             if st.button("🚀 Sync to Airtable", type="primary"):
-                _records  = st.session_state.get("records", [])
-                _images   = st.session_state.get("images",  [])
-                _imgbb    = get_secret("IMGBB_API_KEY")
+                _records         = st.session_state.get("records",          [])
+                _images          = st.session_state.get("images",           [])
+                _imgbb           = get_secret("IMGBB_API_KEY")
+                _img_question_map = st.session_state.get("img_question_map", {})
 
                 log_lines = []
                 def log(msg):
@@ -445,9 +521,9 @@ if "records" in st.session_state:
                         for rec, row in zip(resp.json()["records"], chunk):
                             id_map.append({
                                 "record_id":        rec["id"],
+                                "questionNumber":   row.get("questionNumber", ""),
                                 "hasImages":        row.get("hasImages", False),
                                 "imageDescription": row.get("imageDescription", ""),
-                                "chunkIdx":         row.get("chunkIdx", 0),
                             })
                     log(f"✅ {total} records pushed to Airtable")
                 except Exception as e:
@@ -459,33 +535,48 @@ if "records" in st.session_state:
                 log(f"📋 id_map entries: {len(id_map)}")
 
                 if id_map and _images and _imgbb:
-                    # Group images by chunk (each chunk = CHUNK_PAGES pages)
-                    chunk_img_urls: dict[int, list[str]] = {}
+                    # Upload all images to imgbb first
+                    img_urls_by_name: dict[str, str] = {}
                     for img in _images:
-                        cidx = (img["page"] - 1) // CHUNK_PAGES
                         iurl = upload_to_imgbb(_imgbb, img)
                         if iurl:
-                            chunk_img_urls.setdefault(cidx, []).append(iurl)
-                            log(f"  ✅ {img['name']} (chunk {cidx}) uploaded")
+                            img_urls_by_name[img["name"]] = iurl
+                            log(f"  ✅ {img['name']} uploaded")
                         else:
                             log(f"  ❌ {img['name']} failed to upload")
 
-                    if chunk_img_urls:
+                    if img_urls_by_name:
+                        # Build questionNumber → [urls] from the vision map
+                        q_to_urls: dict[str, list[str]] = {}
+                        unmatched_urls = []
+                        for name, url in img_urls_by_name.items():
+                            qnum = _img_question_map.get(name)
+                            if qnum:
+                                q_to_urls.setdefault(qnum, []).append(url)
+                            else:
+                                unmatched_urls.append(url)
+
+                        log(f"📌 Matched {len(q_to_urls)} question(s) with images")
+                        if unmatched_urls:
+                            log(f"  ℹ️ {len(unmatched_urls)} unmatched images skipped")
+
+                        # Build record_id → questionNumber lookup
+                        rid_to_qnum = {m["record_id"]: m["questionNumber"] for m in id_map}
+
                         patched = 0
                         for m in id_map:
-                            if not (m.get("hasImages") or m.get("imageDescription","").strip()):
-                                continue
-                            cidx     = m.get("chunkIdx", 0)
-                            urls     = chunk_img_urls.get(cidx, [])
+                            qnum = m.get("questionNumber", "")
+                            urls = q_to_urls.get(qnum, [])
                             if not urls:
                                 continue
                             try:
                                 patch_record_images(AT_TOKEN, AT_BASE, AT_TABLE,
                                                     m["record_id"], urls)
                                 patched += 1
+                                log(f"  ✅ Q{qnum} — {len(urls)} image(s) attached")
                             except Exception as e:
-                                log(f"  ❌ {m['record_id']}: {e}")
-                        log(f"✅ Images attached to {patched} records")
+                                log(f"  ❌ Q{qnum} ({m['record_id']}): {e}")
+                        log(f"✅ Done — images attached to {patched} records")
                     else:
                         log("❌ All imgbb uploads failed")
                 elif _images and not _imgbb:
