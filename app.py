@@ -354,11 +354,16 @@ def extract_all_crops(pdf_bytes: bytes,
             except Exception:
                 pass
 
-        # 2. Tables
+        # 2. Tables — skip any that cover more than 50% of page (false positives)
+        page_area = pr.width * pr.height
         try:
             for idx, table in enumerate(page.find_tables().tables, 1):
                 rect = fitz.Rect(table.bbox)
                 if rect.width < 30 or rect.height < 30:
+                    continue
+                if (rect.width * rect.height) > page_area * 0.50:
+                    if is_debug:
+                        debug_log.append(f"SKIP false-positive table p{page_num}: {rect} ({rect.width:.0f}x{rect.height:.0f}pt)")
                     continue
                 data = crop_rect(page, rect)
                 pil  = Image.open(io.BytesIO(data))
