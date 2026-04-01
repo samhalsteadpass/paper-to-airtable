@@ -53,7 +53,7 @@ JPEG_QUALITY      = 70
 RENDER_DPI        = 150
 VISION_DPI        = 170
 EXTRACT_DPI       = 300
-CROP_PAD_PT       = 8
+CROP_PAD_PT       = 24   # increased from 8 — catches dimension labels near drawings
 
 AT_API    = "https://api.airtable.com/v0"
 AT_META   = "https://api.airtable.com/v0/meta"
@@ -379,6 +379,26 @@ def extract_all_crops(pdf_bytes: bytes,
         is_debug  = (debug_page == page_num)
 
         # 1. Raster images
+        # Pre-build text span rects for the whole page (used by all three extraction passes)
+        text_blocks     = page.get_text("dict")["blocks"]
+        text_span_rects : list[fitz.Rect] = []
+        donotwrite_rects: list[fitz.Rect] = []
+        for block in text_blocks:
+            if block.get("type") != 0:
+                continue
+            block_text = " ".join(
+                span.get("text", "")
+                for line in block.get("lines", [])
+                for span in line.get("spans", [])
+            ).lower()
+            if "do not write" in block_text or "examiner" in block_text:
+                donotwrite_rects.append(fitz.Rect(block["bbox"]))
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    r = fitz.Rect(span.get("bbox", [0,0,0,0]))
+                    if r.width > 2 and r.height > 2:
+                        text_span_rects.append(r)
+
         blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
         for idx, block in enumerate(blocks, 1):
             if block.get("type") != 1:
@@ -440,20 +460,6 @@ def extract_all_crops(pdf_bytes: bytes,
             pass
 
         # 3. Drawings — collect ALL paths, cluster, dedup
-        # Build a text-bbox index for this page to skip "do not write" regions
-        text_blocks = page.get_text("dict")["blocks"]
-        donotwrite_rects: list[fitz.Rect] = []
-        for block in text_blocks:
-            if block.get("type") != 0:
-                continue
-            text = " ".join(
-                span.get("text", "")
-                for line in block.get("lines", [])
-                for span in line.get("spans", [])
-            ).lower()
-            if "do not write" in text or "examiner" in text:
-                donotwrite_rects.append(fitz.Rect(block["bbox"]))
-
         raw_rects: list[fitz.Rect] = []
         for drawing in page.get_drawings():
             r = drawing.get("rect")
@@ -506,7 +512,17 @@ def extract_all_crops(pdf_bytes: bytes,
 
         for idx, rect in enumerate(kept, 1):
             try:
-                data = crop_rect(page, rect, pad_pt=CROP_PAD_PT)
+                # Expand bbox to absorb text spans within CROP_PAD_PT of the drawing
+                expanded_rect = fitz.Rect(rect)
+                absorb_zone   = fitz.Rect(
+                    rect.x0 - CROP_PAD_PT * 3, rect.y0 - CROP_PAD_PT * 3,
+                    rect.x1 + CROP_PAD_PT * 3, rect.y1 + CROP_PAD_PT * 3,
+                )
+                for sr in text_span_rects:
+                    if absorb_zone.intersects(sr):
+                        expanded_rect |= sr
+
+                data = crop_rect(page, expanded_rect, pad_pt=CROP_PAD_PT)
                 pil  = Image.open(io.BytesIO(data))
                 if pil.width < 20 or pil.height < 20:
                     continue
