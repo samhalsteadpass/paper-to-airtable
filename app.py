@@ -94,33 +94,23 @@ Each element must be:
 }
 """
 
-VISUAL_DETECT_PROMPT = """This is page {page_num} of an exam paper.
+IMAGE_MAPPING_PROMPT = """This is page {page_num} of an exam paper.
 
-Do two things at once:
-1. Identify every visual element a student needs to answer a question.
-   Include: diagrams, graphs, grids, tables, formula boxes, number lines, geometric shapes, charts.
-   Exclude: answer lines, page borders, headers, footers, barcodes, page numbers, "do not write" text.
+The following visuals were extracted from this page:
+{img_list}
 
-2. For each visual, identify which question number it belongs to by reading the page layout.
-
+For each visual, identify which question number it belongs to by reading the page layout.
 Return ONLY a raw JSON array. No markdown. No explanation.
 Each element:
 {{
-  "label": "centimetre grid",
+  "imageName": "p{page_num}_img1.png",
   "questionNumber": "3a",
   "confidence": "high",
-  "notes": "Grid appears directly under Q3a",
-  "x": 0.25,
-  "y": 0.10,
-  "w": 0.30,
-  "h": 0.25
+  "notes": "Grid appears directly under Q3a"
 }}
 
-x, y = top-left corner as fraction of page width/height (0.0 to 1.0)
-w, h = width and height as fraction of page width/height
 confidence: high, medium, or low
 If no question can be assigned use questionNumber = "none"
-If there are no relevant visuals on this page return an empty array: []
 """
 
 SKIP_PAGE_KEYWORDS = [
@@ -256,115 +246,215 @@ def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
             return False
     return True
 
-# ── GPT-Vision visual extraction + mapping (single call per page) ─────────
-def extract_visuals_from_page(client: OpenAI, pdf_bytes: bytes,
-                               page_num: int) -> tuple[list[dict], dict[str, dict]]:
+# ── PyMuPDF visual extraction (pixel-perfect) ────────────────────────────
+VEC_MIN_CONTENT_PCT = 1.5   # % non-white pixels — filters blank answer line regions
+
+def content_pct(png_data: bytes) -> float:
+    from PIL import ImageStat
+    img  = Image.open(io.BytesIO(png_data)).convert("RGB")
+    mean = sum(ImageStat.Stat(img).mean) / 3
+    return 100.0 - (mean / 255.0 * 100.0)
+
+def rect_inside_any(rect, rect_list, pad=2) -> bool:
+    r = fitz.Rect(rect)
+    return any(
+        r.x0 >= fitz.Rect(o).x0 - pad and r.y0 >= fitz.Rect(o).y0 - pad and
+        r.x1 <= fitz.Rect(o).x1 + pad and r.y1 <= fitz.Rect(o).y1 + pad
+        for o in rect_list
+    )
+
+def merge_rects(rects, x_gap=8, y_gap=4):
+    rects, merged = [fitz.Rect(r) for r in rects], []
+    while rects:
+        cur, changed = rects.pop(0), True
+        while changed:
+            changed, remaining = False, []
+            for r in rects:
+                exp = fitz.Rect(cur.x0-x_gap, cur.y0-y_gap, cur.x1+x_gap, cur.y1+y_gap)
+                if exp.intersects(r):
+                    cur |= r; changed = True
+                else:
+                    remaining.append(r)
+            rects = remaining
+        merged.append(cur)
+    return merged
+
+def render_clip(page, rect, dpi=190) -> tuple[bytes, int, int]:
+    mat  = fitz.Matrix(dpi/72, dpi/72)
+    pix  = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
+    data = pix.tobytes("png")
+    img  = Image.open(io.BytesIO(data))
+    return data, img.width, img.height
+
+@st.cache_data(show_spinner=False)
+def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
     """
-    Single GPT-4.1 call per page:
-    - Locates and crops all question-relevant visuals
-    - Returns their question mapping at the same time
+    Extract embedded images, tables, and vector regions using PyMuPDF.
+    Pixel-perfect coordinates — no GPT coordinate guessing.
     """
-    page_pil       = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
-    page_w, page_h = page_pil.size
+    doc     = fitz.open(stream=pdf_bytes, filetype="pdf")
+    visuals = []
 
-    content = [
-        {"type": "input_text",
-         "text": VISUAL_DETECT_PROMPT.format(page_num=page_num)},
-        {"type": "input_image",
-         "image_url": f"data:image/jpeg;base64,{encode_image(page_pil)}"},
-    ]
-    def _call():
-        return client.responses.create(
-            model=VISION_MODEL,
-            input=[{"role": "user", "content": content}],
-            max_output_tokens=2000,
-        )
-    raw  = openai_response_text(run_with_retry(_call))
-    rows = safe_json_loads(raw, [])
+    for page_num, page in enumerate(doc, 1):
+        if not is_question_page(pdf_bytes, page_num):
+            continue
 
-    visuals: list[dict]      = []
-    mapping: dict[str, dict] = {}
+        table_rects = []
+        pr          = page.rect
 
-    for idx, row in enumerate(rows, 1):
+        # 1. Embedded raster images
+        for idx, img_info in enumerate(page.get_images(full=True), 1):
+            try:
+                bi  = doc.extract_image(img_info[0])
+                pil = Image.open(io.BytesIO(bi["image"]))
+                w, h = pil.size
+                if w < 80 or h < 80 or w*h < 12000:
+                    continue
+                if w/max(h,1) > 4:          # skip barcodes
+                    continue
+                visuals.append({
+                    "page":   page_num,
+                    "name":   f"p{page_num}_img{idx}.{bi['ext']}",
+                    "kind":   "image",
+                    "data":   bi["image"],
+                    "width":  w,
+                    "height": h,
+                })
+            except Exception:
+                pass
+
+        # 2. Tables
         try:
-            x = float(row["x"]); y = float(row["y"])
-            w = float(row["w"]); h = float(row["h"])
+            for idx, table in enumerate(page.find_tables().tables, 1):
+                rect = fitz.Rect(table.bbox)
+                table_rects.append(rect)
+                if rect.width < 40 or rect.height < 40:
+                    continue
+                data, w, h = render_clip(page, rect)
+                if content_pct(data) < VEC_MIN_CONTENT_PCT:
+                    continue
+                visuals.append({
+                    "page":   page_num,
+                    "name":   f"p{page_num}_table{idx}.png",
+                    "kind":   "table",
+                    "data":   data,
+                    "width":  w,
+                    "height": h,
+                })
+        except Exception:
+            pass
 
-            pad = 0.01
-            x1  = max(0.0, x - pad);     y1 = max(0.0, y - pad)
-            x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
+        # 3. Vector regions (diagrams, grids, formula boxes, number lines)
+        try:
+            drawing_rects = []
+            for d in page.get_drawings():
+                rect = d.get("rect")
+                if not rect:
+                    continue
+                rect = fitz.Rect(rect)
+                if rect.width < 18 or rect.height < 18:
+                    continue
+                if rect_inside_any(rect, table_rects):
+                    continue
+                drawing_rects.append(rect)
 
-            if (x2 - x1) > 0.95 and (y2 - y1) > 0.85:
-                continue
-            if (x2 - x1) < 0.03 or (y2 - y1) < 0.03:
-                continue
+            for idx, rect in enumerate(merge_rects(drawing_rects), 1):
+                if rect.width < 35 or rect.height < 35:
+                    continue
+                if rect.width > pr.width * 0.95 and rect.height > pr.height * 0.85:
+                    continue
+                if rect.width > pr.width * 0.85 and rect.height < 60:
+                    continue
+                data, w, h = render_clip(page, rect)
+                if w < 60 or h < 60:
+                    continue
+                asp = w / max(h, 1)
+                if asp > 10 or asp < 0.08:
+                    continue
+                if content_pct(data) < VEC_MIN_CONTENT_PCT:
+                    continue
+                visuals.append({
+                    "page":   page_num,
+                    "name":   f"p{page_num}_vec{idx}.png",
+                    "kind":   "vector",
+                    "data":   data,
+                    "width":  w,
+                    "height": h,
+                })
+        except Exception:
+            pass
 
-            crop = page_pil.crop((
-                int(x1 * page_w), int(y1 * page_h),
-                int(x2 * page_w), int(y2 * page_h),
-            ))
-            buf = io.BytesIO()
-            crop.save(buf, format="PNG")
+    doc.close()
+    return visuals
 
-            name = f"p{page_num}_v{idx}.png"
-            qnum = normalise_qnum(row.get("questionNumber", "none"))
-            conf = str(row.get("confidence", "low") or "low").strip().lower()
-            note = str(row.get("notes", "") or "").strip()
-
-            visuals.append({
-                "page":   page_num,
-                "name":   name,
-                "kind":   str(row.get("label", f"visual{idx}")),
-                "data":   buf.getvalue(),
-                "width":  crop.width,
-                "height": crop.height,
-            })
-            mapping[name] = {
+# ── GPT mapping: which question does each visual belong to? ───────────────
+def map_page_visuals(client: OpenAI, pdf_bytes: bytes,
+                     page_num: int, page_imgs: list[dict]) -> dict[str, dict]:
+    page_pil = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
+    img_list = "\n".join(
+        f"- {img['name']} ({img['width']}x{img['height']}, kind={img.get('kind','?')})"
+        for img in page_imgs
+    )
+    prompt = IMAGE_MAPPING_PROMPT.format(
+        page_num=page_num, img_list=img_list
+    )
+    raw  = call_gpt_vision(client, [page_pil], prompt,
+                           model=VISION_MODEL, max_images=1,
+                           max_output_tokens=2000)
+    rows = safe_json_loads(raw, [])
+    result: dict[str, dict] = {}
+    for row in rows:
+        name = str(row.get("imageName", "") or "").strip()
+        qnum = normalise_qnum(row.get("questionNumber", "none"))
+        conf = str(row.get("confidence", "low") or "low").strip().lower()
+        note = str(row.get("notes", "") or "").strip()
+        if name:
+            result[name] = {
                 "questionNumber": qnum or "none",
-                "confidence":     conf if conf in {"high", "medium", "low"} else "low",
+                "confidence":     conf if conf in {"high","medium","low"} else "low",
                 "notes":          note,
                 "source":         "vision",
             }
-        except Exception:
-            continue
-
-    return visuals, mapping
+    return result
 
 @st.cache_data(show_spinner=False)
-def extract_visual_regions(client_key: str, pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
-    """Run combined GPT-4.1 visual extraction + mapping on all question pages in parallel."""
-    client = OpenAI(api_key=client_key)
-    doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total  = len(doc)
-    doc.close()
+def map_images_to_questions(openai_key: str, pdf_bytes: bytes,
+                             images: list[dict],
+                             records: list[dict]) -> dict[str, dict]:
+    """Ask GPT to map each extracted visual to a question number, in parallel."""
+    client      = OpenAI(api_key=openai_key)
+    page_groups: dict[int, list] = {}
+    for img in images:
+        page_groups.setdefault(img["page"], []).append(img)
 
-    question_pages = [p for p in range(1, total + 1)
-                      if is_question_page(pdf_bytes, p)]
-
-    vis_results: dict[int, list] = {}
-    map_results: dict[int, dict] = {}
-
-    def process(page_num):
-        try:
-            visuals, mapping = extract_visuals_from_page(client, pdf_bytes, page_num)
-            return page_num, visuals, mapping
-        except Exception:
-            return page_num, [], {}
-
+    mapping: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for pn, visuals, mapping in [f.result() for f in
-                                      as_completed([ex.submit(process, p)
-                                                    for p in question_pages])]:
-            vis_results[pn] = visuals
-            map_results[pn] = mapping
+        futures = [ex.submit(map_page_visuals, client, pdf_bytes, pn, imgs)
+                   for pn, imgs in page_groups.items()]
+        for f in as_completed(futures):
+            mapping.update(f.result())
 
-    all_visuals: list[dict]       = []
-    full_mapping: dict[str, dict] = {}
-    for p in sorted(vis_results):
-        all_visuals.extend(vis_results[p])
-        full_mapping.update(map_results[p])
+    # Fallback: assign unmapped visuals to last question on their page
+    pq_index: dict[int, list[str]] = {}
+    for r in records:
+        page = clamp_int(r.get("pageNumber", 0))
+        qn   = normalise_qnum(r.get("questionNumber", ""))
+        if page and qn:
+            pq_index.setdefault(page, [])
+            if qn not in pq_index[page]:
+                pq_index[page].append(qn)
 
-    return all_visuals, full_mapping
+    for img in images:
+        name = img["name"]
+        if name not in mapping or mapping[name].get("questionNumber") in {"", "none"}:
+            qs = pq_index.get(img["page"], [])
+            mapping[name] = {
+                "questionNumber": qs[-1] if qs else "none",
+                "confidence":     "low",
+                "notes":          "Fallback: last question on page",
+                "source":         "fallback",
+            }
+    return mapping
 
 # ── Parallel question extraction ──────────────────────────────────────────
 def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes) -> tuple[list[dict], list[str]]:
@@ -551,14 +641,13 @@ if st.button("✨ Extract Questions", type="primary",
 
     with st.status("Extracting…", expanded=True) as status:
 
-        st.write("📎 Extracting visuals with GPT-4V…")
+        st.write("📎 Extracting visuals with PyMuPDF…")
         extract_visual_regions.clear()
-        images, image_map = extract_visual_regions(OPENAI_KEY, paper_bytes)
-        mapped = sum(1 for v in image_map.values()
-                     if v.get("questionNumber") not in {"none", ""})
-        st.write(f"   Found {len(images)} visuals across "
-                 f"{len(set(i['page'] for i in images))} pages "
-                 f"({mapped} mapped to questions)")
+        images = extract_visual_regions(paper_bytes)
+        st.write(f"   Found {len(images)} visuals "
+                 f"({sum(1 for i in images if i['kind']=='image')} images, "
+                 f"{sum(1 for i in images if i['kind']=='table')} tables, "
+                 f"{sum(1 for i in images if i['kind']=='vector')} vector regions)")
 
         st.write("🤖 Extracting questions (parallel)…")
         questions, q_logs = extract_questions_parallel(client, paper_bytes)
@@ -594,25 +683,12 @@ if st.button("✨ Extract Questions", type="primary",
 
         # Apply fallback mapping for any visuals GPT didn't assign
         if images:
-            pq_index: dict[int, list[str]] = {}
-            for r in records:
-                page = clamp_int(r.get("pageNumber", 0))
-                qn   = normalise_qnum(r.get("questionNumber", ""))
-                if page and qn:
-                    pq_index.setdefault(page, [])
-                    if qn not in pq_index[page]:
-                        pq_index[page].append(qn)
-
-            for img in images:
-                name = img["name"]
-                if name not in image_map or image_map[name].get("questionNumber") in {"", "none"}:
-                    qs = pq_index.get(img["page"], [])
-                    image_map[name] = {
-                        "questionNumber": qs[-1] if qs else "none",
-                        "confidence":     "low",
-                        "notes":          "Fallback: last question on page",
-                        "source":         "fallback",
-                    }
+            map_images_to_questions.clear()
+            st.write("🔍 Mapping visuals to questions with GPT-4V…")
+            image_map = map_images_to_questions(OPENAI_KEY, paper_bytes, images, records)
+            mapped = sum(1 for v in image_map.values()
+                         if v.get("questionNumber") not in {"none", ""})
+            st.write(f"   Mapped {mapped}/{len(images)} visuals to questions")
 
             q_to_imgs  : dict[str, list[str]] = {}
             q_to_conf  : dict[str, list[str]] = {}
