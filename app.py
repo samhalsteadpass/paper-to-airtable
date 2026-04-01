@@ -1,108 +1,4 @@
-# ── Extraction: GPT locates visuals, we crop from 300 DPI render ──────────
-def extract_page_visuals(client: OpenAI, pdf_bytes: bytes,
-                          page_num: int) -> list[dict]:
-    """
-    Render page at 300 DPI, ask GPT to locate all relevant visuals,
-    crop each one with 10% padding for quality.
-    """
-    # Render at 300 DPI for high-quality crops
-    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
-    mat  = fitz.Matrix(EXTRACT_DPI / 72, EXTRACT_DPI / 72)
-    pix  = doc[page_num - 1].get_pixmap(matrix=mat, alpha=False)
-    doc.close()
-
-    page_pil       = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-    page_w, page_h = page_pil.size
-
-    # Send to GPT at VISION_DPI quality (compressed for API efficiency)
-    content = [
-        {"type": "input_text",
-         "text": GPT_EXTRACT_PROMPT.format(page_num=page_num)},
-        {"type": "input_image",
-         "image_url": f"data:image/jpeg;base64,{encode_pil(page_pil)}"},
-    ]
-    def _call():
-        return client.responses.create(
-            model=VISION_MODEL,
-            input=[{"role": "user", "content": content}],
-            max_output_tokens=2000,
-        )
-    raw  = openai_response_text(run_with_retry(_call))
-    rows = safe_json_loads(raw, [])
-
-    visuals: list[dict] = []
-    for idx, row in enumerate(rows, 1):
-        try:
-            x = float(row["x"]); y = float(row["y"])
-            w = float(row["w"]); h = float(row["h"])
-
-            # 10% padding on all sides for quality — compensates for GPT imprecision
-            pad_x = w * 0.10
-            pad_y = h * 0.10
-            x1 = max(0.0, x - pad_x);     y1 = max(0.0, y - pad_y)
-            x2 = min(1.0, x + w + pad_x); y2 = min(1.0, y + h + pad_y)
-
-            # Skip near-full-page boxes
-            if (x2 - x1) > 0.95 and (y2 - y1) > 0.90:
-                continue
-            # Skip tiny
-            if (x2 - x1) < 0.02 or (y2 - y1) < 0.02:
-                continue
-
-            # Crop from the 300 DPI render — high quality
-            crop = page_pil.crop((
-                int(x1 * page_w), int(y1 * page_h),
-                int(x2 * page_w), int(y2 * page_h),
-            ))
-            buf = io.BytesIO()
-            crop.save(buf, format="PNG")
-
-            qnum = normalise_qnum(row.get("questionNumber", "none"))
-            conf = str(row.get("confidence", "low") or "low").strip().lower()
-
-            visuals.append({
-                "page":           page_num,
-                "name":           f"p{page_num}_v{idx}.png",
-                "source":         "gpt",
-                "kind":           str(row.get("label", f"visual{idx}")),
-                "data":           buf.getvalue(),
-                "width":          crop.width,
-                "height":         crop.height,
-                "questionNumber": qnum or "none",
-                "confidence":     conf if conf in {"high", "medium", "low"} else "low",
-                "notes":          str(row.get("notes", "") or ""),
-            })
-        except Exception:
-            continue
-
-    return visuals
-
-@st.cache_data(show_spinner=False)
-def extract_and_judge_visuals(openai_key: str,
-                               pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
-    """
-    Ask GPT to locate and crop all visuals from every question page in parallel.
-    Returns (visuals, image_map).
-    """
-    client = OpenAI(api_key=openai_key)
-    doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total  = len(doc)
-    doc.close()
-
-    question_pages = [p for p in range(1, total + 1)
-                      if is_question_page(pdf_bytes, p)]
-
-    results: dict[int, list] = {}
-
-    def process(page_num: int):
-        try:
-            return page_num, extract_page_visuals(client, pdf_bytes, page_num)
-        except Exception:
-            return page_num, []
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for pn, visuals in [f.result() for f in
-                             as_completed([ex.sub"""
+"""
 app_v2.py  –  Past Paper → Airtable  (OpenAI, Streamlit Cloud)
 ==============================================================
 Architecture:
@@ -395,228 +291,113 @@ def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
     doc.close()
     return not any(kw in text for kw in SKIP_PAGE_KEYWORDS)
 
-# ── Stage 1: PyMuPDF — extract ALL visuals, zero filtering ───────────────
-def rects_overlap(a: fitz.Rect, b: fitz.Rect, pad: float = 4.0) -> bool:
-    return (a.x0 - pad < b.x1 and a.x1 + pad > b.x0 and
-            a.y0 - pad < b.y1 and a.y1 + pad > b.y0)
-
-def merge_rects(rects: list[fitz.Rect],
-                pad: float = 6.0,
-                max_h_gap: float = 30.0,
-                max_v_gap: float = 25.0) -> list[fitz.Rect]:
+# ── Extraction: GPT locates visuals, we crop from 300 DPI render ──────────
+def extract_page_visuals(client: OpenAI, pdf_bytes: bytes,
+                          page_num: int) -> list[dict]:
     """
-    Merge overlapping rects.
-    Rects with horizontal gap > max_h_gap are NOT merged (keeps side-by-side boxes separate).
-    Rects with vertical gap > max_v_gap are NOT merged (keeps Q7a table and Q7b boxes separate).
+    Render page at 300 DPI, ask GPT to locate all relevant visuals,
+    crop each one with 10% padding for quality.
     """
-    rects, merged = list(rects), []
-    while rects:
-        cur, changed = rects.pop(0), True
-        while changed:
-            changed, remaining = False, []
-            for r in rects:
-                h_gap = max(r.x0 - cur.x1, cur.x0 - r.x1, 0.0)
-                v_gap = max(r.y0 - cur.y1, cur.y0 - r.y1, 0.0)
-                if h_gap <= max_h_gap and v_gap <= max_v_gap and rects_overlap(cur, r, pad):
-                    cur |= r; changed = True
-                else:
-                    remaining.append(r)
-            rects = remaining
-        merged.append(cur)
-    return merged
-
-def render_clip(page: fitz.Page, rect: fitz.Rect, dpi: int = EXTRACT_DPI) -> bytes:
-    mat = fitz.Matrix(dpi/72, dpi/72)
-    pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
-    return pix.tobytes("png")
-
-def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
-    """
-    Extract every possible visual candidate from every question page.
-    Order: raster images → find_tables() → path regions (skip if overlaps a table).
-    No relevance filtering — GPT judges that in Stage 2.
-    """
-    doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
-    all_crops: list[dict] = []
-
-    for page_num, page in enumerate(doc, 1):
-        if not is_question_page(pdf_bytes, page_num):
-            continue
-
-        pr = page.rect
-
-        # ── 1. Embedded raster images ──────────────────────────────────
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
-        for idx, block in enumerate(blocks, 1):
-            if block.get("type") != 1:
-                continue
-            try:
-                img_bytes = block.get("image")
-                if not img_bytes:
-                    continue
-                pil = Image.open(io.BytesIO(img_bytes))
-                w, h = pil.size
-                if w < 40 or h < 40:
-                    continue
-                all_crops.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_raster{idx}.png",
-                    "source": "raster",
-                    "data":   img_bytes,
-                    "width":  w,
-                    "height": h,
-                    "bbox":   fitz.Rect(block.get("bbox", [0,0,0,0])),
-                })
-            except Exception:
-                pass
-
-        # ── 2. Tables via find_tables() — semantic, pixel-perfect ──────
-        table_rects: list[fitz.Rect] = []
-        try:
-            for idx, table in enumerate(page.find_tables().tables, 1):
-                rect = fitz.Rect(table.bbox)
-                # Expand generously — find_tables() often clips the outer border
-                rect = fitz.Rect(rect.x0 - 15, rect.y0 - 15,
-                                 rect.x1 + 15, rect.y1 + 15)
-                # Clamp to page bounds
-                rect = rect & pr
-                table_rects.append(rect)
-                if rect.width < 30 or rect.height < 30:
-                    continue
-                data = render_clip(page, rect)
-                pil  = Image.open(io.BytesIO(data))
-                w, h = pil.size
-                if w < 20 or h < 20:
-                    continue
-                all_crops.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_table{idx}.png",
-                    "source": "table",
-                    "data":   data,
-                    "width":  w,
-                    "height": h,
-                    "bbox":   rect,
-                })
-        except Exception:
-            pass
-
-        # ── 3. Path regions — skip anything that overlaps a table ──────
-        path_rects: list[fitz.Rect] = []
-        for path in page.get_drawings():
-            r = path.get("rect")
-            if not r:
-                continue
-            r = fitz.Rect(r)
-            if r.width < 10 or r.height < 10:
-                continue
-            # Skip if this path is inside or overlaps a table we already have
-            if any(rects_overlap(r, tr, pad=6) for tr in table_rects):
-                continue
-            path_rects.append(r)
-
-        for idx, rect in enumerate(merge_rects(path_rects), 1):
-            # Skip near-full-page regions (use OR so partial near-full-page also skipped)
-            if rect.width > pr.width * 0.88 or rect.height > pr.height * 0.80:
-                continue
-            if rect.width < 15 or rect.height < 15:
-                continue
-            # Skip if overlaps a table bbox (belt-and-braces)
-            if any(rects_overlap(rect, tr, pad=6) for tr in table_rects):
-                continue
-            try:
-                data = render_clip(page, rect)
-                pil  = Image.open(io.BytesIO(data))
-                w, h = pil.size
-                if w < 20 or h < 20:
-                    continue
-                all_crops.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_path{idx}.png",
-                    "source": "path",
-                    "data":   data,
-                    "width":  w,
-                    "height": h,
-                    "bbox":   rect,
-                })
-            except Exception:
-                pass
-
+    # Render at 300 DPI for high-quality crops
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat  = fitz.Matrix(EXTRACT_DPI / 72, EXTRACT_DPI / 72)
+    pix  = doc[page_num - 1].get_pixmap(matrix=mat, alpha=False)
     doc.close()
-    return all_crops
 
-# ── Stage 2: GPT judges relevance + assigns question number ───────────────
-def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
-                     page_num: int, crops: list[dict]) -> list[dict]:
-    """
-    Send the rendered page + all crops to GPT-4V.
-    GPT decides: relevant? which question?
-    Returns only the relevant crops with mapping metadata.
-    """
-    if not crops:
-        return []
+    page_pil       = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    page_w, page_h = page_pil.size
 
-    page_pil = render_page_pil(pdf_bytes, page_num, dpi=VISION_DPI)
-
-    content: list[dict] = [
+    # Send to GPT at VISION_DPI quality (compressed for API efficiency)
+    content = [
         {"type": "input_text",
-         "text": GPT_JUDGE_PROMPT.format(page_num=page_num)},
+         "text": GPT_EXTRACT_PROMPT.format(page_num=page_num)},
         {"type": "input_image",
          "image_url": f"data:image/jpeg;base64,{encode_pil(page_pil)}"},
     ]
-    for crop in crops:
-        content.append({"type": "input_text",  "text": f"Crop: {crop['name']}"})
-        content.append({"type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{encode_bytes(crop['data'])}"})
-
-    raw  = call_gpt(client, content, VISION_MODEL, max_output_tokens=3000)
+    def _call():
+        return client.responses.create(
+            model=VISION_MODEL,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=2000,
+        )
+    raw  = openai_response_text(run_with_retry(_call))
     rows = safe_json_loads(raw, [])
 
-    judgements: dict[str, dict] = {
-        str(r.get("cropName", "") or "").strip(): r
-        for r in rows
-    }
+    visuals: list[dict] = []
+    for idx, row in enumerate(rows, 1):
+        try:
+            x = float(row["x"]); y = float(row["y"])
+            w = float(row["w"]); h = float(row["h"])
 
-    kept: list[dict] = []
-    for crop in crops:
-        j = judgements.get(crop["name"], {})
-        if not j.get("relevant", False):
+            # 10% padding on all sides for quality — compensates for GPT imprecision
+            pad_x = w * 0.10
+            pad_y = h * 0.10
+            x1 = max(0.0, x - pad_x);     y1 = max(0.0, y - pad_y)
+            x2 = min(1.0, x + w + pad_x); y2 = min(1.0, y + h + pad_y)
+
+            # Skip near-full-page boxes
+            if (x2 - x1) > 0.95 and (y2 - y1) > 0.90:
+                continue
+            # Skip tiny
+            if (x2 - x1) < 0.02 or (y2 - y1) < 0.02:
+                continue
+
+            # Crop from the 300 DPI render — high quality
+            crop = page_pil.crop((
+                int(x1 * page_w), int(y1 * page_h),
+                int(x2 * page_w), int(y2 * page_h),
+            ))
+            buf = io.BytesIO()
+            crop.save(buf, format="PNG")
+
+            qnum = normalise_qnum(row.get("questionNumber", "none"))
+            conf = str(row.get("confidence", "low") or "low").strip().lower()
+
+            visuals.append({
+                "page":           page_num,
+                "name":           f"p{page_num}_v{idx}.png",
+                "source":         "gpt",
+                "kind":           str(row.get("label", f"visual{idx}")),
+                "data":           buf.getvalue(),
+                "width":          crop.width,
+                "height":         crop.height,
+                "questionNumber": qnum or "none",
+                "confidence":     conf if conf in {"high", "medium", "low"} else "low",
+                "notes":          str(row.get("notes", "") or ""),
+            })
+        except Exception:
             continue
-        qnum = normalise_qnum(j.get("questionNumber", "none"))
-        kept.append({
-            **crop,
-            "kind":           str(j.get("label",      "visual")),
-            "questionNumber": qnum or "none",
-            "confidence":     str(j.get("confidence", "low")).lower(),
-            "notes":          str(j.get("notes",      "")),
-        })
-    return kept
+
+    return visuals
 
 @st.cache_data(show_spinner=False)
 def extract_and_judge_visuals(openai_key: str,
                                pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
     """
-    Stage 1: PyMuPDF extracts all crops.
-    Stage 2: GPT judges each page's crops in parallel.
+    Ask GPT to locate and crop all visuals from every question page in parallel.
     Returns (visuals, image_map).
     """
-    client    = OpenAI(api_key=openai_key)
-    all_crops = extract_all_crops(pdf_bytes)
+    client = OpenAI(api_key=openai_key)
+    doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total  = len(doc)
+    doc.close()
 
-    by_page: dict[int, list[dict]] = {}
-    for crop in all_crops:
-        by_page.setdefault(crop["page"], []).append(crop)
+    question_pages = [p for p in range(1, total + 1)
+                      if is_question_page(pdf_bytes, p)]
 
     results: dict[int, list] = {}
 
-    def process_page(page_num: int, crops: list[dict]):
-        judged = judge_page_crops(client, pdf_bytes, page_num, crops)
-        return page_num, judged
+    def process(page_num: int):
+        try:
+            return page_num, extract_page_visuals(client, pdf_bytes, page_num)
+        except Exception:
+            return page_num, []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for pn, judged in [f.result() for f in
-                            as_completed([ex.submit(process_page, pn, crops)
-                                          for pn, crops in by_page.items()])]:
-            results[pn] = judged
+        for pn, visuals in [f.result() for f in
+                             as_completed([ex.submit(process, p)
+                                           for p in question_pages])]:
+            results[pn] = visuals
 
     kept_visuals: list[dict]       = []
     full_mapping: dict[str, dict]  = {}
@@ -627,12 +408,12 @@ def extract_and_judge_visuals(openai_key: str,
                 "questionNumber": v.get("questionNumber", "none"),
                 "confidence":     v.get("confidence",     "low"),
                 "notes":          v.get("notes",          ""),
-                "source":         "gpt_judge",
+                "source":         "gpt",
             }
 
     return kept_visuals, full_mapping
 
-# ── Stage 3: Recovery — find visuals for hasImages questions with none ────
+# ── Stage 3: Recovery ─────────────────────────────────────────────────────
 def recover_missing_visual(client: OpenAI, pdf_bytes: bytes,
                             record: dict) -> dict | None:
     page_num = clamp_int(record.get("pageNumber", 1), 1)
