@@ -610,7 +610,7 @@ if st.button("✨ Extract Questions", type="primary",
     with st.status("Extracting…", expanded=True) as status:
         st.write("📎 Extracting visuals with GPT-4V…")
         extract_visual_regions.clear()
-        images, image_map = extract_visual_regions(OPENAI_KEY, paper_bytes, _version=2)
+        images, image_map = extract_visual_regions(OPENAI_KEY, paper_bytes)
         mapped = sum(1 for v in image_map.values()
                      if v.get("questionNumber") not in {"none", ""})
         st.write(f"   Found {len(images)} visuals across "
