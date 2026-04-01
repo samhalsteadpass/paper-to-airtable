@@ -292,35 +292,168 @@ def looks_useful_image(img: Image.Image) -> tuple[bool, str]:
     return True, "ok"
 
 
-def extract_images(pdf_bytes: bytes) -> list[dict]:
+def rect_inside_any(rect, rect_list, pad=2):
+    r = fitz.Rect(rect)
+    for other in rect_list:
+        o = fitz.Rect(other)
+        if (
+            r.x0 >= o.x0 - pad and
+            r.y0 >= o.y0 - pad and
+            r.x1 <= o.x1 + pad and
+            r.y1 <= o.y1 + pad
+        ):
+            return True
+    return False
+
+
+def merge_rects(rects, x_gap=12, y_gap=12):
+    if not rects:
+        return []
+
+    rects = [fitz.Rect(r) for r in rects]
+    merged = []
+
+    while rects:
+        current = rects.pop(0)
+        changed = True
+
+        while changed:
+            changed = False
+            remaining = []
+
+            for r in rects:
+                expanded = fitz.Rect(
+                    current.x0 - x_gap,
+                    current.y0 - y_gap,
+                    current.x1 + x_gap,
+                    current.y1 + y_gap,
+                )
+                if expanded.intersects(r):
+                    current |= r
+                    changed = True
+                else:
+                    remaining.append(r)
+
+            rects = remaining
+
+        merged.append(current)
+
+    return merged
+
+
+def render_clip(page, rect, dpi=170):
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
+    data = pix.tobytes("png")
+    img = Image.open(io.BytesIO(data))
+    return data, img.width, img.height
+
+
+def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    images: list[dict] = []
+    visuals: list[dict] = []
 
     for page_num, page in enumerate(doc, 1):
+        table_rects = []
+
+        # 1) Embedded raster images
         for idx, img_info in enumerate(page.get_images(full=True), 1):
             try:
                 extracted = doc.extract_image(img_info[0])
                 data = extracted["image"]
                 ext = extracted.get("ext", "png")
                 pil = Image.open(io.BytesIO(data))
-                useful, reason = looks_useful_image(pil)
+
+                useful, _reason = looks_useful_image(pil)
                 if not useful:
                     continue
 
-                images.append({
+                visuals.append({
                     "page": page_num,
                     "name": f"p{page_num}_img{idx}.{ext}",
+                    "kind": "embedded_image",
                     "data": data,
                     "width": pil.width,
                     "height": pil.height,
-                    "ext": ext,
-                    "filter_reason": reason,
                 })
             except Exception:
                 pass
 
+        # 2) Tables detected by PyMuPDF
+        try:
+            tf = page.find_tables()
+            for idx, table in enumerate(tf.tables, 1):
+                rect = fitz.Rect(table.bbox)
+                table_rects.append(rect)
+
+                if rect.width < 40 or rect.height < 40:
+                    continue
+
+                data, width, height = render_clip(page, rect, dpi=190)
+                visuals.append({
+                    "page": page_num,
+                    "name": f"p{page_num}_table{idx}.png",
+                    "kind": "table",
+                    "data": data,
+                    "width": width,
+                    "height": height,
+                    "bbox": [rect.x0, rect.y0, rect.x1, rect.y1],
+                })
+        except Exception:
+            pass
+
+        # 3) Vector drawing regions, answer boxes, grids, diagrams
+        try:
+            drawing_rects = []
+
+            for d in page.get_drawings():
+                rect = d.get("rect")
+                if not rect:
+                    continue
+
+                rect = fitz.Rect(rect)
+
+                if rect.width < 18 or rect.height < 18:
+                    continue
+
+                if rect_inside_any(rect, table_rects):
+                    continue
+
+                drawing_rects.append(rect)
+
+            merged = merge_rects(drawing_rects, x_gap=10, y_gap=10)
+
+            for idx, rect in enumerate(merged, 1):
+                if rect.width < 35 or rect.height < 35:
+                    continue
+
+                page_rect = page.rect
+                if rect.width > page_rect.width * 0.95 and rect.height > page_rect.height * 0.95:
+                    continue
+
+                data, width, height = render_clip(page, rect, dpi=190)
+
+                if width < 60 or height < 60:
+                    continue
+
+                aspect = width / max(height, 1)
+                if aspect > 10 or aspect < 0.08:
+                    continue
+
+                visuals.append({
+                    "page": page_num,
+                    "name": f"p{page_num}_vec{idx}.png",
+                    "kind": "vector_region",
+                    "data": data,
+                    "width": width,
+                    "height": height,
+                    "bbox": [rect.x0, rect.y0, rect.x1, rect.y1],
+                })
+        except Exception:
+            pass
+
     doc.close()
-    return images
+    return visuals
 
 
 # ── Parallel extraction ───────────────────────────────────────────────────
@@ -402,25 +535,28 @@ def extract_markscheme_parallel(client: OpenAI, pdf_bytes: bytes, chunk_pages: i
 def map_images_for_page(client: OpenAI, pdf_bytes: bytes, page_num: int, page_imgs: list[dict]) -> dict[str, dict]:
     page_image = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
     img_list = "\n".join(
-        f"- {img['name']} ({img['width']}x{img['height']})" for img in page_imgs
+        f"- {img['name']} ({img['width']}x{img['height']}, kind={img.get('kind', 'unknown')})"
+        for img in page_imgs
     )
 
     prompt = f"""This is page {page_num} of an exam paper.
 
-The following extracted images came from this page:
+The following extracted visuals came from this page:
 {img_list}
 
-For each image, identify the question number it belongs to by reading the visual layout of the page.
+Each visual may be a diagram, table, answer box, grid, or other question-specific layout element.
+
+For each visual, identify the question number it belongs to by reading the visual layout of the page.
 Use the nearest clearly associated question number.
 Ignore page logos, decorative images, and unrelated artwork.
 
 Return ONLY a JSON array like this:
 [
   {{
-    "imageName": "p{page_num}_img1.png",
+    "imageName": "p{page_num}_table1.png",
     "questionNumber": "3b",
     "confidence": "high",
-    "notes": "Image sits directly under question 3b"
+    "notes": "Table appears directly beside question 3b"
   }}
 ]
 
@@ -554,6 +690,22 @@ def ensure_table(token: str, base_id: str, table: str):
         st.warning(f"Table check skipped: {e}")
 
 
+def get_existing_airtable_fields(token: str, base_id: str, table: str) -> set[str]:
+    resp = requests.get(
+        f"{AT_META}/bases/{base_id}/tables",
+        headers=at_headers(token),
+        timeout=60,
+    )
+    resp.raise_for_status()
+
+    tables = resp.json().get("tables", [])
+    for t in tables:
+        if t["name"] == table:
+            return {f["name"] for f in t.get("fields", [])}
+
+    return set()
+
+
 def upload_to_imgbb(api_key: str, img: dict) -> str | None:
     b64 = base64.standard_b64encode(img["data"]).decode()
     resp = requests.post(
@@ -582,8 +734,8 @@ def create_airtable_records(token: str, base_id: str, table: str, records: list[
 
 # ── Caching ───────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def cached_extract_images(pdf_bytes: bytes) -> list[dict]:
-    return extract_images(pdf_bytes)
+def cached_extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
+    return extract_visual_regions(pdf_bytes)
 
 
 @st.cache_data(show_spinner=False)
@@ -607,7 +759,7 @@ def cached_map_images(pdf_bytes: bytes, openai_key: str, images: list[dict], rec
 # ── UI ────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Past Paper → Airtable (GPT)", page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable (GPT)")
-st.caption("Upload exam PDFs, extract questions with GPT, map images, review the output, then sync to Airtable.")
+st.caption("Upload exam PDFs, extract questions with GPT, map visuals, review the output, then sync to Airtable.")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN = get_secret("AIRTABLE_TOKEN")
@@ -665,9 +817,9 @@ if st.button("✨ Extract Questions", type="primary", disabled=extract_disabled)
     ms_bytes = ms_file.read() if ms_file else None
 
     with st.status("Extracting…", expanded=True) as status:
-        st.write("📎 Extracting useful embedded images…")
-        images = cached_extract_images(paper_bytes)
-        st.write(f"Found {len(images)} useful extracted images")
+        st.write("📎 Extracting useful visual regions…")
+        images = cached_extract_visual_regions(paper_bytes)
+        st.write(f"Found {len(images)} extracted visuals")
 
         st.write("🤖 Extracting questions in parallel…")
         questions, q_logs = cached_extract_questions_pdf(paper_bytes, OPENAI_KEY)
@@ -704,10 +856,10 @@ if st.button("✨ Extract Questions", type="primary", disabled=extract_disabled)
                 "images": [],
             })
 
-        st.write("🔍 Mapping images to questions in parallel…")
+        st.write("🔍 Mapping visuals to questions in parallel…")
         image_map = cached_map_images(paper_bytes, OPENAI_KEY, images, records) if images else {}
         mapped_count = sum(1 for v in image_map.values() if v.get("questionNumber") not in {"none", ""})
-        st.write(f"Mapped {mapped_count}/{len(images)} images to question numbers")
+        st.write(f"Mapped {mapped_count}/{len(images)} visuals to question numbers")
 
         q_to_images: dict[str, list[str]] = {}
         q_to_conf: dict[str, list[str]] = {}
@@ -746,7 +898,7 @@ if st.button("✨ Extract Questions", type="primary", disabled=extract_disabled)
 
 if "records" in st.session_state:
     st.subheader("3 · Review & edit")
-    st.caption("Edit anything before syncing. Image columns show linked image names and mapping confidence.")
+    st.caption("Edit anything before syncing. Visual columns show linked image names and mapping confidence.")
 
     records = st.session_state["records"]
     images = st.session_state.get("images", [])
@@ -788,11 +940,12 @@ if "records" in st.session_state:
             records[i]["images"] = [x.strip() for x in image_names_raw.split(",") if x.strip()]
 
     if images:
-        with st.expander(f"🖼 Useful extracted images ({len(images)})"):
+        with st.expander(f"🖼 Extracted visuals ({len(images)})"):
             cols = st.columns(4)
             for idx, img in enumerate(images):
                 with cols[idx % 4]:
-                    st.image(img["data"], caption=img["name"], use_container_width=True)
+                    caption = f"{img['name']} ({img.get('kind', 'image')})"
+                    st.image(img["data"], caption=caption, use_container_width=True)
 
     st.subheader("4 · Export / Sync")
     col_a, col_b = st.columns([1, 2])
@@ -826,7 +979,7 @@ if "records" in st.session_state:
                 image_name_to_url: dict[str, str] = {}
 
                 if _images and _imgbb:
-                    log("Uploading images to imgbb…")
+                    log("Uploading visuals to imgbb…")
 
                     def upload_one(img: dict):
                         return img["name"], upload_to_imgbb(_imgbb, img)
@@ -841,32 +994,35 @@ if "records" in st.session_state:
                             else:
                                 log(f"  ❌ {name} failed to upload")
                 elif _images and not _imgbb:
-                    log("⚠️ IMGBB_API_KEY missing, so no images can be attached.")
+                    log("⚠️ IMGBB_API_KEY missing, so no visuals can be attached.")
                 else:
-                    log("ℹ️ No useful images were extracted.")
+                    log("ℹ️ No useful visuals were extracted.")
+
+                existing_fields = get_existing_airtable_fields(AT_TOKEN, AT_BASE, AT_TABLE)
 
                 airtable_payload = []
                 for r in _records:
                     urls = [image_name_to_url[name] for name in r.get("images", []) if name in image_name_to_url]
 
-                    airtable_payload.append({
-                        "fields": {
-                            "Question Number": r.get("questionNumber", ""),
-                            "Question Text": r.get("questionText", ""),
-                            "Mark Allocation": clamp_int(r.get("markAllocation", 0), 0),
-                            "Topic": r.get("topic", ""),
-                            "Subtopic": r.get("subtopic", ""),
-                            "Mark Scheme Answer": r.get("markSchemeAnswer", ""),
-                            "Image Description": r.get("imageDescription", ""),
-                            "Has Images": bool(urls or r.get("hasImages", False)),
-                            "Images": [{"url": u} for u in urls],
-                            "Paper Name": r.get("paperName", paper_name),
-                            "Exam Type": r.get("examType", exam_type),
-                            "Page Number": clamp_int(r.get("pageNumber", 1), 1),
-                            "Image Mapping Confidence": r.get("imageMappingConfidence", ""),
-                            "Image Mapping Notes": r.get("imageMappingNotes", ""),
-                        }
-                    })
+                    fields = {
+                        "Question Number": r.get("questionNumber", ""),
+                        "Question Text": r.get("questionText", ""),
+                        "Mark Allocation": clamp_int(r.get("markAllocation", 0), 0),
+                        "Topic": r.get("topic", ""),
+                        "Subtopic": r.get("subtopic", ""),
+                        "Mark Scheme Answer": r.get("markSchemeAnswer", ""),
+                        "Image Description": r.get("imageDescription", ""),
+                        "Has Images": bool(urls or r.get("hasImages", False)),
+                        "Images": [{"url": u} for u in urls],
+                        "Paper Name": r.get("paperName", paper_name),
+                        "Exam Type": r.get("examType", exam_type),
+                        "Page Number": clamp_int(r.get("pageNumber", 1), 1),
+                        "Image Mapping Confidence": r.get("imageMappingConfidence", ""),
+                        "Image Mapping Notes": r.get("imageMappingNotes", ""),
+                    }
+
+                    fields = {k: v for k, v in fields.items() if k in existing_fields}
+                    airtable_payload.append({"fields": fields})
 
                 log("Creating Airtable records…")
                 created = create_airtable_records(AT_TOKEN, AT_BASE, AT_TABLE, airtable_payload)
@@ -878,3 +1034,25 @@ if "records" in st.session_state:
             except Exception as e:
                 log(f"❌ Sync failed: {e}")
                 st.text("\n".join(log_lines))
+
+st.markdown("""
+### Required secrets
+
+```toml
+OPENAI_API_KEY = "sk-..."
+AIRTABLE_TOKEN = "pat..."
+AIRTABLE_BASE_ID = "app..."
+IMGBB_API_KEY = "..."
+```
+
+### Suggested requirements.txt
+
+```txt
+streamlit
+openai>=1.0.0
+requests
+pymupdf
+pillow
+pandas
+```
+""")
