@@ -1,4 +1,108 @@
-"""
+# ── Extraction: GPT locates visuals, we crop from 300 DPI render ──────────
+def extract_page_visuals(client: OpenAI, pdf_bytes: bytes,
+                          page_num: int) -> list[dict]:
+    """
+    Render page at 300 DPI, ask GPT to locate all relevant visuals,
+    crop each one with 10% padding for quality.
+    """
+    # Render at 300 DPI for high-quality crops
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat  = fitz.Matrix(EXTRACT_DPI / 72, EXTRACT_DPI / 72)
+    pix  = doc[page_num - 1].get_pixmap(matrix=mat, alpha=False)
+    doc.close()
+
+    page_pil       = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    page_w, page_h = page_pil.size
+
+    # Send to GPT at VISION_DPI quality (compressed for API efficiency)
+    content = [
+        {"type": "input_text",
+         "text": GPT_EXTRACT_PROMPT.format(page_num=page_num)},
+        {"type": "input_image",
+         "image_url": f"data:image/jpeg;base64,{encode_pil(page_pil)}"},
+    ]
+    def _call():
+        return client.responses.create(
+            model=VISION_MODEL,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=2000,
+        )
+    raw  = openai_response_text(run_with_retry(_call))
+    rows = safe_json_loads(raw, [])
+
+    visuals: list[dict] = []
+    for idx, row in enumerate(rows, 1):
+        try:
+            x = float(row["x"]); y = float(row["y"])
+            w = float(row["w"]); h = float(row["h"])
+
+            # 10% padding on all sides for quality — compensates for GPT imprecision
+            pad_x = w * 0.10
+            pad_y = h * 0.10
+            x1 = max(0.0, x - pad_x);     y1 = max(0.0, y - pad_y)
+            x2 = min(1.0, x + w + pad_x); y2 = min(1.0, y + h + pad_y)
+
+            # Skip near-full-page boxes
+            if (x2 - x1) > 0.95 and (y2 - y1) > 0.90:
+                continue
+            # Skip tiny
+            if (x2 - x1) < 0.02 or (y2 - y1) < 0.02:
+                continue
+
+            # Crop from the 300 DPI render — high quality
+            crop = page_pil.crop((
+                int(x1 * page_w), int(y1 * page_h),
+                int(x2 * page_w), int(y2 * page_h),
+            ))
+            buf = io.BytesIO()
+            crop.save(buf, format="PNG")
+
+            qnum = normalise_qnum(row.get("questionNumber", "none"))
+            conf = str(row.get("confidence", "low") or "low").strip().lower()
+
+            visuals.append({
+                "page":           page_num,
+                "name":           f"p{page_num}_v{idx}.png",
+                "source":         "gpt",
+                "kind":           str(row.get("label", f"visual{idx}")),
+                "data":           buf.getvalue(),
+                "width":          crop.width,
+                "height":         crop.height,
+                "questionNumber": qnum or "none",
+                "confidence":     conf if conf in {"high", "medium", "low"} else "low",
+                "notes":          str(row.get("notes", "") or ""),
+            })
+        except Exception:
+            continue
+
+    return visuals
+
+@st.cache_data(show_spinner=False)
+def extract_and_judge_visuals(openai_key: str,
+                               pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
+    """
+    Ask GPT to locate and crop all visuals from every question page in parallel.
+    Returns (visuals, image_map).
+    """
+    client = OpenAI(api_key=openai_key)
+    doc    = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total  = len(doc)
+    doc.close()
+
+    question_pages = [p for p in range(1, total + 1)
+                      if is_question_page(pdf_bytes, p)]
+
+    results: dict[int, list] = {}
+
+    def process(page_num: int):
+        try:
+            return page_num, extract_page_visuals(client, pdf_bytes, page_num)
+        except Exception:
+            return page_num, []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for pn, visuals in [f.result() for f in
+                             as_completed([ex.sub"""
 app_v2.py  –  Past Paper → Airtable  (OpenAI, Streamlit Cloud)
 ==============================================================
 Architecture:
@@ -45,7 +149,7 @@ IMAGE_MAX_SIZE    = (1200, 1200)
 JPEG_QUALITY      = 70
 RENDER_DPI        = 150
 VISION_DPI        = 170
-EXTRACT_DPI       = 190
+EXTRACT_DPI       = 300   # high DPI for crop quality
 
 AT_API    = "https://api.airtable.com/v0"
 AT_META   = "https://api.airtable.com/v0/meta"
@@ -109,34 +213,36 @@ Each element must be:
 }
 """
 
-GPT_JUDGE_PROMPT = """You are reviewing extracted visual crops from page {page_num} of an exam paper.
+GPT_EXTRACT_PROMPT = """This is page {page_num} of an exam paper, rendered at high resolution.
 
-For each crop, decide:
-1. Is it relevant? A relevant visual is something a student NEEDS to answer a question:
-   diagrams, graphs, grids, tables, formula boxes, info boxes, number lines, geometric shapes.
-   NOT relevant: blank answer lines, empty boxes, page borders, barcodes, headers/footers,
-   "do not write" boxes, page number boxes.
-
-2. If relevant, which question number does it belong to?
-   - Read the full page image carefully to find which question the visual is associated with.
-   - A visual that appears ABOVE a question still belongs to that question if it is referenced by it.
-   - A data table at the top of a page belongs to the first question below it that uses that data.
-   - If two visuals are clearly for the same question, assign both to that question number.
-   - Only use questionNumber = "none" if you genuinely cannot determine the question.
+Find every visual element a student needs to answer a question on this page.
+Include: diagrams, graphs, grids, tables, formula boxes, info boxes, number lines,
+geometric shapes, coordinate axes, charts, completion tables.
+Exclude: blank answer lines, empty answer boxes, page borders, barcodes,
+headers, footers, page numbers, "do not write outside the box" text.
 
 Return ONLY a raw JSON array. No markdown. No explanation.
 Each element:
 {{
-  "cropName": "p{page_num}_crop1.png",
-  "relevant": true,
-  "questionNumber": "7a",
+  "label": "multiplication table",
+  "questionNumber": "14",
   "confidence": "high",
-  "label": "pizza toppings completion table",
-  "notes": "Table with SM entry beside Q7a"
+  "notes": "Table of products for 61,63,65,67 — used by Q14a, 14b, 14c",
+  "x": 0.12,
+  "y": 0.05,
+  "w": 0.76,
+  "h": 0.38
 }}
 
-confidence: high, medium, or low
-If not relevant, still include the entry with relevant = false and questionNumber = "none"
+x, y = top-left corner as fraction of page width/height (0.0–1.0)
+w, h = width/height as fraction of page dimensions
+
+Rules:
+- Be generous — slightly oversized is always better than clipping
+- A table ABOVE a question still belongs to that question if the question references it
+- Side-by-side boxes each get their own entry (do not combine them)
+- If no relevant visuals exist on this page return []
+- Only use questionNumber = "none" if genuinely unsure
 """
 
 FIND_MISSING_PROMPT = """This is page {page_num} of an exam paper.
