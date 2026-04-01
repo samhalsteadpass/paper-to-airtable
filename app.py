@@ -156,7 +156,7 @@ Be generous with the bounding box — slightly oversized is better than clipping
 "additional page, if required",
 "there are no questions printed",
 "copyright information",
-]
+
 
 # ── Secrets ───────────────────────────────────────────────────────────────
 def get_secret(key: str, fallback: str = "") -> str:
