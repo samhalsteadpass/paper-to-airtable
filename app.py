@@ -46,7 +46,29 @@ VEC_MIN_DIM         = 35        # px — ignore tiny rects
 VEC_MERGE_X_GAP     = 8        # reduced: prevents merging across columns
 VEC_MERGE_Y_GAP     = 4        # reduced: prevents answer lines merging vertically
 VEC_MAX_PAGE_FRAC   = 0.90     # skip if wider AND taller than this fraction of page
-VEC_MIN_CONTENT_PCT = 4.0      # % non-white pixels required — skips blank line regions
+VEC_MIN_CONTENT_PCT = 1.5      # lowered: catches formula boxes, number lines, light diagrams
+
+# Pages to skip — cover, blank, and additional answer pages
+SKIP_PAGE_KEYWORDS = [
+    "do not write on this page",
+    "additional page, if required",
+    "there are no questions printed",
+    "copyright information",
+]
+
+def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
+    """Return False for cover page, blank pages, and trailing answer/copyright pages."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = doc[page_num - 1].get_text().lower()
+    doc.close()
+    # Skip if page contains no question-like content
+    for kw in SKIP_PAGE_KEYWORDS:
+        if kw in text:
+            return False
+    # Skip page 1 (cover page — never has questions)
+    if page_num == 1:
+        return False
+    return True
 
 AT_API  = "https://api.airtable.com/v0"
 AT_META = "https://api.airtable.com/v0/meta"
@@ -290,6 +312,10 @@ def extract_visual_regions(pdf_bytes: bytes) -> list[dict]:
                 bi  = doc.extract_image(img_info[0])
                 pil = Image.open(io.BytesIO(bi["image"]))
                 if not looks_useful_pil(pil):
+                    continue
+                # Skip barcodes (very wide and short)
+                asp = pil.width / max(pil.height, 1)
+                if asp > 4:
                     continue
                 visuals.append({
                     "page":   page_num,
