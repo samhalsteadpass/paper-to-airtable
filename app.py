@@ -242,22 +242,100 @@ def extract_images(pdf_bytes: bytes) -> list[dict]:
     return images
 
 # ── Extraction with parallel processing ───────────────────────────────────
-def ask_gpt_for_questions(client: OpenAI, image_b64_list: list[str], prompt: str) -> str:
-    content: list[dict] = []
-    for img_b64 in image_b64_list:
-        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{base64_img}"})
-    content.append({"type": "input_text", "text": prompt})
-    resp = create_openai_response(client, TEXT_MODEL, content)
-    return openai_response_text(resp)
+from io import BytesIO
+import base64
+
+MAX_IMAGES_PER_REQUEST = 2
+IMAGE_MAX_SIZE = (1200, 1200)
+JPEG_QUALITY = 70
+
+def encode_image(img_pil):
+    """
+    Resize + compress image before sending to GPT
+    """
+    img_pil = img_pil.copy()
+    img_pil.thumbnail(IMAGE_MAX_SIZE)
+
+    buffer = BytesIO()
+    img_pil.save(buffer, format="JPEG", quality=JPEG_QUALITY)
+    return base64.b64encode(buffer.getvalue()).decode()
+from io import BytesIO
+import base64
+
+MAX_IMAGES_PER_REQUEST = 2
+IMAGE_MAX_SIZE = (1200, 1200)
+JPEG_QUALITY = 70
 
 
-def ask_gpt_for_markscheme(client: OpenAI, image_b64_list: list[str], prompt: str) -> str:
-    content: list[dict] = []
-    for img_b64 in image_b64_list:
-        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{base64_img}"})
-    content.append({"type": "input_text", "text": prompt})
-    resp = create_openai_response(client, TEXT_MODEL, content)
-    return openai_response_text(resp)
+def encode_image(img_pil):
+    img_pil = img_pil.copy()
+    img_pil.thumbnail(IMAGE_MAX_SIZE)
+
+    buffer = BytesIO()
+    img_pil.save(buffer, format="JPEG", quality=JPEG_QUALITY)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def call_gpt_vision(
+    client,
+    images,
+    prompt,
+    model="gpt-4.1-mini",
+    max_images=MAX_IMAGES_PER_REQUEST,
+    debug_label="GPT"
+):
+    """
+    Unified GPT vision caller (safe + reusable)
+    """
+
+    images = images[:max_images]
+
+    content = [{"type": "input_text", "text": prompt}]
+    total_size = 0
+
+    for img in images:
+        base64_img = encode_image(img)
+        total_size += len(base64_img)
+
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:image/jpeg;base64,{base64_img}"
+        })
+
+    print(f"[{debug_label}] {len(images)} images | ~{round(total_size/1e6,2)} MB")
+
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[{
+                "role": "user",
+                "content": content
+            }]
+        )
+
+        return response.output_text
+
+    except Exception as e:
+        print(f"[{debug_label} ERROR] {e}")
+        return ""
+
+def ask_gpt_for_questions(client, images, prompt):
+    return call_gpt_vision(
+        client,
+        images,
+        prompt,
+        model="gpt-4.1-mini",
+        debug_label="QUESTIONS"
+    )
+
+def ask_gpt_for_markscheme(client, images, prompt):
+    return call_gpt_vision(
+        client,
+        images,
+        prompt,
+        model="gpt-4.1-mini",
+        debug_label="MARKSCHEME"
+    )
 
 
 def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes, chunk_pages: int) -> tuple[list[dict], list[str]]:
