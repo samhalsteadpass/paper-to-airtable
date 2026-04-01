@@ -96,14 +96,20 @@ Each element must be:
 
 VISUAL_DETECT_PROMPT = """This is page {page_num} of an exam paper.
 
-Identify every visual element that a student needs to answer a question.
-Include: diagrams, graphs, grids, tables, formula boxes, number lines, geometric shapes, charts.
-Exclude: answer lines, page borders, headers, footers, barcodes, page numbers, "do not write" text.
+Do two things at once:
+1. Identify every visual element a student needs to answer a question.
+   Include: diagrams, graphs, grids, tables, formula boxes, number lines, geometric shapes, charts.
+   Exclude: answer lines, page borders, headers, footers, barcodes, page numbers, "do not write" text.
+
+2. For each visual, identify which question number it belongs to by reading the page layout.
 
 Return ONLY a raw JSON array. No markdown. No explanation.
 Each element:
 {{
   "label": "centimetre grid",
+  "questionNumber": "3a",
+  "confidence": "high",
+  "notes": "Grid appears directly under Q3a",
   "x": 0.25,
   "y": 0.10,
   "w": 0.30,
@@ -112,6 +118,8 @@ Each element:
 
 x, y = top-left corner as fraction of page width/height (0.0 to 1.0)
 w, h = width and height as fraction of page width/height
+confidence: high, medium, or low
+If no question can be assigned use questionNumber = "none"
 If there are no relevant visuals on this page return an empty array: []
 """
 
@@ -601,9 +609,12 @@ if st.button("✨ Extract Questions", type="primary",
 
     with st.status("Extracting…", expanded=True) as status:
         st.write("📎 Extracting visuals with GPT-4V…")
-        images = extract_visual_regions(OPENAI_KEY, paper_bytes)
+        images, image_map = extract_visual_regions(OPENAI_KEY, paper_bytes)
+        mapped = sum(1 for v in image_map.values()
+                     if v.get("questionNumber") not in {"none", ""})
         st.write(f"   Found {len(images)} visuals across "
-                 f"{len(set(i['page'] for i in images))} pages")
+                 f"{len(set(i['page'] for i in images))} pages "
+                 f"({mapped} mapped to questions)")
 
         st.write("🤖 Extracting questions (parallel)…")
         questions, q_logs = extract_questions_parallel(client, paper_bytes)
@@ -638,11 +649,26 @@ if st.button("✨ Extract Questions", type="primary",
             })
 
         if images:
-            st.write("🔍 Mapping visuals to questions (parallel)…")
-            image_map = map_images_to_questions(paper_bytes, OPENAI_KEY, images, records)
-            mapped    = sum(1 for v in image_map.values()
-                           if v.get("questionNumber") not in {"none", ""})
-            st.write(f"   Mapped {mapped}/{len(images)} visuals")
+            # Apply fallback mapping for any visuals GPT didn't assign
+            pq_index: dict[int, list[str]] = {}
+            for r in records:
+                page = clamp_int(r.get("pageNumber", 0))
+                qn   = normalise_qnum(r.get("questionNumber", ""))
+                if page and qn:
+                    pq_index.setdefault(page, [])
+                    if qn not in pq_index[page]:
+                        pq_index[page].append(qn)
+
+            for img in images:
+                name = img["name"]
+                if name not in image_map or image_map[name].get("questionNumber") in {"", "none"}:
+                    qs = pq_index.get(img["page"], [])
+                    image_map[name] = {
+                        "questionNumber": qs[-1] if qs else "none",
+                        "confidence":     "low",
+                        "notes":          "Fallback: last question on page",
+                        "source":         "fallback",
+                    }
 
             q_to_imgs  : dict[str, list[str]] = {}
             q_to_conf  : dict[str, list[str]] = {}
