@@ -1,10 +1,11 @@
+
 import io
 import json
 import re
 import base64
 import time
-from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 import fitz
 import pandas as pd
@@ -14,16 +15,21 @@ from PIL import Image
 from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────
-TEXT_MODEL = "gpt-4.1"
+TEXT_MODEL = "gpt-4.1-mini"
 VISION_MODEL = "gpt-4.1"
 MAX_OUTPUT_TOKENS = 8000
-CHUNK_PAGES = 6
-MAX_WORKERS = 4
+CHUNK_PAGES = 2
+MAX_WORKERS = 3
 MAX_RETRIES = 4
 BASE_BACKOFF = 2
-REQUEST_TIMEOUT = 120
+
+MAX_IMAGES_PER_REQUEST = 2
+IMAGE_MAX_SIZE = (1200, 1200)
+JPEG_QUALITY = 70
+
 RENDER_DPI = 150
 VISION_DPI = 170
+
 AT_API = "https://api.airtable.com/v0"
 AT_META = "https://api.airtable.com/v0/meta"
 IMGBB_API = "https://api.imgbb.com/1/upload"
@@ -65,7 +71,7 @@ Rules:
 - Keep shared context attached to each relevant child question.
 - markAllocation must be an integer. Use 0 if missing.
 - Preserve question wording as closely as possible.
-- pageNumber must be the page on which the question appears within the chunk you were shown.
+- pageNumber must be the page number within only the chunk you were shown.
 """
 
 MS_PROMPT = """Extract ALL answers from this mark scheme.
@@ -78,6 +84,7 @@ Each element must be:
 }
 """
 
+
 # ── Secrets ───────────────────────────────────────────────────────────────
 def get_secret(key: str, fallback: str = "") -> str:
     try:
@@ -85,9 +92,10 @@ def get_secret(key: str, fallback: str = "") -> str:
     except Exception:
         return fallback
 
+
 # ── Generic helpers ───────────────────────────────────────────────────────
 def clean_json(raw: str) -> str:
-    raw = raw.strip()
+    raw = (raw or "").strip()
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"^```\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
@@ -101,7 +109,7 @@ def safe_json_loads(raw: str, default: Any):
         return default
 
 
-def normalise_question_number(value: str) -> str:
+def normalise_question_number(value: Any) -> str:
     value = str(value or "").strip()
     value = value.replace(" ", "")
     value = value.replace("(", "").replace(")", "")
@@ -134,11 +142,12 @@ def run_with_retry(fn, *args, **kwargs):
             time.sleep(BASE_BACKOFF * attempt)
     raise last_error
 
-# ── OpenAI helpers ────────────────────────────────────────────────────────
+
 def openai_response_text(resp) -> str:
     text = getattr(resp, "output_text", None)
     if text:
         return text
+
     parts: list[str] = []
     for item in getattr(resp, "output", []) or []:
         for content in getattr(item, "content", []) or []:
@@ -148,15 +157,70 @@ def openai_response_text(resp) -> str:
     return "\n".join(parts)
 
 
-def create_openai_response(client: OpenAI, model: str, content: list[dict], max_output_tokens: int = MAX_OUTPUT_TOKENS):
+# ── OpenAI helpers ────────────────────────────────────────────────────────
+def encode_image(img_pil: Image.Image) -> str:
+    img_pil = img_pil.copy().convert("RGB")
+    img_pil.thumbnail(IMAGE_MAX_SIZE)
+
+    buffer = io.BytesIO()
+    img_pil.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def call_gpt_vision(
+    client: OpenAI,
+    images: list[Image.Image],
+    prompt: str,
+    model: str,
+    max_images: int = MAX_IMAGES_PER_REQUEST,
+    max_output_tokens: int = MAX_OUTPUT_TOKENS,
+    debug_label: str = "GPT",
+) -> str:
+    images = images[:max_images]
+
+    content: list[dict] = [{"type": "input_text", "text": prompt}]
+    total_size = 0
+
+    for img in images:
+        base64_img = encode_image(img)
+        total_size += len(base64_img)
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:image/jpeg;base64,{base64_img}",
+        })
+
+    print(f"[{debug_label}] sending {len(images)} images | ~{round(total_size / 1_000_000, 2)} MB")
+
     def _call():
         return client.responses.create(
             model=model,
             input=[{"role": "user", "content": content}],
             max_output_tokens=max_output_tokens,
-            timeout=REQUEST_TIMEOUT,
         )
-    return run_with_retry(_call)
+
+    resp = run_with_retry(_call)
+    return openai_response_text(resp)
+
+
+def ask_gpt_for_questions(client: OpenAI, images: list[Image.Image], prompt: str) -> str:
+    return call_gpt_vision(
+        client,
+        images,
+        prompt,
+        model=TEXT_MODEL,
+        debug_label="QUESTIONS",
+    )
+
+
+def ask_gpt_for_markscheme(client: OpenAI, images: list[Image.Image], prompt: str) -> str:
+    return call_gpt_vision(
+        client,
+        images,
+        prompt,
+        model=TEXT_MODEL,
+        debug_label="MARKSCHEME",
+    )
+
 
 # ── PDF / image helpers ───────────────────────────────────────────────────
 def render_page_as_png(pdf_bytes: bytes, page_num: int, dpi: int = RENDER_DPI) -> bytes:
@@ -167,9 +231,15 @@ def render_page_as_png(pdf_bytes: bytes, page_num: int, dpi: int = RENDER_DPI) -
     return pix.tobytes("png")
 
 
+def render_page_as_pil(pdf_bytes: bytes, page_num: int, dpi: int = RENDER_DPI) -> Image.Image:
+    png_bytes = render_page_as_png(pdf_bytes, page_num, dpi=dpi)
+    return Image.open(io.BytesIO(png_bytes)).convert("RGB")
+
+
 def split_pdf(pdf_bytes: bytes, chunk_size: int) -> list[bytes]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     chunks: list[bytes] = []
+
     for start in range(0, len(doc), chunk_size):
         writer = fitz.open()
         writer.insert_pdf(doc, from_page=start, to_page=min(start + chunk_size, len(doc)) - 1)
@@ -177,28 +247,36 @@ def split_pdf(pdf_bytes: bytes, chunk_size: int) -> list[bytes]:
         writer.save(buf)
         writer.close()
         chunks.append(buf.getvalue())
+
     doc.close()
     return chunks
 
 
-def pdf_chunk_to_base64_images(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> list[str]:
+def pdf_chunk_to_pil_images(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> list[Image.Image]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    out: list[str] = []
+    out: list[Image.Image] = []
     mat = fitz.Matrix(dpi / 72, dpi / 72)
+
     for page in doc:
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        out.append(base64.standard_b64encode(pix.tobytes("png")).decode())
+        img_bytes = pix.tobytes("png")
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        out.append(pil_img)
+
     doc.close()
     return out
 
 
 def looks_useful_image(img: Image.Image) -> tuple[bool, str]:
     width, height = img.width, img.height
+
     if width < 80 or height < 80:
         return False, "too small"
+
     aspect = width / max(height, 1)
     if aspect > 7 or aspect < 0.14:
         return False, "extreme aspect ratio"
+
     area = width * height
     if area < 12000:
         return False, "area too small"
@@ -217,6 +295,7 @@ def looks_useful_image(img: Image.Image) -> tuple[bool, str]:
 def extract_images(pdf_bytes: bytes) -> list[dict]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     images: list[dict] = []
+
     for page_num, page in enumerate(doc, 1):
         for idx, img_info in enumerate(page.get_images(full=True), 1):
             try:
@@ -227,6 +306,7 @@ def extract_images(pdf_bytes: bytes) -> list[dict]:
                 useful, reason = looks_useful_image(pil)
                 if not useful:
                     continue
+
                 images.append({
                     "page": page_num,
                     "name": f"p{page_num}_img{idx}.{ext}",
@@ -238,116 +318,22 @@ def extract_images(pdf_bytes: bytes) -> list[dict]:
                 })
             except Exception:
                 pass
+
     doc.close()
     return images
 
-# ── Extraction with parallel processing ───────────────────────────────────
-from io import BytesIO
-import base64
 
-MAX_IMAGES_PER_REQUEST = 2
-IMAGE_MAX_SIZE = (1200, 1200)
-JPEG_QUALITY = 70
-
-def encode_image(img_pil):
-    """
-    Resize + compress image before sending to GPT
-    """
-    img_pil = img_pil.copy()
-    img_pil.thumbnail(IMAGE_MAX_SIZE)
-
-    buffer = BytesIO()
-    img_pil.save(buffer, format="JPEG", quality=JPEG_QUALITY)
-    return base64.b64encode(buffer.getvalue()).decode()
-from io import BytesIO
-import base64
-
-MAX_IMAGES_PER_REQUEST = 2
-IMAGE_MAX_SIZE = (1200, 1200)
-JPEG_QUALITY = 70
-
-
-def encode_image(img_pil):
-    img_pil = img_pil.copy()
-    img_pil.thumbnail(IMAGE_MAX_SIZE)
-
-    buffer = BytesIO()
-    img_pil.save(buffer, format="JPEG", quality=JPEG_QUALITY)
-    return base64.b64encode(buffer.getvalue()).decode()
-
-
-def call_gpt_vision(
-    client,
-    images,
-    prompt,
-    model="gpt-4.1-mini",
-    max_images=MAX_IMAGES_PER_REQUEST,
-    debug_label="GPT"
-):
-    """
-    Unified GPT vision caller (safe + reusable)
-    """
-
-    images = images[:max_images]
-
-    content = [{"type": "input_text", "text": prompt}]
-    total_size = 0
-
-    for img in images:
-        base64_img = encode_image(img)
-        total_size += len(base64_img)
-
-        content.append({
-            "type": "input_image",
-            "image_url": f"data:image/jpeg;base64,{base64_img}"
-        })
-
-    print(f"[{debug_label}] {len(images)} images | ~{round(total_size/1e6,2)} MB")
-
-    try:
-        response = client.responses.create(
-            model=model,
-            input=[{
-                "role": "user",
-                "content": content
-            }]
-        )
-
-        return response.output_text
-
-    except Exception as e:
-        print(f"[{debug_label} ERROR] {e}")
-        return ""
-
-def ask_gpt_for_questions(client, images, prompt):
-    return call_gpt_vision(
-        client,
-        images,
-        prompt,
-        model="gpt-4.1-mini",
-        debug_label="QUESTIONS"
-    )
-
-def ask_gpt_for_markscheme(client, images, prompt):
-    return call_gpt_vision(
-        client,
-        images,
-        prompt,
-        model="gpt-4.1-mini",
-        debug_label="MARKSCHEME"
-    )
-
-
+# ── Parallel extraction ───────────────────────────────────────────────────
 def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes, chunk_pages: int) -> tuple[list[dict], list[str]]:
     pdf_chunks = split_pdf(pdf_bytes, chunk_pages)
     raw_logs: list[str] = []
-    collected: list[dict] = []
 
     def process_one(index: int, chunk_bytes: bytes):
         page_offset = index * chunk_pages
-        chunk_images = pdf_chunk_to_base64_images(chunk_bytes)
+        chunk_images = pdf_chunk_to_pil_images(chunk_bytes)
         raw = ask_gpt_for_questions(client, chunk_images, QUESTION_PROMPT)
         rows = safe_json_loads(raw, [])
+
         fixed: list[dict] = []
         for row in rows:
             page_num = clamp_int(row.get("pageNumber", 1), 1) + page_offset
@@ -361,17 +347,18 @@ def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes, chunk_pages: in
                 "imageDescription": str(row.get("imageDescription", "") or ""),
                 "pageNumber": page_num,
             })
-        return fixed, f"Chunk {index + 1}/{len(pdf_chunks)} complete, {len(fixed)} questions"
 
+        return index, fixed, f"Chunk {index + 1}/{len(pdf_chunks)} complete, {len(fixed)} questions"
+
+    ordered: dict[int, list[dict]] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_one, i, chunk): i for i, chunk in enumerate(pdf_chunks)}
-        ordered: dict[int, list[dict]] = {}
+        futures = [executor.submit(process_one, i, chunk) for i, chunk in enumerate(pdf_chunks)]
         for future in as_completed(futures):
-            i = futures[future]
-            rows, message = future.result()
+            i, rows, message = future.result()
             ordered[i] = rows
             raw_logs.append(message)
 
+    collected: list[dict] = []
     for i in range(len(pdf_chunks)):
         collected.extend(ordered.get(i, []))
 
@@ -380,39 +367,40 @@ def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes, chunk_pages: in
 
 def extract_markscheme_parallel(client: OpenAI, pdf_bytes: bytes, chunk_pages: int) -> tuple[dict[str, str], list[str]]:
     pdf_chunks = split_pdf(pdf_bytes, chunk_pages)
-    ms_map: dict[str, str] = {}
     raw_logs: list[str] = []
 
     def process_one(index: int, chunk_bytes: bytes):
-        chunk_images = pdf_chunk_to_base64_images(chunk_bytes)
+        chunk_images = pdf_chunk_to_pil_images(chunk_bytes)
         raw = ask_gpt_for_markscheme(client, chunk_images, MS_PROMPT)
         rows = safe_json_loads(raw, [])
+
         local: dict[str, str] = {}
         for row in rows:
             qn = normalise_question_number(row.get("questionNumber", ""))
             ans = str(row.get("markSchemeAnswer", "") or "")
             if qn and ans:
                 local[qn] = ans
-        return local, f"Mark scheme chunk {index + 1}/{len(pdf_chunks)} complete, {len(local)} entries"
 
+        return index, local, f"Mark scheme chunk {index + 1}/{len(pdf_chunks)} complete, {len(local)} entries"
+
+    ordered: dict[int, dict[str, str]] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_one, i, chunk): i for i, chunk in enumerate(pdf_chunks)}
-        ordered: dict[int, dict[str, str]] = {}
+        futures = [executor.submit(process_one, i, chunk) for i, chunk in enumerate(pdf_chunks)]
         for future in as_completed(futures):
-            i = futures[future]
-            local, message = future.result()
+            i, local, message = future.result()
             ordered[i] = local
             raw_logs.append(message)
 
+    ms_map: dict[str, str] = {}
     for i in range(len(pdf_chunks)):
         ms_map.update(ordered.get(i, {}))
 
     return ms_map, raw_logs
 
+
 # ── Image mapping with confidence + fallback ──────────────────────────────
 def map_images_for_page(client: OpenAI, pdf_bytes: bytes, page_num: int, page_imgs: list[dict]) -> dict[str, dict]:
-    png_bytes = render_page_as_png(pdf_bytes, page_num, dpi=VISION_DPI)
-    png_b64 = base64.standard_b64encode(png_bytes).decode()
+    page_image = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
     img_list = "\n".join(
         f"- {img['name']} ({img['width']}x{img['height']})" for img in page_imgs
     )
@@ -440,19 +428,25 @@ Use confidence values: high, medium, low.
 If no question can be assigned, use questionNumber = "none".
 """
 
-    content = [
-        {"type": "input_image", "image_base64": png_b64},
-        {"type": "input_text", "text": prompt},
-    ]
-    resp = create_openai_response(client, VISION_MODEL, content, max_output_tokens=2500)
-    rows = safe_json_loads(openai_response_text(resp), [])
+    raw = call_gpt_vision(
+        client,
+        [page_image],
+        prompt,
+        model=VISION_MODEL,
+        max_images=1,
+        max_output_tokens=2500,
+        debug_label=f"MAPPING p{page_num}",
+    )
 
+    rows = safe_json_loads(raw, [])
     result: dict[str, dict] = {}
+
     for row in rows:
         name = str(row.get("imageName", "") or "").strip()
         qnum = normalise_question_number(row.get("questionNumber", "none"))
         conf = str(row.get("confidence", "low") or "low").strip().lower()
         notes = str(row.get("notes", "") or "").strip()
+
         if name:
             result[name] = {
                 "questionNumber": qnum if qnum else "none",
@@ -460,22 +454,26 @@ If no question can be assigned, use questionNumber = "none".
                 "notes": notes,
                 "source": "vision",
             }
+
     return result
 
 
 def build_page_question_index(records: list[dict]) -> dict[int, list[str]]:
     index: dict[int, list[str]] = {}
+
     for r in records:
         page = clamp_int(r.get("pageNumber", 0), 0)
         qn = normalise_question_number(r.get("questionNumber", ""))
         if page and qn:
             index.setdefault(page, []).append(qn)
-    for page in index:
+
+    for page, qns in index.items():
         seen = []
-        for qn in index[page]:
+        for qn in qns:
             if qn not in seen:
                 seen.append(qn)
         index[page] = seen
+
     return index
 
 
@@ -484,14 +482,17 @@ def fallback_map_images(images: list[dict], page_question_index: dict[int, list[
         name = img["name"]
         if name in existing_map and existing_map[name].get("questionNumber") not in {"", "none"}:
             continue
+
         page_questions = page_question_index.get(img["page"], [])
         qnum = page_questions[-1] if page_questions else "none"
+
         existing_map[name] = {
             "questionNumber": qnum,
-            "confidence": "low" if qnum != "none" else "low",
+            "confidence": "low",
             "notes": "Fallback mapping based on page-level question list",
             "source": "fallback",
         }
+
     return existing_map
 
 
@@ -501,19 +502,18 @@ def map_images_to_questions_parallel(client: OpenAI, pdf_bytes: bytes, images: l
         page_groups.setdefault(img["page"], []).append(img)
 
     mapping: dict[str, dict] = {}
-    if page_groups:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(map_images_for_page, client, pdf_bytes, page_num, page_imgs): page_num
-                for page_num, page_imgs in page_groups.items()
-            }
-            for future in as_completed(futures):
-                local_map = future.result()
-                mapping.update(local_map)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(map_images_for_page, client, pdf_bytes, page_num, page_imgs)
+            for page_num, page_imgs in page_groups.items()
+        ]
+        for future in as_completed(futures):
+            mapping.update(future.result())
 
     page_question_index = build_page_question_index(records)
-    mapping = fallback_map_images(images, page_question_index, mapping)
-    return mapping
+    return fallback_map_images(images, page_question_index, mapping)
+
 
 # ── Airtable helpers ──────────────────────────────────────────────────────
 def at_headers(token: str):
@@ -522,11 +522,12 @@ def at_headers(token: str):
 
 def ensure_table(token: str, base_id: str, table: str):
     try:
-        r = requests.get(f"{AT_META}/bases/{base_id}/tables", headers=at_headers(token), timeout=REQUEST_TIMEOUT)
+        r = requests.get(f"{AT_META}/bases/{base_id}/tables", headers=at_headers(token), timeout=60)
         if r.status_code == 401:
             st.info("Skipping auto table creation because this token does not have schema.bases:write.")
             return
         r.raise_for_status()
+
         if table in [t["name"] for t in r.json().get("tables", [])]:
             return
 
@@ -545,7 +546,7 @@ def ensure_table(token: str, base_id: str, table: str):
             f"{AT_META}/bases/{base_id}/tables",
             headers=at_headers(token),
             json={"name": table, "fields": fields},
-            timeout=REQUEST_TIMEOUT,
+            timeout=60,
         )
         if not r2.ok:
             st.warning(f"Could not auto-create table ({r2.status_code}). Create it manually.")
@@ -558,36 +559,28 @@ def upload_to_imgbb(api_key: str, img: dict) -> str | None:
     resp = requests.post(
         IMGBB_API,
         data={"key": api_key, "name": img["name"], "image": b64},
-        timeout=REQUEST_TIMEOUT,
+        timeout=60,
     )
     if resp.ok:
         return resp.json()["data"]["url"]
     return None
 
 
-def patch_record_images(token: str, base_id: str, table: str, record_id: str, fields: dict):
-    resp = requests.patch(
-        f"{AT_API}/{base_id}/{requests.utils.quote(table)}/{record_id}",
-        headers=at_headers(token),
-        json={"fields": fields},
-        timeout=REQUEST_TIMEOUT,
-    )
-    if not resp.ok:
-        raise RuntimeError(f"{resp.status_code} — {resp.text[:300]}")
-
-
 def create_airtable_records(token: str, base_id: str, table: str, records: list[dict]) -> list[dict]:
     ensure_table(token, base_id, table)
-    url = f"{AT_API}/{base_id}/{requests.utils.quote(table)}"
+    url = f"{AT_API}/{base_id}/{requests.utils.quote(table, safe='')}"
     created: list[dict] = []
+
     for batch in chunk_list(records, 10):
-        resp = requests.post(url, headers=at_headers(token), json={"records": batch}, timeout=REQUEST_TIMEOUT)
+        resp = requests.post(url, headers=at_headers(token), json={"records": batch}, timeout=60)
         if not resp.ok:
             raise RuntimeError(f"Airtable {resp.status_code}: {resp.text[:500]}")
         created.extend(resp.json().get("records", []))
+
     return created
 
-# ── Caching ────────────────────────────────────────────────────────────────
+
+# ── Caching ───────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def cached_extract_images(pdf_bytes: bytes) -> list[dict]:
     return extract_images(pdf_bytes)
@@ -610,7 +603,8 @@ def cached_map_images(pdf_bytes: bytes, openai_key: str, images: list[dict], rec
     client = OpenAI(api_key=openai_key)
     return map_images_to_questions_parallel(client, pdf_bytes, images, records)
 
-# ── UI ───────────────────────────────────────────────────────────────────
+
+# ── UI ────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Past Paper → Airtable (GPT)", page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable (GPT)")
 st.caption("Upload exam PDFs, extract questions with GPT, map images, review the output, then sync to Airtable.")
@@ -622,6 +616,7 @@ IMGBB_KEY = get_secret("IMGBB_API_KEY")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
+
     if not OPENAI_KEY:
         OPENAI_KEY = st.text_input("OpenAI API key", type="password", placeholder="sk-...")
     else:
@@ -650,10 +645,12 @@ with st.sidebar:
 
 st.subheader("1 · Upload PDFs")
 col1, col2 = st.columns(2)
+
 with col1:
     paper_name = st.text_input("Paper name", placeholder="AQA Biology P1 2023")
     exam_type = st.text_input("Exam type", placeholder="GCSE / A-Level / IGCSE / IB HL")
     paper_file = st.file_uploader("Past paper PDF *", type="pdf")
+
 with col2:
     st.markdown("&nbsp;", unsafe_allow_html=True)
     st.markdown("&nbsp;", unsafe_allow_html=True)
@@ -662,6 +659,7 @@ with col2:
 
 st.subheader("2 · Extract with GPT")
 extract_disabled = not (paper_file and paper_name and exam_type and OPENAI_KEY)
+
 if st.button("✨ Extract Questions", type="primary", disabled=extract_disabled):
     paper_bytes = paper_file.read()
     ms_bytes = ms_file.read() if ms_file else None
@@ -688,6 +686,7 @@ if st.button("✨ Extract Questions", type="primary", disabled=extract_disabled)
         for q in questions:
             qnum = normalise_question_number(q.get("questionNumber", ""))
             page = clamp_int(q.get("pageNumber", 1), 1)
+
             records.append({
                 "questionNumber": qnum,
                 "questionText": q.get("questionText", ""),
@@ -727,6 +726,7 @@ if st.button("✨ Extract Questions", type="primary", disabled=extract_disabled)
             imgs = q_to_images.get(qn, [])
             confs = q_to_conf.get(qn, [])
             notes = q_to_notes.get(qn, [])
+
             if imgs:
                 r["hasImages"] = True
                 r["images"] = imgs
@@ -741,11 +741,12 @@ if st.button("✨ Extract Questions", type="primary", disabled=extract_disabled)
         st.session_state["records"] = records
         st.session_state["images"] = images
         st.session_state["image_map"] = image_map
+
         status.update(label=f"✅ Done — {len(records)} questions extracted", state="complete")
 
 if "records" in st.session_state:
     st.subheader("3 · Review & edit")
-    st.caption("Edit anything before syncing. Image columns show the linked image names and mapping confidence.")
+    st.caption("Edit anything before syncing. Image columns show linked image names and mapping confidence.")
 
     records = st.session_state["records"]
     images = st.session_state.get("images", [])
@@ -817,11 +818,13 @@ if "records" in st.session_state:
             _imgbb = IMGBB_KEY
 
             log_lines: list[str] = []
+
             def log(msg: str):
                 log_lines.append(msg)
 
             try:
                 image_name_to_url: dict[str, str] = {}
+
                 if _images and _imgbb:
                     log("Uploading images to imgbb…")
 
@@ -845,6 +848,7 @@ if "records" in st.session_state:
                 airtable_payload = []
                 for r in _records:
                     urls = [image_name_to_url[name] for name in r.get("images", []) if name in image_name_to_url]
+
                     airtable_payload.append({
                         "fields": {
                             "Question Number": r.get("questionNumber", ""),
@@ -867,8 +871,10 @@ if "records" in st.session_state:
                 log("Creating Airtable records…")
                 created = create_airtable_records(AT_TOKEN, AT_BASE, AT_TABLE, airtable_payload)
                 log(f"✅ {len(created)} records pushed to Airtable")
+
                 st.text("\n".join(log_lines))
                 st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
+
             except Exception as e:
                 log(f"❌ Sync failed: {e}")
                 st.text("\n".join(log_lines))
