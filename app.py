@@ -1,6 +1,11 @@
 """
-app.py  –  Past Paper → Airtable  (OpenAI version, Streamlit Cloud)
-====================================================================
+app_v2.py  –  Past Paper → Airtable  (OpenAI, Streamlit Cloud)
+==============================================================
+Architecture:
+  Stage 1 — PyMuPDF extracts ALL visuals from each page (no filtering).
+  Stage 2 — GPT-4V reviews each page's crops, judges relevance,
+             assigns question number, all in one call per page.
+
 Secrets (.streamlit/secrets.toml or Streamlit Cloud dashboard):
     OPENAI_API_KEY   = "sk-..."
     AIRTABLE_TOKEN   = "pat..."
@@ -34,11 +39,11 @@ CHUNK_PAGES       = 2
 MAX_WORKERS       = 3
 MAX_RETRIES       = 4
 BASE_BACKOFF      = 2
-MAX_IMAGES_PER_REQUEST = 2
 IMAGE_MAX_SIZE    = (1200, 1200)
 JPEG_QUALITY      = 70
 RENDER_DPI        = 150
 VISION_DPI        = 170
+EXTRACT_DPI       = 190   # DPI for cropping individual visuals
 
 AT_API    = "https://api.airtable.com/v0"
 AT_META   = "https://api.airtable.com/v0/meta"
@@ -94,49 +99,30 @@ Each element must be:
 }
 """
 
-GPT_SUPPLEMENT_PROMPT = """This is page {page_num} of an exam paper.
+GPT_JUDGE_PROMPT = """You are reviewing extracted visual crops from page {page_num} of an exam paper.
 
-PyMuPDF already extracted these visuals from this page:
-{already_found}
+For each crop, decide:
+1. Is it relevant? A relevant visual is something a student NEEDS to answer a question:
+   diagrams, graphs, grids, tables, formula boxes, info boxes, number lines, geometric shapes.
+   NOT relevant: blank answer lines, empty boxes, page borders, barcodes, headers/footers,
+   "do not write" boxes, page number boxes.
 
-Are there any question-relevant visuals on this page that are NOT in the list above?
-Include: formula boxes, lightly-drawn diagrams, number lines, geometric shapes, answer-box grids.
-Exclude: answer lines, page borders, headers, footers, barcodes, page numbers.
+2. If relevant, which question number does it belong to?
 
-If nothing is missing return an empty array: []
-
-Otherwise return ONLY a raw JSON array. No markdown. No explanation.
-Each element:
-{{
-  "label": "formula box",
-  "x": 0.25,
-  "y": 0.10,
-  "w": 0.30,
-  "h": 0.12
-}}
-
-x, y = top-left corner as fraction of page width/height (0.0–1.0)
-w, h = width/height as fraction of page dimensions
-Be generous — slightly oversized boxes are better than missing the visual.
-"""
-
-IMAGE_MAPPING_PROMPT = """This is page {page_num} of an exam paper.
-
-The following visuals were extracted from this page:
-{img_list}
-
-For each visual, identify which question number it belongs to by reading the page layout.
 Return ONLY a raw JSON array. No markdown. No explanation.
 Each element:
 {{
-  "imageName": "p{page_num}_img1.png",
-  "questionNumber": "3a",
+  "cropName": "p{page_num}_crop1.png",
+  "relevant": true,
+  "questionNumber": "7a",
   "confidence": "high",
-  "notes": "Grid appears directly under Q3a"
+  "label": "pizza toppings completion table",
+  "notes": "Table with SM entry beside Q7a"
 }}
 
 confidence: high, medium, or low
-If no question can be assigned use questionNumber = "none"
+If relevant but question cannot be determined use questionNumber = "none"
+If not relevant, still include the entry with relevant = false and questionNumber = "none"
 """
 
 SKIP_PAGE_KEYWORDS = [
@@ -168,8 +154,7 @@ def safe_json_loads(raw: str, default: Any):
         return default
 
 def normalise_qnum(value: Any) -> str:
-    value = str(value or "").strip()
-    return value.replace(" ", "").replace("(", "").replace(")", "")
+    return str(value or "").strip().replace(" ", "").replace("(", "").replace(")", "")
 
 def clamp_int(value: Any, default: int = 0) -> int:
     try:
@@ -201,30 +186,29 @@ def openai_response_text(resp) -> str:
         return text
     parts = []
     for item in getattr(resp, "output", []) or []:
-        for content in getattr(item, "content", []) or []:
-            t = getattr(content, "text", None)
+        for c in getattr(item, "content", []) or []:
+            t = getattr(c, "text", None)
             if t:
                 parts.append(t)
     return "\n".join(parts)
 
 # ── OpenAI helpers ────────────────────────────────────────────────────────
-def encode_image(img_pil: Image.Image) -> str:
-    img_pil = img_pil.copy().convert("RGB")
-    img_pil.thumbnail(IMAGE_MAX_SIZE)
+def encode_pil(img: Image.Image) -> str:
+    img = img.copy().convert("RGB")
+    img.thumbnail(IMAGE_MAX_SIZE)
     buf = io.BytesIO()
-    img_pil.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
-def call_gpt_vision(client: OpenAI, images: list[Image.Image], prompt: str,
-                    model: str, max_images: int = MAX_IMAGES_PER_REQUEST,
-                    max_output_tokens: int = MAX_OUTPUT_TOKENS) -> str:
-    images  = images[:max_images]
-    content = [{"type": "input_text", "text": prompt}]
-    for img in images:
-        content.append({
-            "type":      "input_image",
-            "image_url": f"data:image/jpeg;base64,{encode_image(img)}",
-        })
+def encode_bytes(data: bytes) -> str:
+    pil = Image.open(io.BytesIO(data)).convert("RGB")
+    pil.thumbnail(IMAGE_MAX_SIZE)
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+def call_gpt(client: OpenAI, content: list, model: str,
+             max_output_tokens: int = MAX_OUTPUT_TOKENS) -> str:
     def _call():
         return client.responses.create(
             model=model,
@@ -234,10 +218,10 @@ def call_gpt_vision(client: OpenAI, images: list[Image.Image], prompt: str,
     return openai_response_text(run_with_retry(_call))
 
 # ── PDF helpers ───────────────────────────────────────────────────────────
-def render_page_as_pil(pdf_bytes: bytes, page_num: int, dpi: int = RENDER_DPI) -> Image.Image:
+def render_page_pil(pdf_bytes: bytes, page_num: int, dpi: int = RENDER_DPI) -> Image.Image:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     mat = fitz.Matrix(dpi/72, dpi/72)
-    pix = doc[page_num - 1].get_pixmap(matrix=mat, alpha=False)
+    pix = doc[page_num-1].get_pixmap(matrix=mat, alpha=False)
     doc.close()
     return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
@@ -245,14 +229,15 @@ def split_pdf(pdf_bytes: bytes, chunk_size: int) -> list[bytes]:
     doc, chunks = fitz.open(stream=pdf_bytes, filetype="pdf"), []
     for start in range(0, len(doc), chunk_size):
         w = fitz.open()
-        w.insert_pdf(doc, from_page=start, to_page=min(start + chunk_size, len(doc)) - 1)
+        w.insert_pdf(doc, from_page=start,
+                     to_page=min(start + chunk_size, len(doc)) - 1)
         buf = io.BytesIO()
         w.save(buf); w.close()
         chunks.append(buf.getvalue())
     doc.close()
     return chunks
 
-def pdf_chunk_to_pil_images(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> list[Image.Image]:
+def pdf_chunk_to_pils(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> list[Image.Image]:
     doc, out = fitz.open(stream=pdf_bytes, filetype="pdf"), []
     mat = fitz.Matrix(dpi/72, dpi/72)
     for page in doc:
@@ -265,39 +250,30 @@ def is_question_page(pdf_bytes: bytes, page_num: int) -> bool:
     if page_num == 1:
         return False
     doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = doc[page_num - 1].get_text().lower()
+    text = doc[page_num-1].get_text().lower()
     doc.close()
-    for kw in SKIP_PAGE_KEYWORDS:
-        if kw in text:
-            return False
-    return True
+    return not any(kw in text for kw in SKIP_PAGE_KEYWORDS)
 
-# ── PyMuPDF visual extraction (pixel-perfect) ────────────────────────────
-VEC_MIN_CONTENT_PCT = 1.5   # % non-white pixels — filters blank answer line regions
+# ── Stage 1: PyMuPDF — extract ALL visuals, zero filtering ───────────────
+def rects_overlap(a: fitz.Rect, b: fitz.Rect, pad: float = 4.0) -> bool:
+    return (a.x0 - pad < b.x1 and a.x1 + pad > b.x0 and
+            a.y0 - pad < b.y1 and a.y1 + pad > b.y0)
 
-def content_pct(png_data: bytes) -> float:
-    from PIL import ImageStat
-    img  = Image.open(io.BytesIO(png_data)).convert("RGB")
-    mean = sum(ImageStat.Stat(img).mean) / 3
-    return 100.0 - (mean / 255.0 * 100.0)
-
-def rect_inside_any(rect, rect_list, pad=2) -> bool:
-    r = fitz.Rect(rect)
-    return any(
-        r.x0 >= fitz.Rect(o).x0 - pad and r.y0 >= fitz.Rect(o).y0 - pad and
-        r.x1 <= fitz.Rect(o).x1 + pad and r.y1 <= fitz.Rect(o).y1 + pad
-        for o in rect_list
-    )
-
-def merge_rects(rects, x_gap=10, y_gap=10):
-    rects, merged = [fitz.Rect(r) for r in rects], []
+def merge_rects(rects: list[fitz.Rect],
+                pad: float = 6.0,
+                max_h_gap: float = 30.0) -> list[fitz.Rect]:
+    """
+    Merge overlapping rects. Rects with horizontal gap > max_h_gap
+    are NOT merged — keeps side-by-side boxes separate.
+    """
+    rects, merged = list(rects), []
     while rects:
         cur, changed = rects.pop(0), True
         while changed:
             changed, remaining = False, []
             for r in rects:
-                exp = fitz.Rect(cur.x0-x_gap, cur.y0-y_gap, cur.x1+x_gap, cur.y1+y_gap)
-                if exp.intersects(r):
+                h_gap = max(r.x0 - cur.x1, cur.x0 - r.x1, 0.0)
+                if h_gap <= max_h_gap and rects_overlap(cur, r, pad):
                     cur |= r; changed = True
                 else:
                     remaining.append(r)
@@ -305,317 +281,254 @@ def merge_rects(rects, x_gap=10, y_gap=10):
         merged.append(cur)
     return merged
 
-def render_clip(page, rect, dpi=190) -> tuple[bytes, int, int]:
-    mat  = fitz.Matrix(dpi/72, dpi/72)
-    pix  = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
-    data = pix.tobytes("png")
-    img  = Image.open(io.BytesIO(data))
-    return data, img.width, img.height
+def render_clip(page: fitz.Page, rect: fitz.Rect,
+                dpi: int = EXTRACT_DPI) -> bytes:
+    mat = fitz.Matrix(dpi/72, dpi/72)
+    pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
+    return pix.tobytes("png")
 
-def gpt_supplement_page(client: OpenAI, pdf_bytes: bytes,
-                         page_num: int, already: list[dict]) -> list[dict]:
+def extract_all_crops(pdf_bytes: bytes) -> list[dict]:
     """
-    Ask GPT if there are any visuals on this page that PyMuPDF missed.
-    Returns additional visuals cropped with generous padding.
+    Extract every possible visual candidate from every question page.
+    No relevance filtering — GPT judges that in Stage 2.
+    Returns list of {page, name, data, width, height}.
     """
-    page_pil       = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
-    page_w, page_h = page_pil.size
-
-    already_str = "\n".join(f"- {i['name']} ({i['kind']})" for i in already) or "(none)"
-    prompt      = GPT_SUPPLEMENT_PROMPT.format(
-        page_num=page_num, already_found=already_str
-    )
-    content = [
-        {"type": "input_text",  "text": prompt},
-        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{encode_image(page_pil)}"},
-    ]
-    def _call():
-        return client.responses.create(
-            model=VISION_MODEL,
-            input=[{"role": "user", "content": content}],
-            max_output_tokens=1500,
-        )
-    raw  = openai_response_text(run_with_retry(_call))
-    rows = safe_json_loads(raw, [])
-
-    extras = []
-    for idx, row in enumerate(rows, 1):
-        try:
-            x = float(row["x"]); y = float(row["y"])
-            w = float(row["w"]); h = float(row["h"])
-
-            # Generous padding (5%) to compensate for GPT imprecision
-            pad = 0.05
-            x1  = max(0.0, x - pad);     y1 = max(0.0, y - pad)
-            x2  = min(1.0, x + w + pad); y2 = min(1.0, y + h + pad)
-
-            # Skip if either dimension is near-full-page (OR not AND)
-            if (x2 - x1) > 0.88 or (y2 - y1) > 0.88:
-                continue
-            if (x2 - x1) < 0.03 or (y2 - y1) < 0.03:
-                continue
-
-            crop = page_pil.crop((
-                int(x1 * page_w), int(y1 * page_h),
-                int(x2 * page_w), int(y2 * page_h),
-            ))
-            buf = io.BytesIO()
-            crop.save(buf, format="PNG")
-            extras.append({
-                "page":   page_num,
-                "name":   f"p{page_num}_gpt{idx}.png",
-                "kind":   str(row.get("label", "gpt_visual")),
-                "data":   buf.getvalue(),
-                "width":  crop.width,
-                "height": crop.height,
-            })
-        except Exception:
-            continue
-    return extras
-
-@st.cache_data(show_spinner=False)
-def extract_visual_regions(openai_key: str, pdf_bytes: bytes) -> list[dict]:
-    """
-    Stage 1: PyMuPDF extracts pixel-perfect images, tables, vector regions.
-    Stage 2: GPT-4V supplements anything PyMuPDF missed (formula boxes, light diagrams).
-    """
-    client  = OpenAI(api_key=openai_key)
-    doc     = fitz.open(stream=pdf_bytes, filetype="pdf")
-    visuals = []
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    all_crops: list[dict] = []
 
     for page_num, page in enumerate(doc, 1):
         if not is_question_page(pdf_bytes, page_num):
             continue
 
-        page_visuals = []
-        table_rects  = []
-        pr           = page.rect
+        pr = page.rect
 
-        # 1. Embedded raster images
-        for idx, img_info in enumerate(page.get_images(full=True), 1):
+        # 1. Embedded raster images (from get_text dict for accurate bytes)
+        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES)["blocks"]
+        for idx, block in enumerate(blocks, 1):
+            if block.get("type") != 1:
+                continue
             try:
-                bi  = doc.extract_image(img_info[0])
-                pil = Image.open(io.BytesIO(bi["image"]))
+                img_bytes = block.get("image")
+                if not img_bytes:
+                    continue
+                pil = Image.open(io.BytesIO(img_bytes))
                 w, h = pil.size
-                if w < 80 or h < 80 or w*h < 12000:
+                if w < 40 or h < 40:
                     continue
-                if w/max(h,1) > 4:
-                    continue
-                page_visuals.append({
+                all_crops.append({
                     "page":   page_num,
-                    "name":   f"p{page_num}_img{idx}.{bi['ext']}",
-                    "kind":   "image",
-                    "data":   bi["image"],
+                    "name":   f"p{page_num}_raster{idx}.png",
+                    "source": "raster",
+                    "data":   img_bytes,
                     "width":  w,
                     "height": h,
                 })
             except Exception:
                 pass
 
-        # 2. Tables
-        try:
-            for idx, table in enumerate(page.find_tables().tables, 1):
-                rect = fitz.Rect(table.bbox)
-                table_rects.append(rect)
-                if rect.width < 40 or rect.height < 40:
+        # 2. All path regions — merge nearby, keep side-by-side separate
+        path_rects: list[fitz.Rect] = []
+        for path in page.get_drawings():
+            r = path.get("rect")
+            if not r:
+                continue
+            r = fitz.Rect(r)
+            # Skip sub-pixel noise
+            if r.width < 10 or r.height < 10:
+                continue
+            path_rects.append(r)
+
+        for idx, rect in enumerate(merge_rects(path_rects), 1):
+            # Skip obvious full-page borders
+            if rect.width > pr.width * 0.93 and rect.height > pr.height * 0.83:
+                continue
+            # Skip sub-pixel
+            if rect.width < 15 or rect.height < 15:
+                continue
+            try:
+                data = render_clip(page, rect)
+                pil  = Image.open(io.BytesIO(data))
+                w, h = pil.size
+                if w < 20 or h < 20:
                     continue
-                data, w, h = render_clip(page, rect)
-                if content_pct(data) < VEC_MIN_CONTENT_PCT:
-                    continue
-                page_visuals.append({
+                all_crops.append({
                     "page":   page_num,
-                    "name":   f"p{page_num}_table{idx}.png",
-                    "kind":   "table",
+                    "name":   f"p{page_num}_path{idx}.png",
+                    "source": "path",
                     "data":   data,
                     "width":  w,
                     "height": h,
                 })
-        except Exception:
-            pass
-
-        # 3. Vector regions
-        try:
-            drawing_rects = []
-            for d in page.get_drawings():
-                rect = d.get("rect")
-                if not rect:
-                    continue
-                rect = fitz.Rect(rect)
-                if rect.width < 18 or rect.height < 18:
-                    continue
-                if rect_inside_any(rect, table_rects):
-                    continue
-                drawing_rects.append(rect)
-
-            for idx, rect in enumerate(merge_rects(drawing_rects), 1):
-                if rect.width < 35 or rect.height < 35:
-                    continue
-                # Skip full-page borders
-                if rect.width > pr.width * 0.95 and rect.height > pr.height * 0.85:
-                    continue
-                # Skip wide-but-short strips — answer lines, header rules
-                if rect.height < 80 and rect.width > pr.width * 0.5:
-                    continue
-                data, w, h = render_clip(page, rect)
-                if w < 60 or h < 60:
-                    continue
-                if w / max(h, 1) > 10 or w / max(h, 1) < 0.08:
-                    continue
-                if content_pct(data) < VEC_MIN_CONTENT_PCT:
-                    continue
-                page_visuals.append({
-                    "page":   page_num,
-                    "name":   f"p{page_num}_vec{idx}.png",
-                    "kind":   "vector",
-                    "data":   data,
-                    "width":  w,
-                    "height": h,
-                })
-        except Exception:
-            pass
-
-        # 4. GPT supplement — catch anything PyMuPDF missed
-        try:
-            extras = gpt_supplement_page(client, pdf_bytes, page_num, page_visuals)
-            page_visuals.extend(extras)
-        except Exception:
-            pass
-
-        visuals.extend(page_visuals)
+            except Exception:
+                pass
 
     doc.close()
-    return visuals
+    return all_crops
 
-# ── GPT mapping: which question does each visual belong to? ───────────────
-def map_page_visuals(client: OpenAI, pdf_bytes: bytes,
-                     page_num: int, page_imgs: list[dict]) -> dict[str, dict]:
-    page_pil = render_page_as_pil(pdf_bytes, page_num, dpi=VISION_DPI)
-    img_list = "\n".join(
-        f"- {img['name']} ({img['width']}x{img['height']}, kind={img.get('kind','?')})"
-        for img in page_imgs
-    )
-    prompt = IMAGE_MAPPING_PROMPT.format(
-        page_num=page_num, img_list=img_list
-    )
-    raw  = call_gpt_vision(client, [page_pil], prompt,
-                           model=VISION_MODEL, max_images=1,
-                           max_output_tokens=2000)
+# ── Stage 2: GPT judges relevance + assigns question number ───────────────
+def judge_page_crops(client: OpenAI, pdf_bytes: bytes,
+                     page_num: int,
+                     crops: list[dict]) -> list[dict]:
+    """
+    Send the rendered page + all crops to GPT-4V.
+    GPT decides: relevant? which question?
+    Returns only the relevant crops, enriched with mapping metadata.
+    """
+    if not crops:
+        return []
+
+    page_pil = render_page_pil(pdf_bytes, page_num, dpi=VISION_DPI)
+
+    # Build content: page image first, then each crop
+    content: list[dict] = [
+        {"type": "input_text",
+         "text": GPT_JUDGE_PROMPT.format(page_num=page_num)},
+        {"type": "input_image",
+         "image_url": f"data:image/jpeg;base64,{encode_pil(page_pil)}"},
+    ]
+    for crop in crops:
+        content.append({"type": "input_text",  "text": f"Crop: {crop['name']}"})
+        content.append({"type": "input_image",
+                         "image_url": f"data:image/jpeg;base64,{encode_bytes(crop['data'])}"})
+
+    raw  = call_gpt(client, content, VISION_MODEL, max_output_tokens=3000)
     rows = safe_json_loads(raw, [])
-    result: dict[str, dict] = {}
+
+    # Build lookup from GPT response
+    judgements: dict[str, dict] = {}
     for row in rows:
-        name = str(row.get("imageName", "") or "").strip()
-        qnum = normalise_qnum(row.get("questionNumber", "none"))
-        conf = str(row.get("confidence", "low") or "low").strip().lower()
-        note = str(row.get("notes", "") or "").strip()
+        name = str(row.get("cropName", "") or "").strip()
         if name:
-            result[name] = {
-                "questionNumber": qnum or "none",
-                "confidence":     conf if conf in {"high","medium","low"} else "low",
-                "notes":          note,
-                "source":         "vision",
-            }
-    return result
+            judgements[name] = row
+
+    kept: list[dict] = []
+    for crop in crops:
+        j = judgements.get(crop["name"], {})
+        if not j.get("relevant", False):
+            continue
+        qnum = normalise_qnum(j.get("questionNumber", "none"))
+        kept.append({
+            **crop,
+            "kind":       str(j.get("label",      "visual")),
+            "questionNumber": qnum or "none",
+            "confidence": str(j.get("confidence", "low")).lower(),
+            "notes":      str(j.get("notes",      "")),
+            "source_gpt": True,
+        })
+    return kept
 
 @st.cache_data(show_spinner=False)
-def map_images_to_questions(openai_key: str, pdf_bytes: bytes,
-                             images: list[dict],
-                             records: list[dict]) -> dict[str, dict]:
-    """Ask GPT to map each extracted visual to a question number, in parallel."""
-    client      = OpenAI(api_key=openai_key)
-    page_groups: dict[int, list] = {}
-    for img in images:
-        page_groups.setdefault(img["page"], []).append(img)
+def extract_and_judge_visuals(openai_key: str,
+                               pdf_bytes: bytes) -> tuple[list[dict], dict[str, dict]]:
+    """
+    Stage 1: PyMuPDF extracts all crops (no filtering).
+    Stage 2: GPT judges each page's crops in parallel.
+    Returns (visuals, image_map).
+    """
+    client = OpenAI(api_key=openai_key)
 
-    mapping: dict[str, dict] = {}
+    # Stage 1
+    all_crops = extract_all_crops(pdf_bytes)
+
+    # Group by page
+    by_page: dict[int, list[dict]] = {}
+    for crop in all_crops:
+        by_page.setdefault(crop["page"], []).append(crop)
+
+    # Stage 2 — parallel per page
+    kept_visuals: list[dict]       = []
+    full_mapping: dict[str, dict]  = {}
+
+    def process_page(page_num: int, crops: list[dict]):
+        judged = judge_page_crops(client, pdf_bytes, page_num, crops)
+        return page_num, judged
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(map_page_visuals, client, pdf_bytes, pn, imgs)
-                   for pn, imgs in page_groups.items()]
+        futures = {ex.submit(process_page, pn, crops): pn
+                   for pn, crops in by_page.items()}
+        results: dict[int, list] = {}
         for f in as_completed(futures):
-            mapping.update(f.result())
+            pn, judged = f.result()
+            results[pn] = judged
 
-    # Fallback: assign unmapped visuals to last question on their page
-    pq_index: dict[int, list[str]] = {}
-    for r in records:
-        page = clamp_int(r.get("pageNumber", 0))
-        qn   = normalise_qnum(r.get("questionNumber", ""))
-        if page and qn:
-            pq_index.setdefault(page, [])
-            if qn not in pq_index[page]:
-                pq_index[page].append(qn)
-
-    for img in images:
-        name = img["name"]
-        if name not in mapping or mapping[name].get("questionNumber") in {"", "none"}:
-            qs = pq_index.get(img["page"], [])
-            mapping[name] = {
-                "questionNumber": qs[-1] if qs else "none",
-                "confidence":     "low",
-                "notes":          "Fallback: last question on page",
-                "source":         "fallback",
+    for pn in sorted(results):
+        for v in results[pn]:
+            kept_visuals.append(v)
+            full_mapping[v["name"]] = {
+                "questionNumber": v.get("questionNumber", "none"),
+                "confidence":     v.get("confidence",     "low"),
+                "notes":          v.get("notes",          ""),
+                "source":         "gpt_judge",
             }
-    return mapping
 
-# ── Parallel question extraction ──────────────────────────────────────────
-def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes) -> tuple[list[dict], list[str]]:
-    pdf_chunks = split_pdf(pdf_bytes, CHUNK_PAGES)
+    return kept_visuals, full_mapping
+
+# ── Question + mark scheme extraction ─────────────────────────────────────
+def extract_questions_parallel(client: OpenAI,
+                                pdf_bytes: bytes) -> tuple[list[dict], list[str]]:
+    chunks = split_pdf(pdf_bytes, CHUNK_PAGES)
     logs: list[str] = []
 
-    def process_one(index: int, chunk_bytes: bytes):
-        offset = index * CHUNK_PAGES
-        images = pdf_chunk_to_pil_images(chunk_bytes)
-        raw    = call_gpt_vision(client, images, QUESTION_PROMPT, model=TEXT_MODEL)
-        rows   = safe_json_loads(raw, [])
-        fixed  = []
-        for row in rows:
-            fixed.append({
-                "questionNumber":   normalise_qnum(row.get("questionNumber",   "")),
-                "questionText":     str(row.get("questionText",     "") or ""),
-                "markAllocation":   clamp_int(row.get("markAllocation", 0), 0),
-                "topic":            str(row.get("topic",            "") or ""),
-                "subtopic":         str(row.get("subtopic",         "") or ""),
-                "hasImages":        bool(row.get("hasImages",       False)),
-                "imageDescription": str(row.get("imageDescription", "") or ""),
-                "pageNumber":       clamp_int(row.get("pageNumber", 1), 1) + offset,
-            })
-        return index, fixed, f"Chunk {index+1}/{len(pdf_chunks)}: {len(fixed)} questions"
+    def process(i: int, chunk: bytes):
+        offset = i * CHUNK_PAGES
+        pils   = pdf_chunk_to_pils(chunk)
+        content = [{"type": "input_text", "text": QUESTION_PROMPT}]
+        for p in pils:
+            content.append({"type": "input_image",
+                             "image_url": f"data:image/jpeg;base64,{encode_pil(p)}"})
+        raw  = call_gpt(client, content, TEXT_MODEL)
+        rows = safe_json_loads(raw, [])
+        fixed = [{
+            "questionNumber":   normalise_qnum(r.get("questionNumber",   "")),
+            "questionText":     str(r.get("questionText",     "") or ""),
+            "markAllocation":   clamp_int(r.get("markAllocation", 0), 0),
+            "topic":            str(r.get("topic",            "") or ""),
+            "subtopic":         str(r.get("subtopic",         "") or ""),
+            "hasImages":        bool(r.get("hasImages",       False)),
+            "imageDescription": str(r.get("imageDescription", "") or ""),
+            "pageNumber":       clamp_int(r.get("pageNumber", 1), 1) + offset,
+        } for r in rows]
+        return i, fixed, f"Chunk {i+1}/{len(chunks)}: {len(fixed)} questions"
 
     ordered: dict[int, list] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(process_one, i, c) for i, c in enumerate(pdf_chunks)]
-        for f in as_completed(futures):
-            i, rows, msg = f.result()
+        for i, rows, msg in [f.result() for f in
+                              as_completed([ex.submit(process, i, c)
+                                            for i, c in enumerate(chunks)])]:
             ordered[i] = rows; logs.append(msg)
 
     collected = []
-    for i in range(len(pdf_chunks)):
+    for i in range(len(chunks)):
         collected.extend(ordered.get(i, []))
     return collected, logs
 
-def extract_markscheme_parallel(client: OpenAI, pdf_bytes: bytes) -> tuple[dict[str, str], list[str]]:
-    pdf_chunks = split_pdf(pdf_bytes, CHUNK_PAGES)
+def extract_markscheme_parallel(client: OpenAI,
+                                 pdf_bytes: bytes) -> tuple[dict[str, str], list[str]]:
+    chunks = split_pdf(pdf_bytes, CHUNK_PAGES)
     logs: list[str] = []
 
-    def process_one(index: int, chunk_bytes: bytes):
-        images = pdf_chunk_to_pil_images(chunk_bytes)
-        raw    = call_gpt_vision(client, images, MS_PROMPT, model=TEXT_MODEL)
-        rows   = safe_json_loads(raw, [])
-        local  = {}
-        for row in rows:
-            qn  = normalise_qnum(row.get("questionNumber",   ""))
-            ans = str(row.get("markSchemeAnswer", "") or "")
-            if qn and ans:
-                local[qn] = ans
-        return index, local, f"MS chunk {index+1}/{len(pdf_chunks)}: {len(local)} entries"
+    def process(i: int, chunk: bytes):
+        pils = pdf_chunk_to_pils(chunk)
+        content = [{"type": "input_text", "text": MS_PROMPT}]
+        for p in pils:
+            content.append({"type": "input_image",
+                             "image_url": f"data:image/jpeg;base64,{encode_pil(p)}"})
+        raw  = call_gpt(client, content, TEXT_MODEL)
+        rows = safe_json_loads(raw, [])
+        local = {normalise_qnum(r.get("questionNumber", "")): str(r.get("markSchemeAnswer", "") or "")
+                 for r in rows
+                 if r.get("questionNumber") and r.get("markSchemeAnswer")}
+        return i, local, f"MS chunk {i+1}/{len(chunks)}: {len(local)} entries"
 
     ordered: dict[int, dict] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(process_one, i, c) for i, c in enumerate(pdf_chunks)]
-        for f in as_completed(futures):
-            i, local, msg = f.result()
+        for i, local, msg in [f.result() for f in
+                               as_completed([ex.submit(process, i, c)
+                                             for i, c in enumerate(chunks)])]:
             ordered[i] = local; logs.append(msg)
 
     ms_map: dict[str, str] = {}
-    for i in range(len(pdf_chunks)):
+    for i in range(len(chunks)):
         ms_map.update(ordered.get(i, {}))
     return ms_map, logs
 
@@ -636,19 +549,22 @@ def ensure_table(token: str, base_id: str, table: str):
         fields = []
         for name, ftype in AT_FIELDS:
             if ftype == "number":
-                fields.append({"name": name, "type": "number", "options": {"precision": 0}})
+                fields.append({"name": name, "type": "number",
+                               "options": {"precision": 0}})
             elif ftype == "checkbox":
                 fields.append({"name": name, "type": "checkbox",
-                               "options": {"icon": "check", "color": "greenBright"}})
+                               "options": {"icon": "check",
+                                           "color": "greenBright"}})
             elif ftype == "multipleAttachments":
                 fields.append({"name": name, "type": "multipleAttachments"})
             else:
                 fields.append({"name": name, "type": ftype})
         r2 = requests.post(f"{AT_META}/bases/{base_id}/tables",
                            headers=at_headers(token),
-                           json={"name": table, "fields": fields}, timeout=60)
+                           json={"name": table, "fields": fields},
+                           timeout=60)
         if not r2.ok:
-            st.warning(f"Could not auto-create table ({r2.status_code}). Create it manually.")
+            st.warning(f"Could not auto-create table ({r2.status_code}).")
     except Exception as e:
         st.warning(f"Table check skipped: {e}")
 
@@ -664,8 +580,8 @@ def get_existing_fields(token: str, base_id: str, table: str) -> set[str]:
 def upload_to_imgbb(api_key: str, img: dict) -> str | None:
     b64  = base64.standard_b64encode(img["data"]).decode()
     resp = requests.post(IMGBB_API,
-                         data={"key": api_key, "name": img["name"], "image": b64},
-                         timeout=60)
+                         data={"key": api_key, "name": img["name"],
+                               "image": b64}, timeout=60)
     if resp.ok:
         return resp.json()["data"]["url"]
     return None
@@ -684,9 +600,10 @@ def create_airtable_records(token: str, base_id: str, table: str,
     return created
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────
-st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
-st.title("📄 Past Paper → Airtable")
-st.caption("Upload exam PDFs, extract questions with GPT, map visuals, review, then sync to Airtable.")
+st.set_page_config(page_title="Past Paper → Airtable v2",
+                   page_icon="📄", layout="wide")
+st.title("📄 Past Paper → Airtable v2")
+st.caption("PyMuPDF extracts everything · GPT-4V judges relevance & maps to questions · Airtable sync")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
@@ -696,11 +613,13 @@ IMGBB_KEY  = get_secret("IMGBB_API_KEY")
 with st.sidebar:
     st.header("⚙️ Configuration")
     if not OPENAI_KEY:
-        OPENAI_KEY = st.text_input("OpenAI API key", type="password", placeholder="sk-...")
+        OPENAI_KEY = st.text_input("OpenAI API key", type="password",
+                                    placeholder="sk-...")
     else:
         st.success("✓ OpenAI key loaded")
     if not AT_TOKEN:
-        AT_TOKEN = st.text_input("Airtable Token", type="password", placeholder="patXXXXXX")
+        AT_TOKEN = st.text_input("Airtable Token", type="password",
+                                  placeholder="patXXXXXX")
     else:
         st.success("✓ Airtable token loaded")
     if not AT_BASE:
@@ -708,7 +627,8 @@ with st.sidebar:
     else:
         st.success("✓ Airtable Base ID loaded")
     if not IMGBB_KEY:
-        IMGBB_KEY = st.text_input("imgbb API key", type="password", placeholder="imgbb.com/api")
+        IMGBB_KEY = st.text_input("imgbb API key", type="password",
+                                   placeholder="imgbb.com/api")
     else:
         st.success("✓ imgbb key loaded")
     AT_TABLE = st.text_input("Table name", value="Questions")
@@ -717,11 +637,11 @@ with st.sidebar:
     for name, ftype in AT_FIELDS:
         st.markdown(f"- `{name}` — {ftype}")
 
-# ── Step 1: Upload ────────────────────────────────────────────────────────
+# ── Step 1: Upload ─────────────────────────────────────────────────────
 st.subheader("1 · Upload PDFs")
 col1, col2 = st.columns(2)
 with col1:
-    paper_name = st.text_input("Paper name", placeholder="AQA Biology P1 2023")
+    paper_name = st.text_input("Paper name", placeholder="AQA Maths P1 2024")
     exam_type  = st.text_input("Exam type",  placeholder="GCSE / A-Level / IB HL")
     paper_file = st.file_uploader("Past paper PDF *", type="pdf")
 with col2:
@@ -730,30 +650,33 @@ with col2:
     st.markdown("&nbsp;", unsafe_allow_html=True)
     ms_file = st.file_uploader("Mark scheme PDF (optional)", type="pdf")
 
-# ── Step 2: Extract ───────────────────────────────────────────────────────
+# ── Step 2: Extract ────────────────────────────────────────────────────
 st.subheader("2 · Extract with GPT")
 if st.button("✨ Extract Questions", type="primary",
              disabled=not (paper_file and paper_name and exam_type and OPENAI_KEY)):
+
     paper_bytes = paper_file.read()
     ms_bytes    = ms_file.read() if ms_file else None
     client      = OpenAI(api_key=OPENAI_KEY)
 
     with st.status("Extracting…", expanded=True) as status:
 
-        st.write("📎 Extracting visuals (PyMuPDF + GPT supplement)…")
-        extract_visual_regions.clear()
-        images = extract_visual_regions(OPENAI_KEY, paper_bytes)
-        st.write(f"   Found {len(images)} visuals "
-                 f"({sum(1 for i in images if i['kind']=='image')} images, "
-                 f"{sum(1 for i in images if i['kind']=='table')} tables, "
-                 f"{sum(1 for i in images if i['kind']=='vector')} vectors, "
-                 f"{sum(1 for i in images if i['kind'].startswith('gpt') or '_gpt' in i['name'])} GPT extras)")
+        # Visuals
+        st.write("📎 Extracting all visual candidates (PyMuPDF)…")
+        extract_and_judge_visuals.clear()
+        images, image_map = extract_and_judge_visuals(OPENAI_KEY, paper_bytes)
+        kept   = len(images)
+        mapped = sum(1 for v in image_map.values()
+                     if v.get("questionNumber") not in {"none", ""})
+        st.write(f"   {kept} visuals kept · {mapped} mapped to questions")
 
+        # Questions
         st.write("🤖 Extracting questions (parallel)…")
         questions, q_logs = extract_questions_parallel(client, paper_bytes)
         for line in q_logs:
             st.write(f"   {line}")
 
+        # Mark scheme
         ms_map: dict[str, str] = {}
         if ms_bytes:
             st.write("🧠 Extracting mark scheme (parallel)…")
@@ -761,6 +684,7 @@ if st.button("✨ Extract Questions", type="primary",
             for line in ms_logs:
                 st.write(f"   {line}")
 
+        # Merge into records
         records = []
         for q in questions:
             qnum = normalise_qnum(q.get("questionNumber", ""))
@@ -781,25 +705,39 @@ if st.button("✨ Extract Questions", type="primary",
                 "images":                 [],
             })
 
-        # Apply fallback mapping for any visuals GPT didn't assign
+        # Apply image mapping + fallback
         if images:
-            map_images_to_questions.clear()
-            st.write("🔍 Mapping visuals to questions with GPT-4V…")
-            image_map = map_images_to_questions(OPENAI_KEY, paper_bytes, images, records)
-            mapped = sum(1 for v in image_map.values()
-                         if v.get("questionNumber") not in {"none", ""})
-            st.write(f"   Mapped {mapped}/{len(images)} visuals to questions")
+            pq_index: dict[int, list[str]] = {}
+            for r in records:
+                page = clamp_int(r.get("pageNumber", 0))
+                qn   = normalise_qnum(r.get("questionNumber", ""))
+                if page and qn:
+                    pq_index.setdefault(page, [])
+                    if qn not in pq_index[page]:
+                        pq_index[page].append(qn)
+
+            # Fallback for unassigned
+            for img in images:
+                nm = img["name"]
+                if image_map.get(nm, {}).get("questionNumber") in {"", "none", None}:
+                    qs = pq_index.get(img["page"], [])
+                    image_map[nm] = {
+                        "questionNumber": qs[-1] if qs else "none",
+                        "confidence":     "low",
+                        "notes":          "Fallback: last question on page",
+                        "source":         "fallback",
+                    }
 
             q_to_imgs  : dict[str, list[str]] = {}
             q_to_conf  : dict[str, list[str]] = {}
             q_to_notes : dict[str, list[str]] = {}
-            for name, meta in image_map.items():
+            for nm, meta in image_map.items():
                 qn = normalise_qnum(meta.get("questionNumber", "none"))
                 if qn and qn != "none":
-                    q_to_imgs .setdefault(qn, []).append(name)
+                    q_to_imgs .setdefault(qn, []).append(nm)
                     q_to_conf .setdefault(qn, []).append(meta.get("confidence", "low"))
                     q_to_notes.setdefault(qn, []).append(
-                        f"{name}: {meta.get('notes','')} [{meta.get('source','vision')}]")
+                        f"{nm}: {meta.get('notes','')} [{meta.get('source','gpt')}]")
 
             for r in records:
                 qn    = r["questionNumber"]
@@ -817,9 +755,12 @@ if st.button("✨ Extract Questions", type="primary",
         st.session_state["records"]   = records
         st.session_state["images"]    = images
         st.session_state["image_map"] = image_map
-        status.update(label=f"✅ Done — {len(records)} questions extracted", state="complete")
+        status.update(
+            label=f"✅ Done — {len(records)} questions, {len(images)} visuals",
+            state="complete"
+        )
 
-# ── Step 3: Review ────────────────────────────────────────────────────────
+# ── Step 3: Review ─────────────────────────────────────────────────────
 if "records" in st.session_state:
     records = st.session_state["records"]
     images  = st.session_state.get("images", [])
@@ -842,7 +783,8 @@ if "records" in st.session_state:
         "Page Number":              r.get("pageNumber", 1),
     } for r in records])
 
-    edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", height=460)
+    edited = st.data_editor(df, use_container_width=True,
+                             num_rows="dynamic", height=460)
 
     col_map = {
         "Q #":                      "questionNumber",
@@ -865,18 +807,20 @@ if "records" in st.session_state:
             records[i]["markAllocation"] = clamp_int(row["Marks"], 0)
             records[i]["pageNumber"]     = clamp_int(row["Page Number"], 1)
             raw_names = str(row.get("Image Names") or "")
-            records[i]["images"] = [x.strip() for x in raw_names.split(",") if x.strip()]
+            records[i]["images"] = [x.strip() for x in
+                                    raw_names.split(",") if x.strip()]
 
     if images:
-        with st.expander(f"🖼 Extracted visuals ({len(images)})"):
+        with st.expander(f"🖼 Kept visuals ({len(images)})"):
             cols = st.columns(4)
             for idx, img in enumerate(images):
                 with cols[idx % 4]:
+                    qn = image_map.get(img["name"], {}).get("questionNumber", "?")
                     st.image(img["data"],
-                             caption=f"{img['name']} — {img.get('kind','?')}",
+                             caption=f"{img['name']}\nQ{qn} · {img.get('kind','?')}",
                              use_container_width=True)
 
-    # ── Step 4: Export / Sync ─────────────────────────────────────────────
+    # ── Step 4: Export / Sync ──────────────────────────────────────────
     st.subheader("4 · Export / Sync")
     dl_col, sync_col = st.columns([1, 2])
 
@@ -902,7 +846,7 @@ if "records" in st.session_state:
 
     with sync_col:
         if not (AT_TOKEN and AT_BASE):
-            st.warning("Add your Airtable token and Base ID in the sidebar to sync.")
+            st.warning("Add your Airtable token and Base ID to sync.")
         elif not AT_TOKEN.startswith("pat"):
             st.error("❌ Token should start with `pat`.")
         elif not AT_BASE.startswith("app"):
@@ -918,7 +862,7 @@ if "records" in st.session_state:
                 log_lines: list[str] = []
                 def log(msg): log_lines.append(msg)
 
-                # Upload images to imgbb in parallel
+                # Upload to imgbb in parallel
                 img_url_map: dict[str, str] = {}
                 if _images and _imgbb:
                     log(f"Uploading {len(_images)} visuals to imgbb…")
@@ -933,7 +877,7 @@ if "records" in st.session_state:
                             else:
                                 log(f"  ❌ {name} failed")
                 elif _images and not _imgbb:
-                    log("⚠️ IMGBB_API_KEY missing — visuals will not be attached.")
+                    log("⚠️ IMGBB_API_KEY missing — visuals not attached.")
 
                 try:
                     existing = get_existing_fields(AT_TOKEN, AT_BASE, AT_TABLE)
@@ -960,7 +904,7 @@ if "records" in st.session_state:
                         fields = {k: v for k, v in fields.items() if k in existing}
                         payload.append({"fields": fields})
 
-                    log(f"Pushing {len(payload)} records to Airtable…")
+                    log(f"Pushing {len(payload)} records…")
                     created = create_airtable_records(AT_TOKEN, AT_BASE, AT_TABLE, payload)
                     log(f"✅ {len(created)} records synced!")
                 except Exception as e:
