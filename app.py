@@ -1,30 +1,3 @@
-"""
-app_v3.py  –  Past Paper → Airtable  (OpenAI, Streamlit Cloud)
-==============================================================
-Flow:
-  Step 1  Upload PDFs
-  Step 2  Extract All Visuals (PyMuPDF, 300 DPI) — view before GPT
-  Step 3  Extract Questions + Judge Visuals (GPT-4V)
-  Step 4  Review & edit
-  Step 5  Export / Sync to Airtable
-
-Extraction strategy:
-  1. Raster images  — get_text("dict") image blocks, re-rendered at 300 DPI
-  2. Tables         — find_tables(), skip if > 50% of page (false positives)
-  3. Drawings       — ALL paths collected, clustered by proximity (20pt),
-                      largest-first dedup applied to clusters
-  GPT judges: relevant? which question? + recovery pass for hasImages with no visual.
-
-Secrets:
-    OPENAI_API_KEY   = "sk-..."
-    AIRTABLE_TOKEN   = "pat..."
-    AIRTABLE_BASE_ID = "app..."
-    IMGBB_API_KEY    = "..."
-
-requirements.txt:
-    streamlit openai requests pymupdf pillow pandas
-"""
-
 import io
 import json
 import re
