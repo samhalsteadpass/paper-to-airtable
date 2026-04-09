@@ -610,7 +610,8 @@ if "paper_bytes" in st.session_state and st_canvas is not None:
                 horizontal=True
             )
             drawing_mode = "rect" if mode == "Draw new boxes" else "transform"
-
+            st.image(display_pil, caption=f"Debug page {selected_page}", use_container_width=True)
+            st.write(display_pil.size)
             canvas_result = st_canvas(
                 fill_color="rgba(0,0,0,0)",
                 stroke_width=3,
