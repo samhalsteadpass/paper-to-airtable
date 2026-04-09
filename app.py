@@ -443,10 +443,35 @@ def ai_assign(client: OpenAI, box: dict, records: list[dict],
     note = str(parsed.get("notes", "") or "").strip()
 
     valid = {normalise_qnum(r.get("questionNumber", "")) for r in cands}
-    if qn not in valid:
+
+    def fuzzy_match(ai_qn: str, valid_set: set) -> str:
+        """Return the best matching question number from valid_set, or empty string."""
+        if ai_qn in valid_set:
+            return ai_qn
+        # Strip leading Q/q and zeros, try again
+        stripped = ai_qn.lstrip("Qq0") or ai_qn
+        if stripped in valid_set:
+            return stripped
+        # AI returned a parent like "8" — match first child like "8a", "8b"
+        children = [v for v in valid_set if v.startswith(ai_qn) or v.lstrip("Qq0").startswith(ai_qn)]
+        if len(children) == 1:
+            return children[0]
+        # Candidate is a parent of what AI returned e.g. AI said "8a", record is "8"
+        parents = [v for v in valid_set if ai_qn.startswith(v) and v]
+        if len(parents) == 1:
+            return parents[0]
+        return ""
+
+    matched = fuzzy_match(qn, valid)
+    if not matched:
         qn   = ""
         conf = "low"
         note = (note + " " if note else "") + "[outside candidate set]"
+    else:
+        if matched != qn:
+            note = (note + " " if note else "") + f"[matched {qn}→{matched}]"
+        qn = matched
+
     if conf not in {"high", "medium", "low"}:
         conf = "low"
 
