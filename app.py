@@ -712,8 +712,18 @@ if "pdf" in st.session_state:
                 cap   = (f"→ Q{qn}" if qn
                          else f"→ AI: Q{ai_qn} ({ai_cf})" if ai_qn
                          else "unassigned")
-                st.image(b["data"], caption=f"Box {b['idx']} {cap}",
-                         use_container_width=True)
+                img_col, del_col = st.columns([5, 1])
+                with img_col:
+                    st.image(b["data"], caption=f"Box {b['idx']} {cap}",
+                             use_container_width=True)
+                with del_col:
+                    if st.button("🗑️", key=f"del_{sel_page}_{b['idx']}",
+                                 help=f"Delete box {b['idx']}"):
+                        new_pb = [x for x in pb if x["idx"] != b["idx"]]
+                        set_page_boxes(sel_page, new_pb)
+                        reindex(sel_page)
+                        st.session_state[f"clicks_{sel_page}"] = []
+                        st.rerun()
 
             col_a, col_b = st.columns(2)
             with col_a:
