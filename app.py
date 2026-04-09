@@ -12,7 +12,11 @@ import requests
 import streamlit as st
 from PIL import Image, ImageDraw
 from openai import OpenAI
-from streamlit_image_coordinates import streamlit_image_coordinates
+
+try:
+    from streamlit_drawable_canvas_fix import st_canvas
+except Exception:
+    st_canvas = None
 
 # ── Config ────────────────────────────────────────────────────────────────
 TEXT_MODEL = "gpt-4.1-mini"
@@ -240,7 +244,7 @@ def render_page_for_display(pdf_bytes: bytes, page_num: int, max_width: int = CA
     display_pil = pil.resize((display_w, display_h))
     return pil, display_pil, scale
 
-def draw_boxes_on_preview(image: Image.Image, boxes: list[dict]) -> Image.Image:
+def draw_boxes_on_preview(image: Image.Image, boxes: list[dict], selected_qnum: str = "") -> Image.Image:
     img = image.copy()
     draw = ImageDraw.Draw(img)
 
@@ -251,40 +255,46 @@ def draw_boxes_on_preview(image: Image.Image, boxes: list[dict]) -> Image.Image:
         x1 = x0 + rel["w"] * img.width
         y1 = y0 + rel["h"] * img.height
 
-        draw.rectangle([x0, y0, x1, y1], outline="red", width=3)
+        qn = normalise_qnum(box.get("questionNumber", ""))
+        outline = "red" if not selected_qnum or qn == selected_qnum else "orange"
+        draw.rectangle([x0, y0, x1, y1], outline=outline, width=3)
+
         label = str(box.get("boxIndex", ""))
         if label:
             tx0 = x0 + 2
             ty0 = max(0, y0 - 18)
-            tx1 = tx0 + 20
+            tx1 = tx0 + 28
             ty1 = ty0 + 16
-            draw.rectangle([tx0, ty0, tx1, ty1], fill="red")
+            draw.rectangle([tx0, ty0, tx1, ty1], fill=outline)
             draw.text((tx0 + 4, ty0 + 1), label, fill="white")
 
     return img
 
-def save_box_for_selected_question(
-    pdf_bytes: bytes,
-    page_num: int,
-    rel: dict,
-    selected_qnum: str,
-    notes: str = "Manual box",
-):
-    page_boxes = get_boxes_for_page(page_num)
-    rel_boxes = [b["rel_bbox"] for b in page_boxes] + [rel]
+def extract_latest_rect_from_canvas(canvas_result) -> dict | None:
+    if not canvas_result or not getattr(canvas_result, "json_data", None):
+        return None
 
-    rebuilt = rebuild_page_boxes_from_rel(
-        pdf_bytes=pdf_bytes,
-        page_num=page_num,
-        rel_boxes=rel_boxes,
-        existing_boxes=page_boxes,
-    )
+    objects = canvas_result.json_data.get("objects", []) or []
+    rects = [obj for obj in objects if obj.get("type") == "rect"]
+    if not rects:
+        return None
 
-    if rebuilt:
-        rebuilt[-1]["questionNumber"] = normalise_qnum(selected_qnum)
-        rebuilt[-1]["notes"] = notes.strip() or "Manual box"
+    obj = rects[-1]
 
-    set_boxes_for_page(page_num, rebuilt)
+    left = float(obj.get("left", 0))
+    top = float(obj.get("top", 0))
+    width = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
+    height = float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
+
+    if width <= 0 or height <= 0:
+        return None
+
+    return {
+        "left": left,
+        "top": top,
+        "width": width,
+        "height": height,
+    }
 
 # ── Manual box store ──────────────────────────────────────────────────────
 def get_manual_boxes() -> dict[int, list[dict]]:
@@ -333,6 +343,29 @@ def get_all_boxes() -> list[dict]:
     for page in sorted(store):
         all_boxes.extend(store[page])
     return all_boxes
+
+def save_box_for_selected_question(
+    pdf_bytes: bytes,
+    page_num: int,
+    rel: dict,
+    selected_qnum: str,
+    notes: str = "Manual box",
+):
+    page_boxes = get_boxes_for_page(page_num)
+    rel_boxes = [b["rel_bbox"] for b in page_boxes] + [rel]
+
+    rebuilt = rebuild_page_boxes_from_rel(
+        pdf_bytes=pdf_bytes,
+        page_num=page_num,
+        rel_boxes=rel_boxes,
+        existing_boxes=page_boxes,
+    )
+
+    if rebuilt:
+        rebuilt[-1]["questionNumber"] = normalise_qnum(selected_qnum)
+        rebuilt[-1]["notes"] = notes.strip() or "Manual box"
+
+    set_boxes_for_page(page_num, rebuilt)
 
 # ── Question + mark scheme extraction ─────────────────────────────────────
 def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes) -> tuple[list[dict], list[str]]:
@@ -467,9 +500,9 @@ def create_airtable_records(token: str, base_id: str, table: str, records: list[
     return created
 
 # ── UI ────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Past Paper → Airtable (Question-first capture)", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Past Paper → Airtable (Rectangle capture)", page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable")
-st.caption("Extract questions, then capture graphs/diagrams straight onto the correct question.")
+st.caption("Extract questions, then draw rectangles to attach graphs, diagrams and tables to the correct question.")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN = get_secret("AIRTABLE_TOKEN")
@@ -529,8 +562,7 @@ if st.button("Load PDF", disabled=not paper_file):
     st.session_state["question_pages"] = pages
     st.session_state["selected_page"] = pages[0] if pages else 1
     st.session_state["manual_boxes_by_page"] = {}
-    for p in pages:
-        st.session_state[f"click_state_{p}"] = []
+    st.session_state["last_saved_rect_sig"] = ""
     st.success(f"Loaded PDF with {len(pages)} question pages.")
 
 # ── Step 2: Extract questions / mark scheme ──────────────────────────────
@@ -626,10 +658,14 @@ if "paper_bytes" in st.session_state:
                 state="complete"
             )
 
-# ── Step 3: Question-first image capture ──────────────────────────────────
+# ── Step 3: Rectangle capture ─────────────────────────────────────────────
 if "paper_bytes" in st.session_state:
     st.subheader("3 · Capture images by question")
-    st.caption("Select a question, then click two corners on the page. The crop is saved straight to that question.")
+    st.caption("Select a question, draw a rectangle over the graph or diagram, then save the latest rectangle.")
+
+    if st_canvas is None:
+        st.error("Install streamlit-drawable-canvas-fix to use rectangle drawing.")
+        st.stop()
 
     paper_bytes = st.session_state["paper_bytes"]
     pages = st.session_state.get("question_pages", [])
@@ -661,6 +697,8 @@ if "paper_bytes" in st.session_state:
                 placeholder="e.g. 2 or 2a"
             )
 
+        selected_qnum_norm = normalise_qnum(selected_question_for_capture)
+
         capture_notes = st.text_input(
             "Notes for new captures",
             key="capture_notes",
@@ -680,8 +718,6 @@ if "paper_bytes" in st.session_state:
             st.info("No question pages found.")
 
         all_boxes = get_all_boxes()
-        selected_qnum_norm = normalise_qnum(selected_question_for_capture)
-
         question_boxes = [
             b for b in all_boxes
             if normalise_qnum(b.get("questionNumber", "")) == selected_qnum_norm
@@ -715,6 +751,7 @@ if "paper_bytes" in st.session_state:
                             break
                     if removed:
                         break
+                st.session_state["last_saved_rect_sig"] = ""
                 st.rerun()
 
         with c2:
@@ -733,6 +770,7 @@ if "paper_bytes" in st.session_state:
                         b["boxIndex"] = i
                         b["name"] = f"p{page_num}_box{i}.png"
                     set_boxes_for_page(page_num, filtered)
+                st.session_state["last_saved_rect_sig"] = ""
                 st.rerun()
 
     with right:
@@ -746,84 +784,79 @@ if "paper_bytes" in st.session_state:
             display_w, display_h = display_pil.size
 
             page_boxes = get_boxes_for_page(selected_page)
-            preview_img = draw_boxes_on_preview(display_pil, page_boxes) if page_boxes else display_pil
+            preview_img = draw_boxes_on_preview(display_pil, page_boxes, selected_qnum_norm)
 
             st.markdown(f"### Page {selected_page}")
             st.markdown(f"**Current target question:** `{selected_qnum_norm or 'None'}`")
 
-            click_state_key = f"click_state_{selected_page}"
-            if click_state_key not in st.session_state:
-                st.session_state[click_state_key] = []
-
-            click = streamlit_image_coordinates(
-                preview_img,
-                key=f"page_click_{selected_page}_{len(page_boxes)}_{selected_qnum_norm}",
+            canvas_result = st_canvas(
+                fill_color="rgba(255, 0, 0, 0.15)",
+                stroke_width=2,
+                stroke_color="#ff0000",
+                background_image=preview_img,
+                update_streamlit=True,
+                height=display_h,
+                width=display_w,
+                drawing_mode="rect",
+                key=f"canvas_{selected_page}_{selected_qnum_norm}_{len(page_boxes)}",
             )
 
-            if click:
-                x = int(click["x"])
-                y = int(click["y"])
-                clicks = st.session_state[click_state_key]
-                point = (x, y)
+            latest_rect = extract_latest_rect_from_canvas(canvas_result)
 
-                if not clicks or clicks[-1] != point:
-                    clicks.append(point)
-
-                if len(clicks) > 2:
-                    clicks = clicks[-2:]
-
-                if len(clicks) == 2:
-                    (x1, y1), (x2, y2) = clicks[0], clicks[1]
-
-                    left_x = min(x1, x2)
-                    top_y = min(y1, y2)
-                    width = abs(x2 - x1)
-                    height = abs(y2 - y1)
-
-                    if width > 5 and height > 5 and selected_qnum_norm:
-                        rel = {
-                            "x": left_x / display_w,
-                            "y": top_y / display_h,
-                            "w": width / display_w,
-                            "h": height / display_h,
-                        }
-
-                        save_box_for_selected_question(
-                            pdf_bytes=paper_bytes,
-                            page_num=selected_page,
-                            rel=rel,
-                            selected_qnum=selected_qnum_norm,
-                            notes=capture_notes or "Manual box",
-                        )
-
-                        st.session_state[click_state_key] = []
-                        st.rerun()
-                    else:
-                        if not selected_qnum_norm:
-                            st.warning("Select a question first.")
-                        else:
-                            st.warning("Box is too small.")
-                        st.session_state[click_state_key] = []
-
-                else:
-                    st.session_state[click_state_key] = clicks
-
-            clicks = st.session_state[click_state_key]
-            if len(clicks) == 1:
-                st.info(f"First corner selected: {clicks[0]}. Click the opposite corner to save.")
+            if latest_rect:
+                st.info(
+                    f"Latest rectangle: x={int(latest_rect['left'])}, y={int(latest_rect['top'])}, "
+                    f"w={int(latest_rect['width'])}, h={int(latest_rect['height'])}"
+                )
 
             c3, c4 = st.columns(2)
+
             with c3:
-                if st.button("Reset current click", key="reset_current_click"):
-                    st.session_state[click_state_key] = []
-                    st.rerun()
+                can_save = latest_rect is not None and bool(selected_qnum_norm)
+                if st.button("Save latest rectangle", disabled=not can_save, key="save_latest_rectangle"):
+                    rect = latest_rect
+                    width = rect["width"]
+                    height = rect["height"]
+
+                    if width > 5 and height > 5:
+                        rel = {
+                            "x": rect["left"] / display_w,
+                            "y": rect["top"] / display_h,
+                            "w": rect["width"] / display_w,
+                            "h": rect["height"] / display_h,
+                        }
+
+                        rect_sig = (
+                            f"{selected_page}|{selected_qnum_norm}|"
+                            f"{round(rel['x'], 4)}|{round(rel['y'], 4)}|"
+                            f"{round(rel['w'], 4)}|{round(rel['h'], 4)}"
+                        )
+
+                        if rect_sig != st.session_state.get("last_saved_rect_sig", ""):
+                            save_box_for_selected_question(
+                                pdf_bytes=paper_bytes,
+                                page_num=selected_page,
+                                rel=rel,
+                                selected_qnum=selected_qnum_norm,
+                                notes=capture_notes or "Manual box",
+                            )
+                            st.session_state["last_saved_rect_sig"] = rect_sig
+                            st.success("Rectangle saved to selected question.")
+                            st.rerun()
+                        else:
+                            st.warning("That rectangle was already saved.")
+                    else:
+                        st.warning("Rectangle is too small.")
+
             with c4:
-                st.write(f"Image size: {display_w} × {display_h}")
+                st.write(f"Canvas size: {display_w} × {display_h}")
+
+            st.caption("Draw one rectangle at a time. After saving, the page refreshes and your crop appears in the question list on the left.")
 
 # ── Step 4: Review image assignments ──────────────────────────────────────
 if "paper_bytes" in st.session_state:
     st.subheader("4 · Review image assignments")
-    st.caption("Review or edit image-to-question assignments. New crops are now assigned when captured.")
+    st.caption("Review or edit image-to-question assignments.")
 
     all_boxes = get_all_boxes()
     st.write(f"Current saved visual crops: **{len(all_boxes)}**")
