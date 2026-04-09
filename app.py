@@ -518,7 +518,7 @@ with st.sidebar:
     USE_AI_MS_EXTRACTION = st.checkbox("Use AI for mark scheme extraction", value=True)
 
 if st_canvas is None:
-    st.error("Install `streamlit-drawable-canvas` to use this app.")
+    st.error("Install `streamlit-drawable-canvas-fix` to use this app.")
 
 # ── Step 1: Upload ────────────────────────────────────────────────────────
 st.subheader("1 · Upload PDFs")
@@ -628,7 +628,7 @@ if "paper_bytes" in st.session_state and st_canvas is not None:
             if st.button("Save canvas boxes", key=f"save_canvas_{selected_page}"):
                 rel_boxes = canvas_objects_to_rel_boxes(canvas_result, display_w, display_h)
                 rebuilt = rebuild_page_boxes_from_rel(
-                    paper_bytes=paper_bytes,
+                    pdf_bytes=paper_bytes,
                     page_num=selected_page,
                     rel_boxes=rel_boxes,
                     existing_boxes=page_boxes,
