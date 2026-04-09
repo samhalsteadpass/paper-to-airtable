@@ -1,5 +1,5 @@
 """
-app_v4.py  –  Past Paper → Airtable  (manual capture + AI assignment)
+app_v5.py  –  Past Paper → Airtable  (manual capture + AI assignment)
 =====================================================================
 Flow:
   1. Upload PDFs
