@@ -631,11 +631,38 @@ if "pdf" in st.session_state:
         left, right = st.columns([1, 2])
 
         with left:
-            sel_page = st.selectbox("Page", pages,
-                                    index=pages.index(
-                                        st.session_state.get("sel_page", pages[0]))
-                                    if st.session_state.get("sel_page") in pages else 0)
+            # Page navigation
+        pages = st.session_state.get("pages", [])
+        if pages:
+            if "sel_page_idx" not in st.session_state:
+                st.session_state["sel_page_idx"] = 0
+            idx = st.session_state["sel_page_idx"]
+            idx = max(0, min(idx, len(pages) - 1))
+
+            nav1, nav2, nav3 = st.columns([1, 2, 1])
+            with nav1:
+                if st.button("◀ Prev", disabled=idx == 0):
+                    st.session_state["sel_page_idx"] = idx - 1
+                    st.session_state[f"clicks_{pages[idx]}"] = []
+                    st.rerun()
+            with nav2:
+                st.markdown(
+                    f"<div style='text-align:center;padding:6px 0;font-weight:500'>"
+                    f"Page {pages[idx]} of {pages[-1]} "
+                    f"<span style='color:var(--color-text-secondary);font-weight:400'>"
+                    f"({idx+1}/{len(pages)})</span></div>",
+                    unsafe_allow_html=True)
+            with nav3:
+                if st.button("Next ▶", disabled=idx == len(pages) - 1):
+                    st.session_state["sel_page_idx"] = idx + 1
+                    st.session_state[f"clicks_{pages[idx]}"] = []
+                    st.rerun()
+
+            sel_page = pages[idx]
             st.session_state["sel_page"] = sel_page
+        else:
+            sel_page = 1
+            st.info("Load a PDF first.")
 
             # Assignment mode
             mode = st.radio("Assignment", ["AI suggest", "Manual"],
@@ -646,7 +673,12 @@ if "pdf" in st.session_state:
                     normalise_qnum(r.get("questionNumber", "")) for r in records))
                 manual_qnum = st.selectbox("Question", qnums)
 
-            notes_input = st.text_input("Notes", placeholder="e.g. diagram, table")
+            notes_input = st.text_input(
+                "Notes (label this crop before drawing)",
+                key="notes_input",
+                placeholder="e.g. cone diagram, price table"
+            )
+            st.caption("Type a note then draw the box — the note is saved with each crop.")
 
             # Current page boxes
             pb = page_boxes(sel_page)
@@ -721,7 +753,7 @@ if "pdf" in st.session_state:
                         }
                         qn_for_box = normalise_qnum(manual_qnum) if mode == "Manual" else ""
                         box = add_box(pdf, sel_page, rel, qnum=qn_for_box,
-                                       notes=notes_input.strip() or "manual")
+                                       notes=st.session_state.get("notes_input", "").strip() or "manual")
 
                         # AI assign
                         if mode == "AI suggest" and OPENAI_KEY and records:
