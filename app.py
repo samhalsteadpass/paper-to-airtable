@@ -789,16 +789,20 @@ if "paper_bytes" in st.session_state:
             st.markdown(f"### Page {selected_page}")
             st.markdown(f"**Current target question:** `{selected_qnum_norm or 'None'}`")
 
+            canvas_bg = preview_img.convert("RGBA")
+
             canvas_result = st_canvas(
                 fill_color="rgba(255, 0, 0, 0.15)",
                 stroke_width=2,
                 stroke_color="#ff0000",
-                background_image=preview_img,
+                background_color="rgba(0,0,0,0)",
+                background_image=canvas_bg,
                 update_streamlit=True,
-                height=display_h,
-                width=display_w,
+                height=canvas_bg.height,
+                width=canvas_bg.width,
                 drawing_mode="rect",
-                key=f"canvas_{selected_page}_{selected_qnum_norm}_{len(page_boxes)}",
+                display_toolbar=True,
+                key=f"canvas_{selected_page}_{selected_qnum_norm}",
             )
 
             latest_rect = extract_latest_rect_from_canvas(canvas_result)
