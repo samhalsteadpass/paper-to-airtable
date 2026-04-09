@@ -629,8 +629,9 @@ if "pdf" in st.session_state:
 # ── 3. Capture ─────────────────────────────────────────────────────────────
 if "pdf" in st.session_state:
     st.subheader("3 · Capture visuals")
-    st.caption("Click two corners on the page to draw a box. "
-               "AI suggests the question assignment automatically.")
+    st.caption("① Optional: type a crop label in the left panel  "
+               "② Click two corners on the page image to draw a box  "
+               "③ AI instantly suggests which question it belongs to")
 
     pdf     = st.session_state["pdf"]
     pages   = st.session_state.get("pages", [])
@@ -671,19 +672,35 @@ if "pdf" in st.session_state:
                     st.rerun()
 
             # ── Assignment mode ───────────────────────────────────────────
-            mode        = st.radio("Assignment", ["AI suggest", "Manual"], horizontal=True)
+            mode        = st.radio("Assignment mode", ["AI suggest", "Manual"],
+                                   horizontal=True,
+                                   help="AI suggest: GPT picks the question automatically. "
+                                        "Manual: you pick from the list below.")
             manual_qnum = ""
-            if mode == "Manual" and records:
-                qnums       = list(dict.fromkeys(
-                    normalise_qnum(r.get("questionNumber", "")) for r in records))
-                manual_qnum = st.selectbox("Question", qnums)
+            if mode == "Manual":
+                if records:
+                    qnums       = list(dict.fromkeys(
+                        normalise_qnum(r.get("questionNumber", "")) for r in records))
+                    manual_qnum = st.selectbox(
+                        "Assign box to question",
+                        qnums,
+                        help="Select the question this crop belongs to before drawing the box.",
+                    )
+                else:
+                    st.info("Run Extract first so questions are available to assign.")
 
+            # ── Notes ─────────────────────────────────────────────────────
+            st.divider()
+            st.markdown("**📝 Crop label** *(optional)*")
+            st.caption("Type a short label, then draw the box on the right. "
+                       "The label is saved with the crop.")
             st.text_input(
-                "Notes (label this crop before drawing)",
+                "Label for next crop",
                 key="notes_input",
-                placeholder="e.g. cone diagram, price table",
+                placeholder="e.g. cone diagram · price table · graph Q3",
+                label_visibility="collapsed",
             )
-            st.caption("Type a note then draw the box — the note is saved with each crop.")
+            st.divider()
 
             # ── Current page boxes ────────────────────────────────────────
             pb = page_boxes(sel_page)
