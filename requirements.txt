@@ -5,3 +5,8 @@ requests
 pdf2image
 pytesseract
 airtable-python-wrapper
+streamlit-drawable-canvas
+PyMuPDF
+pandas
+requests
+openai
