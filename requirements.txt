@@ -5,3 +5,4 @@ pandas
 pillow
 requests
 openai
+streamlit-drawable-canvas-fix
