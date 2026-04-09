@@ -12,11 +12,7 @@ import requests
 import streamlit as st
 from PIL import Image, ImageDraw
 from openai import OpenAI
-
-try:
-    from streamlit_drawable_canvas import st_canvas
-except Exception:
-    st_canvas = None
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ── Config ────────────────────────────────────────────────────────────────
 TEXT_MODEL = "gpt-4.1-mini"
@@ -30,6 +26,9 @@ JPEG_QUALITY = 70
 RENDER_DPI = 150
 EXTRACT_DPI = 300
 CANVAS_MAX_WIDTH = 950
+
+AUTO_ASSIGN_HIGH_CONF_ONLY = True
+AUTO_ASSIGN_CONFIDENCE_VALUES = {"high"}
 
 AT_API = "https://api.airtable.com/v0"
 AT_META = "https://api.airtable.com/v0/meta"
@@ -90,6 +89,27 @@ Each element must be:
   "questionNumber": "1a",
   "markSchemeAnswer": "Full acceptable answer, notes, working, allow/reject guidance and key words"
 }
+"""
+
+IMAGE_ASSIGN_PROMPT_TEMPLATE = """You are matching a cropped exam image to the most likely question.
+
+Return ONLY raw JSON in this exact shape:
+{
+  "questionNumber": "2a",
+  "confidence": "high",
+  "notes": "Short reason"
+}
+
+Confidence must be one of: high, medium, low.
+
+Candidate questions:
+{candidate_block}
+
+Rules:
+- Choose the single best matching questionNumber from the candidates.
+- Use visual clues like graph titles, labels, tables, diagrams, nearby wording inside the crop, or figure numbering.
+- If the crop is too ambiguous, still choose the best candidate but set confidence to low.
+- Keep notes short.
 """
 
 # ── Secrets ───────────────────────────────────────────────────────────────
@@ -256,45 +276,19 @@ def draw_boxes_on_preview(image: Image.Image, boxes: list[dict], selected_qnum: 
         y1 = y0 + rel["h"] * img.height
 
         qn = normalise_qnum(box.get("questionNumber", ""))
-        outline = "red" if not selected_qnum or qn == selected_qnum else "orange"
+        outline = "red" if selected_qnum and qn == selected_qnum else "orange"
         draw.rectangle([x0, y0, x1, y1], outline=outline, width=3)
 
         label = str(box.get("boxIndex", ""))
         if label:
             tx0 = x0 + 2
             ty0 = max(0, y0 - 18)
-            tx1 = tx0 + 28
+            tx1 = tx0 + 26
             ty1 = ty0 + 16
             draw.rectangle([tx0, ty0, tx1, ty1], fill=outline)
             draw.text((tx0 + 4, ty0 + 1), label, fill="white")
 
     return img
-
-def extract_latest_rect_from_canvas(canvas_result) -> dict | None:
-    if not canvas_result or not getattr(canvas_result, "json_data", None):
-        return None
-
-    objects = canvas_result.json_data.get("objects", []) or []
-    rects = [obj for obj in objects if obj.get("type") == "rect"]
-    if not rects:
-        return None
-
-    obj = rects[-1]
-
-    left = float(obj.get("left", 0))
-    top = float(obj.get("top", 0))
-    width = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
-    height = float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
-
-    if width <= 0 or height <= 0:
-        return None
-
-    return {
-        "left": left,
-        "top": top,
-        "width": width,
-        "height": height,
-    }
 
 # ── Manual box store ──────────────────────────────────────────────────────
 def get_manual_boxes() -> dict[int, list[dict]]:
@@ -317,9 +311,16 @@ def rebuild_page_boxes_from_rel(pdf_bytes: bytes, page_num: int, rel_boxes: list
 
         prev_qnum = ""
         prev_notes = "Manual box"
+        prev_ai_qnum = ""
+        prev_ai_conf = ""
+        prev_ai_notes = ""
         if i - 1 < len(existing_boxes):
-            prev_qnum = existing_boxes[i - 1].get("questionNumber", "")
-            prev_notes = existing_boxes[i - 1].get("notes", "Manual box")
+            old = existing_boxes[i - 1]
+            prev_qnum = old.get("questionNumber", "")
+            prev_notes = old.get("notes", "Manual box")
+            prev_ai_qnum = old.get("aiQuestionNumber", "")
+            prev_ai_conf = old.get("aiConfidence", "")
+            prev_ai_notes = old.get("aiNotes", "")
 
         rebuilt.append({
             "page": page_num,
@@ -330,6 +331,9 @@ def rebuild_page_boxes_from_rel(pdf_bytes: bytes, page_num: int, rel_boxes: list
             "width": pil.width,
             "height": pil.height,
             "questionNumber": prev_qnum,
+            "aiQuestionNumber": prev_ai_qnum,
+            "aiConfidence": prev_ai_conf,
+            "aiNotes": prev_ai_notes,
             "kind": "",
             "confidence": "",
             "notes": prev_notes,
@@ -344,28 +348,12 @@ def get_all_boxes() -> list[dict]:
         all_boxes.extend(store[page])
     return all_boxes
 
-def save_box_for_selected_question(
-    pdf_bytes: bytes,
-    page_num: int,
-    rel: dict,
-    selected_qnum: str,
-    notes: str = "Manual box",
-):
+def reindex_page_boxes(page_num: int):
     page_boxes = get_boxes_for_page(page_num)
-    rel_boxes = [b["rel_bbox"] for b in page_boxes] + [rel]
-
-    rebuilt = rebuild_page_boxes_from_rel(
-        pdf_bytes=pdf_bytes,
-        page_num=page_num,
-        rel_boxes=rel_boxes,
-        existing_boxes=page_boxes,
-    )
-
-    if rebuilt:
-        rebuilt[-1]["questionNumber"] = normalise_qnum(selected_qnum)
-        rebuilt[-1]["notes"] = notes.strip() or "Manual box"
-
-    set_boxes_for_page(page_num, rebuilt)
+    for i, b in enumerate(page_boxes, 1):
+        b["boxIndex"] = i
+        b["name"] = f"p{page_num}_box{i}.png"
+    set_boxes_for_page(page_num, page_boxes)
 
 # ── Question + mark scheme extraction ─────────────────────────────────────
 def extract_questions_parallel(client: OpenAI, pdf_bytes: bytes) -> tuple[list[dict], list[str]]:
@@ -434,6 +422,91 @@ def extract_markscheme_parallel(client: OpenAI, pdf_bytes: bytes) -> tuple[dict[
         ms_map.update(ordered.get(i, {}))
     return ms_map, logs
 
+# ── AI image assignment ───────────────────────────────────────────────────
+def candidate_questions_for_image(records: list[dict], page_num: int) -> list[dict]:
+    same_page = [r for r in records if clamp_int(r.get("pageNumber", 0), 0) == page_num]
+    nearby = [r for r in records if clamp_int(r.get("pageNumber", 0), 0) in {page_num - 1, page_num + 1}]
+
+    candidates = same_page[:]
+    seen = {normalise_qnum(r.get("questionNumber", "")) for r in candidates}
+
+    for r in nearby:
+        qn = normalise_qnum(r.get("questionNumber", ""))
+        if qn and qn not in seen:
+            candidates.append(r)
+            seen.add(qn)
+
+    if not candidates:
+        candidates = records[:20]
+
+    return candidates[:25]
+
+def build_candidate_block(candidates: list[dict]) -> str:
+    parts = []
+    for r in candidates:
+        qn = normalise_qnum(r.get("questionNumber", ""))
+        page = clamp_int(r.get("pageNumber", 0), 0)
+        qtext = str(r.get("questionText", "") or "").strip()
+        qtext = re.sub(r"\s+", " ", qtext)
+        qtext = qtext[:500]
+        parts.append(f"- {qn} | page {page} | {qtext}")
+    return "\n".join(parts)
+
+def ai_assign_image_to_question(client: OpenAI, box: dict, records: list[dict]) -> dict:
+    page_num = clamp_int(box.get("page", 0), 0)
+    candidates = candidate_questions_for_image(records, page_num)
+    if not candidates:
+        return {"questionNumber": "", "confidence": "low", "notes": "No candidate questions available."}
+
+    prompt = IMAGE_ASSIGN_PROMPT_TEMPLATE.format(
+        candidate_block=build_candidate_block(candidates)
+    )
+
+    img = Image.open(io.BytesIO(box["data"])).convert("RGB")
+    content = [
+        {"type": "input_text", "text": prompt},
+        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{encode_pil(img)}"},
+    ]
+
+    raw = call_gpt(client, content, TEXT_MODEL, max_output_tokens=500)
+    parsed = safe_json_loads(raw, {})
+
+    qn = normalise_qnum(parsed.get("questionNumber", ""))
+    conf = str(parsed.get("confidence", "") or "").strip().lower()
+    notes = str(parsed.get("notes", "") or "").strip()
+
+    valid_qnums = {normalise_qnum(r.get("questionNumber", "")) for r in candidates}
+    if qn not in valid_qnums:
+        qn = ""
+        conf = "low"
+        notes = (notes + " " if notes else "") + "Model returned a question outside the candidate set."
+
+    if conf not in {"high", "medium", "low"}:
+        conf = "low"
+
+    return {
+        "questionNumber": qn,
+        "confidence": conf,
+        "notes": notes or "No reason given.",
+    }
+
+def assign_ai_to_box_in_store(page_num: int, box_index: int, result: dict):
+    page_boxes = get_boxes_for_page(page_num)
+    for b in page_boxes:
+        if b["boxIndex"] == box_index:
+            b["aiQuestionNumber"] = normalise_qnum(result.get("questionNumber", ""))
+            b["aiConfidence"] = str(result.get("confidence", "") or "").strip().lower()
+            b["aiNotes"] = str(result.get("notes", "") or "")
+            auto_qn = b["aiQuestionNumber"]
+            auto_conf = b["aiConfidence"]
+            if auto_qn and (
+                (AUTO_ASSIGN_HIGH_CONF_ONLY and auto_conf in AUTO_ASSIGN_CONFIDENCE_VALUES)
+                or (not AUTO_ASSIGN_HIGH_CONF_ONLY)
+            ):
+                b["questionNumber"] = auto_qn
+            break
+    set_boxes_for_page(page_num, page_boxes)
+
 # ── Airtable helpers ──────────────────────────────────────────────────────
 def at_headers(token: str):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -500,9 +573,9 @@ def create_airtable_records(token: str, base_id: str, table: str, records: list[
     return created
 
 # ── UI ────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Past Paper → Airtable (Rectangle capture)", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Past Paper → Airtable (AI image assignment)", page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable")
-st.caption("Extract questions, then draw rectangles to attach graphs, diagrams and tables to the correct question.")
+st.caption("Extract questions, double-click to capture images, and use AI to suggest which question each image belongs to.")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN = get_secret("AIRTABLE_TOKEN")
@@ -536,6 +609,11 @@ with st.sidebar:
     AT_TABLE = st.text_input("Table name", value="Questions")
     USE_AI_QUESTION_EXTRACTION = st.checkbox("Use AI for question extraction", value=True)
     USE_AI_MS_EXTRACTION = st.checkbox("Use AI for mark scheme extraction", value=True)
+    USE_AI_IMAGE_ASSIGNMENT = st.checkbox("Use AI to assign images to questions", value=True)
+    ONLY_AUTO_ASSIGN_HIGH = st.checkbox("Only auto-assign high-confidence image matches", value=True)
+
+# respect UI checkbox
+AUTO_ASSIGN_HIGH_CONF_ONLY = ONLY_AUTO_ASSIGN_HIGH
 
 # ── Step 1: Upload ────────────────────────────────────────────────────────
 st.subheader("1 · Upload PDFs")
@@ -562,7 +640,8 @@ if st.button("Load PDF", disabled=not paper_file):
     st.session_state["question_pages"] = pages
     st.session_state["selected_page"] = pages[0] if pages else 1
     st.session_state["manual_boxes_by_page"] = {}
-    st.session_state["last_saved_rect_sig"] = ""
+    for p in pages:
+        st.session_state[f"click_state_{p}"] = []
     st.success(f"Loaded PDF with {len(pages)} question pages.")
 
 # ── Step 2: Extract questions / mark scheme ──────────────────────────────
@@ -573,7 +652,6 @@ if "paper_bytes" in st.session_state:
         paper_bytes = st.session_state["paper_bytes"]
         ms_bytes = ms_file.read() if ms_file else None
         client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
-
         all_boxes = get_all_boxes()
 
         with st.status("Processing…", expanded=True) as status:
@@ -622,82 +700,55 @@ if "paper_bytes" in st.session_state:
                         "images": [],
                     })
 
-                q_to_imgs = {}
-                q_to_notes = {}
-                for b in all_boxes:
-                    qn = normalise_qnum(b.get("questionNumber", ""))
-                    if qn:
-                        q_to_imgs.setdefault(qn, []).append(b["name"])
-                        q_to_notes.setdefault(qn, []).append(f"{b['name']}: {b.get('notes', '')}")
-
-                for r in records:
-                    qn = r["questionNumber"]
-                    imgs = q_to_imgs.get(qn, [])
-                    notes = q_to_notes.get(qn, [])
-                    if imgs:
-                        r["hasImages"] = True
-                        r["images"] = imgs
-                        r["imageMappingConfidence"] = "manual"
-                        r["imageMappingNotes"] = "\n".join(notes)
-
             st.session_state["records"] = records
             st.session_state["images"] = all_boxes
 
-            if records:
-                extracted_qnums = [
-                    normalise_qnum(r.get("questionNumber", ""))
-                    for r in records
-                    if normalise_qnum(r.get("questionNumber", ""))
-                ]
-                extracted_qnums = list(dict.fromkeys(extracted_qnums))
-                if extracted_qnums and "selected_question_for_capture" not in st.session_state:
-                    st.session_state["selected_question_for_capture"] = extracted_qnums[0]
-
             status.update(
-                label=f"✅ Done — {len(records)} questions · {len(all_boxes)} visuals",
+                label=f"✅ Done — {len(records)} questions",
                 state="complete"
             )
 
-# ── Step 3: Rectangle capture ─────────────────────────────────────────────
+# ── Step 3: Double-click autosave capture ────────────────────────────────
 if "paper_bytes" in st.session_state:
-    st.subheader("3 · Capture images by question")
-    st.caption("Select a question, draw a rectangle over the graph or diagram, then save the latest rectangle.")
-
-    if st_canvas is None:
-        st.error("Install streamlit-drawable-canvas-fix to use rectangle drawing.")
-        st.stop()
+    st.subheader("3 · Capture images")
+    st.caption("Choose a question manually, or leave AI to suggest the question after each crop is saved.")
 
     paper_bytes = st.session_state["paper_bytes"]
     pages = st.session_state.get("question_pages", [])
+    records = st.session_state.get("records", [])
 
-    extracted_qnums = []
-    if "records" in st.session_state:
-        extracted_qnums = [
-            normalise_qnum(r.get("questionNumber", ""))
-            for r in st.session_state.get("records", [])
-            if normalise_qnum(r.get("questionNumber", ""))
-        ]
-        extracted_qnums = list(dict.fromkeys(extracted_qnums))
+    extracted_qnums = [
+        normalise_qnum(r.get("questionNumber", ""))
+        for r in records
+        if normalise_qnum(r.get("questionNumber", ""))
+    ]
+    extracted_qnums = list(dict.fromkeys(extracted_qnums))
 
     left, right = st.columns([1, 2])
 
     with left:
-        st.markdown("### Selected question")
+        assignment_mode = st.radio(
+            "Assignment mode",
+            options=["AI suggest", "Manual select"],
+            index=0 if USE_AI_IMAGE_ASSIGNMENT else 1,
+            horizontal=False,
+        )
 
-        if extracted_qnums:
-            selected_question_for_capture = st.selectbox(
-                "Question",
-                options=extracted_qnums,
-                key="selected_question_for_capture",
-            )
+        if assignment_mode == "Manual select":
+            if extracted_qnums:
+                selected_question_for_capture = st.selectbox(
+                    "Question",
+                    options=extracted_qnums,
+                    key="selected_question_for_capture",
+                )
+            else:
+                selected_question_for_capture = st.text_input(
+                    "Question number",
+                    key="selected_question_for_capture_manual",
+                    placeholder="e.g. 2 or 2a"
+                )
         else:
-            selected_question_for_capture = st.text_input(
-                "Question number",
-                key="selected_question_for_capture_manual",
-                placeholder="e.g. 2 or 2a"
-            )
-
-        selected_qnum_norm = normalise_qnum(selected_question_for_capture)
+            selected_question_for_capture = ""
 
         capture_notes = st.text_input(
             "Notes for new captures",
@@ -717,60 +768,33 @@ if "paper_bytes" in st.session_state:
             selected_page = 1
             st.info("No question pages found.")
 
-        all_boxes = get_all_boxes()
-        question_boxes = [
-            b for b in all_boxes
-            if normalise_qnum(b.get("questionNumber", "")) == selected_qnum_norm
-        ]
+        page_boxes = get_boxes_for_page(selected_page)
+        st.markdown(f"**Saved boxes on this page:** {len(page_boxes)}")
 
-        st.markdown(f"**Images linked to Q{selected_qnum_norm or '?'}:** {len(question_boxes)}")
-
-        for box in question_boxes:
-            caption = f"{box['name']} (p{box['page']})"
-            st.image(box["data"], caption=caption, use_container_width=True)
+        for box in page_boxes:
+            qnum = box.get("questionNumber", "")
+            ai_q = box.get("aiQuestionNumber", "")
+            ai_c = box.get("aiConfidence", "")
+            if qnum:
+                label = f"{box['name']} → Q{qnum}"
+            elif ai_q:
+                label = f"{box['name']} → AI {ai_q} ({ai_c})"
+            else:
+                label = box["name"]
+            st.image(box["data"], caption=label, use_container_width=True)
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button(
-                "Undo last for this question",
-                disabled=not question_boxes,
-                key="undo_last_for_question"
-            ):
-                store = get_manual_boxes()
-                removed = False
-                for page_num in sorted(store.keys(), reverse=True):
-                    page_boxes = store[page_num]
-                    for idx in range(len(page_boxes) - 1, -1, -1):
-                        if normalise_qnum(page_boxes[idx].get("questionNumber", "")) == selected_qnum_norm:
-                            del page_boxes[idx]
-                            for i, b in enumerate(page_boxes, 1):
-                                b["boxIndex"] = i
-                                b["name"] = f"p{page_num}_box{i}.png"
-                            set_boxes_for_page(page_num, page_boxes)
-                            removed = True
-                            break
-                    if removed:
-                        break
-                st.session_state["last_saved_rect_sig"] = ""
+            if st.button("Clear page boxes", disabled=not page_boxes):
+                set_boxes_for_page(selected_page, [])
+                st.session_state[f"click_state_{selected_page}"] = []
                 st.rerun()
-
         with c2:
-            if st.button(
-                "Clear this question",
-                disabled=not question_boxes,
-                key="clear_this_question"
-            ):
-                store = get_manual_boxes()
-                for page_num, page_boxes in store.items():
-                    filtered = [
-                        b for b in page_boxes
-                        if normalise_qnum(b.get("questionNumber", "")) != selected_qnum_norm
-                    ]
-                    for i, b in enumerate(filtered, 1):
-                        b["boxIndex"] = i
-                        b["name"] = f"p{page_num}_box{i}.png"
-                    set_boxes_for_page(page_num, filtered)
-                st.session_state["last_saved_rect_sig"] = ""
+            if st.button("Undo last box", disabled=not page_boxes):
+                page_boxes = get_boxes_for_page(selected_page)
+                page_boxes = page_boxes[:-1]
+                set_boxes_for_page(selected_page, page_boxes)
+                reindex_page_boxes(selected_page)
                 st.rerun()
 
     with right:
@@ -782,85 +806,161 @@ if "paper_bytes" in st.session_state:
                 dpi=RENDER_DPI
             )
             display_w, display_h = display_pil.size
-
+            selected_qnum_norm = normalise_qnum(selected_question_for_capture)
             page_boxes = get_boxes_for_page(selected_page)
             preview_img = draw_boxes_on_preview(display_pil, page_boxes, selected_qnum_norm)
 
             st.markdown(f"### Page {selected_page}")
-            st.markdown(f"**Current target question:** `{selected_qnum_norm or 'None'}`")
+            click_state_key = f"click_state_{selected_page}"
+            if click_state_key not in st.session_state:
+                st.session_state[click_state_key] = []
 
-            canvas_bg = preview_img.convert("RGBA")
-
-            canvas_result = st_canvas(
-                fill_color="rgba(255, 0, 0, 0.15)",
-                stroke_width=2,
-                stroke_color="#ff0000",
-                background_color="rgba(0,0,0,0)",
-                background_image=canvas_bg,
-                update_streamlit=True,
-                height=canvas_bg.height,
-                width=canvas_bg.width,
-                drawing_mode="rect",
-                display_toolbar=True,
-                key=f"canvas_{selected_page}_{selected_qnum_norm}",
+            click = streamlit_image_coordinates(
+                preview_img,
+                key=f"page_click_{selected_page}_{len(page_boxes)}_{selected_qnum_norm}_{assignment_mode}",
             )
 
-            latest_rect = extract_latest_rect_from_canvas(canvas_result)
+            if click:
+                x = int(click["x"])
+                y = int(click["y"])
+                clicks = st.session_state[click_state_key]
+                point = (x, y)
 
-            if latest_rect:
-                st.info(
-                    f"Latest rectangle: x={int(latest_rect['left'])}, y={int(latest_rect['top'])}, "
-                    f"w={int(latest_rect['width'])}, h={int(latest_rect['height'])}"
-                )
+                if not clicks or clicks[-1] != point:
+                    clicks.append(point)
 
-            c3, c4 = st.columns(2)
+                if len(clicks) > 2:
+                    clicks = clicks[-2:]
 
-            with c3:
-                can_save = latest_rect is not None and bool(selected_qnum_norm)
-                if st.button("Save latest rectangle", disabled=not can_save, key="save_latest_rectangle"):
-                    rect = latest_rect
-                    width = rect["width"]
-                    height = rect["height"]
+                if len(clicks) == 2:
+                    (x1, y1), (x2, y2) = clicks[0], clicks[1]
+
+                    left_x = min(x1, x2)
+                    top_y = min(y1, y2)
+                    width = abs(x2 - x1)
+                    height = abs(y2 - y1)
 
                     if width > 5 and height > 5:
                         rel = {
-                            "x": rect["left"] / display_w,
-                            "y": rect["top"] / display_h,
-                            "w": rect["width"] / display_w,
-                            "h": rect["height"] / display_h,
+                            "x": left_x / display_w,
+                            "y": top_y / display_h,
+                            "w": width / display_w,
+                            "h": height / display_h,
                         }
 
-                        rect_sig = (
-                            f"{selected_page}|{selected_qnum_norm}|"
-                            f"{round(rel['x'], 4)}|{round(rel['y'], 4)}|"
-                            f"{round(rel['w'], 4)}|{round(rel['h'], 4)}"
+                        rel_boxes = [b["rel_bbox"] for b in page_boxes] + [rel]
+                        rebuilt = rebuild_page_boxes_from_rel(
+                            pdf_bytes=paper_bytes,
+                            page_num=selected_page,
+                            rel_boxes=rel_boxes,
+                            existing_boxes=page_boxes,
                         )
 
-                        if rect_sig != st.session_state.get("last_saved_rect_sig", ""):
-                            save_box_for_selected_question(
-                                pdf_bytes=paper_bytes,
-                                page_num=selected_page,
-                                rel=rel,
-                                selected_qnum=selected_qnum_norm,
-                                notes=capture_notes or "Manual box",
-                            )
-                            st.session_state["last_saved_rect_sig"] = rect_sig
-                            st.success("Rectangle saved to selected question.")
-                            st.rerun()
-                        else:
-                            st.warning("That rectangle was already saved.")
+                        if rebuilt:
+                            new_box = rebuilt[-1]
+                            new_box["notes"] = capture_notes.strip() or "Manual box"
+
+                            if assignment_mode == "Manual select":
+                                new_box["questionNumber"] = selected_qnum_norm
+                            else:
+                                new_box["questionNumber"] = ""
+                                new_box["aiQuestionNumber"] = ""
+                                new_box["aiConfidence"] = ""
+                                new_box["aiNotes"] = ""
+
+                        set_boxes_for_page(selected_page, rebuilt)
+
+                        # AI assign after save
+                        if (
+                            assignment_mode == "AI suggest"
+                            and USE_AI_IMAGE_ASSIGNMENT
+                            and OPENAI_KEY
+                            and records
+                        ):
+                            try:
+                                client = OpenAI(api_key=OPENAI_KEY)
+                                page_boxes = get_boxes_for_page(selected_page)
+                                latest_box = page_boxes[-1]
+                                result = ai_assign_image_to_question(client, latest_box, records)
+                                assign_ai_to_box_in_store(selected_page, latest_box["boxIndex"], result)
+                                st.success(
+                                    f"Box saved. AI suggested {result.get('questionNumber') or 'none'} "
+                                    f"({result.get('confidence', 'low')})."
+                                )
+                            except Exception as e:
+                                st.warning(f"Box saved, but AI assignment failed: {e}")
+
+                        st.session_state[click_state_key] = []
+                        st.rerun()
                     else:
-                        st.warning("Rectangle is too small.")
+                        st.warning("Box is too small.")
+                        st.session_state[click_state_key] = []
+                else:
+                    st.session_state[click_state_key] = clicks
 
+            clicks = st.session_state[click_state_key]
+            if len(clicks) == 1:
+                st.info(f"First corner selected: {clicks[0]}. Click the opposite corner to autosave.")
+
+            c3, c4 = st.columns(2)
+            with c3:
+                if st.button("Reset current click"):
+                    st.session_state[click_state_key] = []
+                    st.rerun()
             with c4:
-                st.write(f"Canvas size: {display_w} × {display_h}")
+                st.write(f"Image size: {display_w} × {display_h}")
 
-            st.caption("Draw one rectangle at a time. After saving, the page refreshes and your crop appears in the question list on the left.")
+# ── Step 4: Bulk AI assign unassigned boxes ───────────────────────────────
+if "paper_bytes" in st.session_state and st.session_state.get("records"):
+    st.subheader("4 · AI assign unassigned images")
+    st.caption("Run AI matching across saved images that do not yet have a final question number.")
 
-# ── Step 4: Review image assignments ──────────────────────────────────────
+    all_boxes = get_all_boxes()
+    unassigned_count = sum(1 for b in all_boxes if not normalise_qnum(b.get("questionNumber", "")))
+    st.write(f"Unassigned images: **{unassigned_count}**")
+
+    if st.button("AI assign all unassigned images", disabled=not unassigned_count):
+        if not OPENAI_KEY:
+            st.error("OpenAI key is required for AI image assignment.")
+        else:
+            client = OpenAI(api_key=OPENAI_KEY)
+            records = st.session_state.get("records", [])
+            done = 0
+            failed = 0
+
+            with st.status("Assigning images…", expanded=True) as status:
+                store = get_manual_boxes()
+                for page_num in sorted(store.keys()):
+                    page_boxes = store[page_num]
+                    for b in page_boxes:
+                        if normalise_qnum(b.get("questionNumber", "")):
+                            continue
+                        try:
+                            result = ai_assign_image_to_question(client, b, records)
+                            b["aiQuestionNumber"] = result["questionNumber"]
+                            b["aiConfidence"] = result["confidence"]
+                            b["aiNotes"] = result["notes"]
+                            if result["questionNumber"] and (
+                                (AUTO_ASSIGN_HIGH_CONF_ONLY and result["confidence"] in AUTO_ASSIGN_CONFIDENCE_VALUES)
+                                or (not AUTO_ASSIGN_HIGH_CONF_ONLY)
+                            ):
+                                b["questionNumber"] = result["questionNumber"]
+                            done += 1
+                            st.write(
+                                f"Page {page_num}, box {b['boxIndex']}: "
+                                f"{result['questionNumber'] or 'none'} ({result['confidence']})"
+                            )
+                        except Exception as e:
+                            failed += 1
+                            st.write(f"Page {page_num}, box {b['boxIndex']}: failed — {e}")
+                    set_boxes_for_page(page_num, page_boxes)
+
+                status.update(label=f"✅ Done — {done} processed, {failed} failed", state="complete")
+
+# ── Step 5: Review image assignments ──────────────────────────────────────
 if "paper_bytes" in st.session_state:
-    st.subheader("4 · Review image assignments")
-    st.caption("Review or edit image-to-question assignments.")
+    st.subheader("5 · Review image assignments")
+    st.caption("You can override AI suggestions here before export.")
 
     all_boxes = get_all_boxes()
     st.write(f"Current saved visual crops: **{len(all_boxes)}**")
@@ -872,23 +972,35 @@ if "paper_bytes" in st.session_state:
                 "Page": b["page"],
                 "Box #": b["boxIndex"],
                 "Image Name": b["name"],
-                "Question Number": b.get("questionNumber", ""),
+                "Final Question Number": b.get("questionNumber", ""),
+                "AI Suggested Question": b.get("aiQuestionNumber", ""),
+                "AI Confidence": b.get("aiConfidence", ""),
+                "AI Notes": b.get("aiNotes", ""),
                 "Notes": b.get("notes", ""),
             })
 
         map_df = pd.DataFrame(rows)
-        edited_map_df = st.data_editor(map_df, use_container_width=True, num_rows="fixed", height=360)
+        edited_map_df = st.data_editor(map_df, use_container_width=True, num_rows="fixed", height=420)
 
         if st.button("Save image assignments"):
             by_page = {}
             for _, row in edited_map_df.iterrows():
                 page = int(row["Page"])
                 box_index = int(row["Box #"])
-                qnum = normalise_qnum(row["Question Number"])
+                final_qnum = normalise_qnum(row["Final Question Number"])
+                ai_qnum = normalise_qnum(row["AI Suggested Question"])
+                ai_conf = str(row["AI Confidence"] or "").strip().lower()
+                ai_notes = str(row["AI Notes"] or "")
                 notes = str(row["Notes"] or "")
 
                 by_page.setdefault(page, {})
-                by_page[page][box_index] = {"questionNumber": qnum, "notes": notes}
+                by_page[page][box_index] = {
+                    "questionNumber": final_qnum,
+                    "aiQuestionNumber": ai_qnum,
+                    "aiConfidence": ai_conf,
+                    "aiNotes": ai_notes,
+                    "notes": notes,
+                }
 
             store = get_manual_boxes()
             for page, page_boxes in store.items():
@@ -896,36 +1008,32 @@ if "paper_bytes" in st.session_state:
                     idx = box["boxIndex"]
                     if page in by_page and idx in by_page[page]:
                         box["questionNumber"] = by_page[page][idx]["questionNumber"]
+                        box["aiQuestionNumber"] = by_page[page][idx]["aiQuestionNumber"]
+                        box["aiConfidence"] = by_page[page][idx]["aiConfidence"]
+                        box["aiNotes"] = by_page[page][idx]["aiNotes"]
                         box["notes"] = by_page[page][idx]["notes"] or "Manual box"
 
             st.success("Assignments saved.")
             st.rerun()
 
-        with st.expander("Preview all crops"):
-            by_page_preview = {}
-            for b in all_boxes:
-                by_page_preview.setdefault(b["page"], []).append(b)
-            for pg in sorted(by_page_preview):
-                st.markdown(f"**Page {pg}**")
-                cols = st.columns(4)
-                for i, box in enumerate(by_page_preview[pg]):
-                    with cols[i % 4]:
-                        qnum = box.get("questionNumber", "")
-                        caption = f"{box['name']}" if not qnum else f"{box['name']} → Q{qnum}"
-                        st.image(box["data"], caption=caption, use_container_width=True)
-
-# ── Step 5: Merge images into extracted records ───────────────────────────
+# ── Step 6: Merge images into extracted records ───────────────────────────
 if "records" in st.session_state:
     records = st.session_state.get("records", [])
     all_boxes = get_all_boxes()
 
     q_to_imgs = {}
     q_to_notes = {}
+
     for b in all_boxes:
         qn = normalise_qnum(b.get("questionNumber", ""))
         if qn:
             q_to_imgs.setdefault(qn, []).append(b["name"])
-            q_to_notes.setdefault(qn, []).append(f"{b['name']}: {b.get('notes', '')}")
+            ai_part = ""
+            if b.get("aiQuestionNumber"):
+                ai_part = f" | AI {b.get('aiQuestionNumber')} ({b.get('aiConfidence', '')})"
+            q_to_notes.setdefault(qn, []).append(
+                f"{b['name']}: {b.get('notes', '')}{ai_part}"
+            )
 
     for r in records:
         qn = normalise_qnum(r.get("questionNumber", ""))
@@ -934,7 +1042,7 @@ if "records" in st.session_state:
         r["images"] = imgs
         if imgs:
             r["hasImages"] = True
-            r["imageMappingConfidence"] = "manual"
+            r["imageMappingConfidence"] = "manual+ai" if any("AI " in n for n in notes) else "manual"
             r["imageMappingNotes"] = "\n".join(notes)
         else:
             r["images"] = []
@@ -944,12 +1052,12 @@ if "records" in st.session_state:
     st.session_state["records"] = records
     st.session_state["images"] = all_boxes
 
-# ── Step 6: Review extracted records ──────────────────────────────────────
+# ── Step 7: Review extracted records ──────────────────────────────────────
 if "records" in st.session_state or "images" in st.session_state:
     records = st.session_state.get("records", [])
     images = st.session_state.get("images", [])
 
-    st.subheader("6 · Review & edit")
+    st.subheader("7 · Review & edit")
 
     if records:
         df = pd.DataFrame([{
@@ -1000,15 +1108,22 @@ if "records" in st.session_state or "images" in st.session_state:
             for idx, img in enumerate(images):
                 with cols[idx % 4]:
                     qn = img.get("questionNumber", "")
-                    cap = img["name"] if not qn else f"{img['name']} → Q{qn}"
+                    ai_qn = img.get("aiQuestionNumber", "")
+                    ai_conf = img.get("aiConfidence", "")
+                    if qn:
+                        cap = f"{img['name']} → Q{qn}"
+                    elif ai_qn:
+                        cap = f"{img['name']} → AI {ai_qn} ({ai_conf})"
+                    else:
+                        cap = img["name"]
                     st.image(img["data"], caption=cap, use_container_width=True)
 
-# ── Step 7: Export / Sync ────────────────────────────────────────────────
+# ── Step 8: Export / Sync ────────────────────────────────────────────────
 if "images" in st.session_state or "records" in st.session_state:
     records = st.session_state.get("records", [])
     images = st.session_state.get("images", [])
 
-    st.subheader("7 · Export / Sync")
+    st.subheader("8 · Export / Sync")
     dl_col, sync_col = st.columns([1, 2])
 
     with dl_col:
@@ -1092,7 +1207,7 @@ if "images" in st.session_state or "records" in st.session_state:
                         created = create_airtable_records(AT_TOKEN, AT_BASE, AT_TABLE, payload)
                         log(f"✅ {len(created)} records synced!")
                     else:
-                        log("No record payload to sync. You may have only exported images.")
+                        log("No record payload to sync.")
 
                 except Exception as e:
                     log(f"❌ Sync failed: {e}")
