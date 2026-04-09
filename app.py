@@ -10,13 +10,9 @@ import fitz
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw
 from openai import OpenAI
-
-try:
-    from streamlit_drawable_canvas import st_canvas
-except Exception:
-    st_canvas = None
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ── Config ────────────────────────────────────────────────────────────────
 TEXT_MODEL = "gpt-4.1-mini"
@@ -30,7 +26,6 @@ JPEG_QUALITY = 70
 RENDER_DPI = 150
 EXTRACT_DPI = 300
 CANVAS_MAX_WIDTH = 950
-BOX_STROKE = "#00AEEF"
 
 AT_API = "https://api.airtable.com/v0"
 AT_META = "https://api.airtable.com/v0/meta"
@@ -236,7 +231,7 @@ def crop_from_rel_bbox(pdf_bytes: bytes, page_num: int, rel_bbox: dict, dpi: int
     doc.close()
     return data
 
-def render_page_for_canvas(pdf_bytes: bytes, page_num: int, max_width: int = CANVAS_MAX_WIDTH, dpi: int = RENDER_DPI):
+def render_page_for_display(pdf_bytes: bytes, page_num: int, max_width: int = CANVAS_MAX_WIDTH, dpi: int = RENDER_DPI):
     pil = render_page_pil(pdf_bytes, page_num, dpi=dpi)
     w, h = pil.size
     display_w = min(max_width, w)
@@ -245,61 +240,28 @@ def render_page_for_canvas(pdf_bytes: bytes, page_num: int, max_width: int = CAN
     display_pil = pil.resize((display_w, display_h))
     return pil, display_pil, scale
 
-def canvas_rect_to_rel(obj: dict, display_w: int, display_h: int) -> dict | None:
-    try:
-        left = float(obj.get("left", 0))
-        top = float(obj.get("top", 0))
-        width = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
-        height = float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
-    except Exception:
-        return None
+def draw_boxes_on_preview(image: Image.Image, boxes: list[dict]) -> Image.Image:
+    img = image.copy()
+    draw = ImageDraw.Draw(img)
 
-    if width < 3 or height < 3:
-        return None
-
-    x = max(0.0, min(1.0, left / display_w))
-    y = max(0.0, min(1.0, top / display_h))
-    w = max(0.0, min(1.0 - x, width / display_w))
-    h = max(0.0, min(1.0 - y, height / display_h))
-
-    if w <= 0 or h <= 0:
-        return None
-
-    return {"x": x, "y": y, "w": w, "h": h}
-
-def build_initial_canvas_json(boxes: list[dict], display_w: int, display_h: int) -> dict:
-    objects = []
     for box in boxes:
         rel = box["rel_bbox"]
-        objects.append({
-            "type": "rect",
-            "left": rel["x"] * display_w,
-            "top": rel["y"] * display_h,
-            "width": rel["w"] * display_w,
-            "height": rel["h"] * display_h,
-            "fill": "rgba(0,0,0,0)",
-            "stroke": BOX_STROKE,
-            "strokeWidth": 3,
-            "rx": 0,
-            "ry": 0,
-            "scaleX": 1,
-            "scaleY": 1,
-        })
-    return {"version": "4.4.0", "objects": objects}
+        x0 = rel["x"] * img.width
+        y0 = rel["y"] * img.height
+        x1 = x0 + rel["w"] * img.width
+        y1 = y0 + rel["h"] * img.height
 
-def canvas_objects_to_rel_boxes(canvas_result, display_w: int, display_h: int) -> list[dict]:
-    out = []
-    if not canvas_result or not getattr(canvas_result, "json_data", None):
-        return out
+        draw.rectangle([x0, y0, x1, y1], outline="red", width=3)
+        label = str(box.get("boxIndex", ""))
+        if label:
+            tx0 = x0 + 2
+            ty0 = max(0, y0 - 18)
+            tx1 = tx0 + 20
+            ty1 = ty0 + 16
+            draw.rectangle([tx0, ty0, tx1, ty1], fill="red")
+            draw.text((tx0 + 4, ty0 + 1), label, fill="white")
 
-    objects = canvas_result.json_data.get("objects", []) or []
-    rects = [obj for obj in objects if obj.get("type") == "rect"]
-
-    for obj in rects:
-        rel = canvas_rect_to_rel(obj, display_w, display_h)
-        if rel:
-            out.append(rel)
-    return out
+    return img
 
 # ── Manual box store ──────────────────────────────────────────────────────
 def get_manual_boxes() -> dict[int, list[dict]]:
@@ -321,8 +283,10 @@ def rebuild_page_boxes_from_rel(pdf_bytes: bytes, page_num: int, rel_boxes: list
         pil = Image.open(io.BytesIO(img_bytes))
 
         prev_qnum = ""
+        prev_notes = "Manual box"
         if i - 1 < len(existing_boxes):
             prev_qnum = existing_boxes[i - 1].get("questionNumber", "")
+            prev_notes = existing_boxes[i - 1].get("notes", "Manual box")
 
         rebuilt.append({
             "page": page_num,
@@ -335,7 +299,7 @@ def rebuild_page_boxes_from_rel(pdf_bytes: bytes, page_num: int, rel_boxes: list
             "questionNumber": prev_qnum,
             "kind": "",
             "confidence": "",
-            "notes": "Manual box",
+            "notes": prev_notes,
             "boxIndex": i,
         })
     return rebuilt
@@ -480,9 +444,9 @@ def create_airtable_records(token: str, base_id: str, table: str, records: list[
     return created
 
 # ── UI ────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Past Paper → Airtable (Box First v2)", page_icon="📄", layout="wide")
-st.title("📄 Past Paper → Airtable, box-first v2")
-st.caption("Manual boxes, transform mode, manual question-number assignment")
+st.set_page_config(page_title="Past Paper → Airtable (Click Boxes)", page_icon="📄", layout="wide")
+st.title("📄 Past Paper → Airtable, click-box version")
+st.caption("Click top-left, then bottom-right to create each box")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN = get_secret("AIRTABLE_TOKEN")
@@ -517,9 +481,6 @@ with st.sidebar:
     USE_AI_QUESTION_EXTRACTION = st.checkbox("Use AI for question extraction", value=True)
     USE_AI_MS_EXTRACTION = st.checkbox("Use AI for mark scheme extraction", value=True)
 
-if st_canvas is None:
-    st.error("Install `streamlit-drawable-canvas-fix` to use this app.")
-
 # ── Step 1: Upload ────────────────────────────────────────────────────────
 st.subheader("1 · Upload PDFs")
 col1, col2 = st.columns(2)
@@ -545,12 +506,14 @@ if st.button("Load PDF", disabled=not paper_file):
     st.session_state["question_pages"] = pages
     st.session_state["selected_page"] = pages[0] if pages else 1
     st.session_state["manual_boxes_by_page"] = {}
+    for p in pages:
+        st.session_state[f"click_state_{p}"] = []
     st.success(f"Loaded PDF with {len(pages)} question pages.")
 
-# ── Step 2: Box editor ────────────────────────────────────────────────────
-if "paper_bytes" in st.session_state and st_canvas is not None:
+# ── Step 2: Click-to-box editor ───────────────────────────────────────────
+if "paper_bytes" in st.session_state:
     st.subheader("2 · Draw and edit boxes")
-    st.caption("Use draw mode to add boxes. Use transform mode to move or resize them. Save after each change.")
+    st.caption("Click once for the top-left corner, then again for the bottom-right corner.")
 
     paper_bytes = st.session_state["paper_bytes"]
     pages = st.session_state.get("question_pages", [])
@@ -582,61 +545,93 @@ if "paper_bytes" in st.session_state and st_canvas is not None:
         with c1:
             if st.button("Clear page boxes", disabled=not page_boxes):
                 set_boxes_for_page(selected_page, [])
+                st.session_state[f"click_state_{selected_page}"] = []
                 st.rerun()
         with c2:
-            if st.button("Copy boxes from previous page", disabled=selected_page <= 1):
-                prev_boxes = get_boxes_for_page(selected_page - 1)
-                copied = []
-                for i, b in enumerate(prev_boxes, 1):
-                    copied.append({
-                        **b,
-                        "page": selected_page,
-                        "name": f"p{selected_page}_box{i}.png",
-                        "boxIndex": i,
-                    })
-                set_boxes_for_page(selected_page, copied)
+            if st.button("Undo last box", disabled=not page_boxes):
+                page_boxes = get_boxes_for_page(selected_page)
+                set_boxes_for_page(selected_page, page_boxes[:-1])
                 st.rerun()
 
     with right:
         if pages:
-            _, display_pil, _ = render_page_for_canvas(paper_bytes, selected_page, max_width=CANVAS_MAX_WIDTH, dpi=RENDER_DPI)
+            _, display_pil, _ = render_page_for_display(
+                paper_bytes,
+                selected_page,
+                max_width=CANVAS_MAX_WIDTH,
+                dpi=RENDER_DPI
+            )
             display_w, display_h = display_pil.size
             page_boxes = get_boxes_for_page(selected_page)
-            initial_json = build_initial_canvas_json(page_boxes, display_w, display_h)
 
-            mode = st.radio(
-                "Canvas mode",
-                ["Draw new boxes", "Transform existing boxes"],
-                horizontal=True
-            )
-            drawing_mode = "rect" if mode == "Draw new boxes" else "transform"
-            st.image(display_pil, caption=f"Debug page {selected_page}", use_container_width=True)
-            st.write(display_pil.size)
-            canvas_result = st_canvas(
-                fill_color="rgba(0,0,0,0)",
-                stroke_width=3,
-                stroke_color=BOX_STROKE,
-                background_image=display_pil,
-                update_streamlit=True,
-                height=display_h,
-                width=display_w,
-                drawing_mode=drawing_mode,
-                initial_drawing=initial_json,
-                display_toolbar=True,
-                key=f"canvas_{selected_page}_{drawing_mode}_{len(page_boxes)}",
+            preview_img = draw_boxes_on_preview(display_pil, page_boxes) if page_boxes else display_pil
+
+            st.markdown("**Page preview**")
+            click_state_key = f"click_state_{selected_page}"
+            if click_state_key not in st.session_state:
+                st.session_state[click_state_key] = []
+
+            click = streamlit_image_coordinates(
+                preview_img,
+                key=f"page_click_{selected_page}_{len(page_boxes)}",
             )
 
-            if st.button("Save canvas boxes", key=f"save_canvas_{selected_page}"):
-                rel_boxes = canvas_objects_to_rel_boxes(canvas_result, display_w, display_h)
-                rebuilt = rebuild_page_boxes_from_rel(
-                    pdf_bytes=paper_bytes,
-                    page_num=selected_page,
-                    rel_boxes=rel_boxes,
-                    existing_boxes=page_boxes,
-                )
-                set_boxes_for_page(selected_page, rebuilt)
-                st.success(f"Saved {len(rebuilt)} boxes for page {selected_page}.")
-                st.rerun()
+            if click:
+                x = int(click["x"])
+                y = int(click["y"])
+                clicks = st.session_state[click_state_key]
+                point = (x, y)
+                if not clicks or clicks[-1] != point:
+                    clicks.append(point)
+                if len(clicks) > 2:
+                    clicks = clicks[-2:]
+                st.session_state[click_state_key] = clicks
+
+            clicks = st.session_state[click_state_key]
+
+            if len(clicks) >= 1:
+                st.write(f"First corner: {clicks[0]}")
+            if len(clicks) >= 2:
+                st.write(f"Second corner: {clicks[1]}")
+
+            if len(clicks) >= 2:
+                if st.button("Save box from two clicks"):
+                    (x1, y1), (x2, y2) = clicks[0], clicks[1]
+
+                    left_x = min(x1, x2)
+                    top_y = min(y1, y2)
+                    width = abs(x2 - x1)
+                    height = abs(y2 - y1)
+
+                    if width > 5 and height > 5:
+                        rel = {
+                            "x": left_x / display_w,
+                            "y": top_y / display_h,
+                            "w": width / display_w,
+                            "h": height / display_h,
+                        }
+
+                        rel_boxes = [b["rel_bbox"] for b in page_boxes] + [rel]
+                        rebuilt = rebuild_page_boxes_from_rel(
+                            pdf_bytes=paper_bytes,
+                            page_num=selected_page,
+                            rel_boxes=rel_boxes,
+                            existing_boxes=page_boxes,
+                        )
+                        set_boxes_for_page(selected_page, rebuilt)
+                        st.session_state[click_state_key] = []
+                        st.success("Box saved.")
+                        st.rerun()
+                    else:
+                        st.warning("Box is too small.")
+
+            c3, c4 = st.columns(2)
+            with c3:
+                if st.button("Reset clicks"):
+                    st.session_state[click_state_key] = []
+                    st.rerun()
+            with c4:
+                st.write(f"Image size: {display_w} × {display_h}")
 
 # ── Step 3: Manual question mapping ───────────────────────────────────────
 if "paper_bytes" in st.session_state:
