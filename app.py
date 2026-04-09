@@ -1016,6 +1016,12 @@ if "records" in st.session_state:
             st.caption(f"Token: `{tp}` | Base: `{AT_BASE}` | Table: `{AT_TABLE}`")
 
             if st.button("🚀 Sync to Airtable", type="primary"):
+                st.session_state["do_sync"] = True
+                st.session_state.pop("sync_log", None)
+                st.rerun()
+
+            if st.session_state.get("do_sync"):
+                st.session_state["do_sync"] = False
                 log_lines: list[str] = []
 
                 def log(m):
@@ -1071,5 +1077,8 @@ if "records" in st.session_state:
                 except Exception as e:
                     log(f"❌ Sync failed: {e}")
 
-                st.text("\n".join(log_lines))
+                st.session_state["sync_log"] = log_lines
+
+            if "sync_log" in st.session_state:
+                st.text("\n".join(st.session_state["sync_log"]))
                 st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
