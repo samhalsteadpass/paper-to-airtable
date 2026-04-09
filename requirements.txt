@@ -1,12 +1,7 @@
-openai
 streamlit
-pillow
-requests
-pdf2image
-pytesseract
-airtable-python-wrapper
 streamlit-drawable-canvas-fix
 PyMuPDF
 pandas
+pillow
 requests
 openai
