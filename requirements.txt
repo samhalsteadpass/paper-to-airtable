@@ -5,7 +5,7 @@ requests
 pdf2image
 pytesseract
 airtable-python-wrapper
-streamlit-drawable-canvas
+streamlit-drawable-canvas-fix
 PyMuPDF
 pandas
 requests
