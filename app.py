@@ -14,7 +14,7 @@ from PIL import Image
 from openai import OpenAI
 
 try:
-    from streamlit_drawable_canvas import st_canvas
+    from streamlit_drawable_canvas_fix import st_canvas
 except Exception:
     st_canvas = None
 
