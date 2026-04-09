@@ -114,6 +114,13 @@ Each element:
 
 AI_ASSIGN_PROMPT = """You are matching a cropped exam image to the most likely question.
 
+You are given TWO images:
+1. The FULL PAGE from the exam paper
+2. A CROPPED region taken from that page (the visual to assign)
+
+Use both images together. The full page shows the surrounding questions and layout,
+which makes it easy to see which question the crop belongs to.
+
 Return ONLY raw JSON:
 {{
   "questionNumber": "2a",
@@ -127,8 +134,9 @@ Candidate questions (question number | page | question text):
 {candidates}
 
 Rules:
+- Use the full page to identify the question number printed nearest to the crop's position.
+- Use the crop itself to confirm with visual clues: labels, axis titles, table headers, figure numbers.
 - Choose the single best match from the candidates list.
-- Use visual clues in the crop: labels, axis titles, table headers, figure numbers.
 - If genuinely ambiguous, pick the best candidate but set confidence to low.
 - questionNumber must be exactly as shown in the candidates list.
 """
@@ -406,7 +414,8 @@ def candidates_for_page(records: list[dict], pn: int) -> list[dict]:
             seen.add(qn)
     return (cands or records)[:25]
 
-def ai_assign(client: OpenAI, box: dict, records: list[dict]) -> dict:
+def ai_assign(client: OpenAI, box: dict, records: list[dict],
+               pdf_bytes: bytes = None) -> dict:
     cands  = candidates_for_page(records, box["page"])
     cblock = "\n".join(
         f"- {normalise_qnum(r.get('questionNumber', ''))} | "
@@ -415,12 +424,17 @@ def ai_assign(client: OpenAI, box: dict, records: list[dict]) -> dict:
         for r in cands
     )
     prompt  = AI_ASSIGN_PROMPT.format(candidates=cblock)
-    img     = Image.open(io.BytesIO(box["data"])).convert("RGB")
-    content = [
-        {"type": "input_text",  "text": prompt},
-        {"type": "input_image",
-         "image_url": f"data:image/jpeg;base64,{encode_pil(img)}"},
-    ]
+    crop_img = Image.open(io.BytesIO(box["data"])).convert("RGB")
+    content = [{"type": "input_text", "text": prompt}]
+    # Send full page first so GPT can see layout context
+    if pdf_bytes:
+        page_png = render_page_cached(pdf_bytes, box["page"], dpi=RENDER_DPI)
+        page_pil = Image.open(io.BytesIO(page_png)).convert("RGB")
+        content.append({"type": "input_image",
+                         "image_url": f"data:image/jpeg;base64,{encode_pil(page_pil)}"})
+    # Then the crop
+    content.append({"type": "input_image",
+                     "image_url": f"data:image/jpeg;base64,{encode_pil(crop_img)}"})
     parsed = safe_json_loads(
         call_gpt(client, content, VISION_MODEL, max_tokens=300), {})
 
@@ -792,7 +806,7 @@ if "pdf" in st.session_state:
                         if mode == "AI suggest" and OPENAI_KEY and records:
                             try:
                                 client = OpenAI(api_key=OPENAI_KEY)
-                                result = ai_assign(client, box, records)
+                                result = ai_assign(client, box, records, pdf_bytes=pdf)
                                 pb2    = page_boxes(sel_page)
                                 for b in pb2:
                                     if b["idx"] == box["idx"]:
@@ -839,7 +853,7 @@ if st.session_state.get("records") and any(all_boxes()):
                     if normalise_qnum(b.get("questionNumber", "")):
                         continue
                     try:
-                        r = ai_assign(client, b, records)
+                        r = ai_assign(client, b, records, pdf_bytes=st.session_state.get('pdf'))
                         b["ai_qnum"]  = r["questionNumber"]
                         b["ai_conf"]  = r["confidence"]
                         b["ai_notes"] = r["notes"]
