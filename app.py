@@ -594,7 +594,37 @@ if "paper_bytes" in st.session_state:
             if len(clicks) >= 2:
                 st.write(f"Second corner: {clicks[1]}")
 
-            if len(clicks) >= 2:
+                        if len(clicks) >= 2:
+                st.markdown("### Assign this crop")
+
+                extracted_qnums = []
+                if "records" in st.session_state:
+                    extracted_qnums = [
+                        normalise_qnum(r.get("questionNumber", ""))
+                        for r in st.session_state.get("records", [])
+                        if normalise_qnum(r.get("questionNumber", ""))
+                    ]
+                    extracted_qnums = sorted(list(dict.fromkeys(extracted_qnums)))
+
+                if extracted_qnums:
+                    selected_qnum_for_box = st.selectbox(
+                        "Question number for this box",
+                        options=[""] + extracted_qnums,
+                        key=f"new_box_qnum_{selected_page}_{len(page_boxes)}"
+                    )
+                else:
+                    selected_qnum_for_box = st.text_input(
+                        "Question number for this box",
+                        key=f"new_box_qnum_{selected_page}_{len(page_boxes)}",
+                        placeholder="e.g. 2 or 2a"
+                    )
+
+                new_box_notes = st.text_input(
+                    "Notes (optional)",
+                    key=f"new_box_notes_{selected_page}_{len(page_boxes)}",
+                    placeholder="e.g. graph, diagram, table"
+                )
+
                 if st.button("Save box from two clicks"):
                     (x1, y1), (x2, y2) = clicks[0], clicks[1]
 
@@ -618,13 +648,17 @@ if "paper_bytes" in st.session_state:
                             rel_boxes=rel_boxes,
                             existing_boxes=page_boxes,
                         )
+
+                        if rebuilt:
+                            rebuilt[-1]["questionNumber"] = normalise_qnum(selected_qnum_for_box)
+                            rebuilt[-1]["notes"] = new_box_notes.strip() or "Manual box"
+
                         set_boxes_for_page(selected_page, rebuilt)
                         st.session_state[click_state_key] = []
-                        st.success("Box saved.")
+                        st.success("Box saved and assigned.")
                         st.rerun()
                     else:
                         st.warning("Box is too small.")
-
             c3, c4 = st.columns(2)
             with c3:
                 if st.button("Reset clicks"):
@@ -636,7 +670,7 @@ if "paper_bytes" in st.session_state:
 # ── Step 3: Manual question mapping ───────────────────────────────────────
 if "paper_bytes" in st.session_state:
     st.subheader("3 · Assign question numbers to boxes")
-    st.caption("Type the question number for each crop manually. Leave blank if not assigned yet.")
+    st.caption("Review or edit the question number for each crop. These are now assigned when the box is saved.")
 
     all_boxes = get_all_boxes()
     st.write(f"Current saved visual crops: **{len(all_boxes)}**")
