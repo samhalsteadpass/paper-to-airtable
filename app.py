@@ -263,6 +263,29 @@ def draw_boxes_on_preview(image: Image.Image, boxes: list[dict]) -> Image.Image:
 
     return img
 
+def save_box_for_selected_question(
+    pdf_bytes: bytes,
+    page_num: int,
+    rel: dict,
+    selected_qnum: str,
+    notes: str = "Manual box",
+):
+    page_boxes = get_boxes_for_page(page_num)
+    rel_boxes = [b["rel_bbox"] for b in page_boxes] + [rel]
+
+    rebuilt = rebuild_page_boxes_from_rel(
+        pdf_bytes=pdf_bytes,
+        page_num=page_num,
+        rel_boxes=rel_boxes,
+        existing_boxes=page_boxes,
+    )
+
+    if rebuilt:
+        rebuilt[-1]["questionNumber"] = normalise_qnum(selected_qnum)
+        rebuilt[-1]["notes"] = notes.strip() or "Manual box"
+
+    set_boxes_for_page(page_num, rebuilt)
+
 # ── Manual box store ──────────────────────────────────────────────────────
 def get_manual_boxes() -> dict[int, list[dict]]:
     return st.session_state.setdefault("manual_boxes_by_page", {})
@@ -444,9 +467,9 @@ def create_airtable_records(token: str, base_id: str, table: str, records: list[
     return created
 
 # ── UI ────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Past Paper → Airtable (Click Boxes)", page_icon="📄", layout="wide")
-st.title("📄 Past Paper → Airtable, click-box version")
-st.caption("Click top-left, then bottom-right to create each box")
+st.set_page_config(page_title="Past Paper → Airtable (Question-first capture)", page_icon="📄", layout="wide")
+st.title("📄 Past Paper → Airtable")
+st.caption("Extract questions, then capture graphs/diagrams straight onto the correct question.")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN = get_secret("AIRTABLE_TOKEN")
@@ -510,223 +533,9 @@ if st.button("Load PDF", disabled=not paper_file):
         st.session_state[f"click_state_{p}"] = []
     st.success(f"Loaded PDF with {len(pages)} question pages.")
 
-# ── Step 2: Click-to-box editor ───────────────────────────────────────────
+# ── Step 2: Extract questions / mark scheme ──────────────────────────────
 if "paper_bytes" in st.session_state:
-    st.subheader("2 · Draw and edit boxes")
-    st.caption("Click once for the top-left corner, then again for the bottom-right corner.")
-
-    paper_bytes = st.session_state["paper_bytes"]
-    pages = st.session_state.get("question_pages", [])
-
-    left, right = st.columns([1, 2])
-
-    with left:
-        if pages:
-            selected_page = st.selectbox(
-                "Page",
-                pages,
-                index=max(0, pages.index(st.session_state.get("selected_page", pages[0])))
-                if st.session_state.get("selected_page") in pages else 0,
-            )
-            st.session_state["selected_page"] = selected_page
-        else:
-            selected_page = 1
-            st.info("No question pages found.")
-
-        page_boxes = get_boxes_for_page(selected_page)
-        st.markdown(f"**Saved boxes on this page:** {len(page_boxes)}")
-
-        for box in page_boxes:
-            qnum = box.get("questionNumber", "")
-            label = f"{box['name']}" if not qnum else f"{box['name']} → Q{qnum}"
-            st.image(box["data"], caption=label, use_container_width=True)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Clear page boxes", disabled=not page_boxes):
-                set_boxes_for_page(selected_page, [])
-                st.session_state[f"click_state_{selected_page}"] = []
-                st.rerun()
-        with c2:
-            if st.button("Undo last box", disabled=not page_boxes):
-                page_boxes = get_boxes_for_page(selected_page)
-                set_boxes_for_page(selected_page, page_boxes[:-1])
-                st.rerun()
-
-    with right:
-        if pages:
-            _, display_pil, _ = render_page_for_display(
-                paper_bytes,
-                selected_page,
-                max_width=CANVAS_MAX_WIDTH,
-                dpi=RENDER_DPI
-            )
-            display_w, display_h = display_pil.size
-            page_boxes = get_boxes_for_page(selected_page)
-
-            preview_img = draw_boxes_on_preview(display_pil, page_boxes) if page_boxes else display_pil
-
-            st.markdown("**Page preview**")
-            click_state_key = f"click_state_{selected_page}"
-            if click_state_key not in st.session_state:
-                st.session_state[click_state_key] = []
-
-            click = streamlit_image_coordinates(
-                preview_img,
-                key=f"page_click_{selected_page}_{len(page_boxes)}",
-            )
-
-            if click:
-                x = int(click["x"])
-                y = int(click["y"])
-                clicks = st.session_state[click_state_key]
-                point = (x, y)
-                if not clicks or clicks[-1] != point:
-                    clicks.append(point)
-                if len(clicks) > 2:
-                    clicks = clicks[-2:]
-                st.session_state[click_state_key] = clicks
-
-            clicks = st.session_state[click_state_key]
-
-            if len(clicks) >= 1:
-                st.write(f"First corner: {clicks[0]}")
-            if len(clicks) >= 2:
-                st.write(f"Second corner: {clicks[1]}")
-
-                        if len(clicks) >= 2:
-                st.markdown("### Assign this crop")
-
-                extracted_qnums = []
-                if "records" in st.session_state:
-                    extracted_qnums = [
-                        normalise_qnum(r.get("questionNumber", ""))
-                        for r in st.session_state.get("records", [])
-                        if normalise_qnum(r.get("questionNumber", ""))
-                    ]
-                    extracted_qnums = sorted(list(dict.fromkeys(extracted_qnums)))
-
-                if extracted_qnums:
-                    selected_qnum_for_box = st.selectbox(
-                        "Question number for this box",
-                        options=[""] + extracted_qnums,
-                        key=f"new_box_qnum_{selected_page}_{len(page_boxes)}"
-                    )
-                else:
-                    selected_qnum_for_box = st.text_input(
-                        "Question number for this box",
-                        key=f"new_box_qnum_{selected_page}_{len(page_boxes)}",
-                        placeholder="e.g. 2 or 2a"
-                    )
-
-                new_box_notes = st.text_input(
-                    "Notes (optional)",
-                    key=f"new_box_notes_{selected_page}_{len(page_boxes)}",
-                    placeholder="e.g. graph, diagram, table"
-                )
-
-                if st.button("Save box from two clicks"):
-                    (x1, y1), (x2, y2) = clicks[0], clicks[1]
-
-                    left_x = min(x1, x2)
-                    top_y = min(y1, y2)
-                    width = abs(x2 - x1)
-                    height = abs(y2 - y1)
-
-                    if width > 5 and height > 5:
-                        rel = {
-                            "x": left_x / display_w,
-                            "y": top_y / display_h,
-                            "w": width / display_w,
-                            "h": height / display_h,
-                        }
-
-                        rel_boxes = [b["rel_bbox"] for b in page_boxes] + [rel]
-                        rebuilt = rebuild_page_boxes_from_rel(
-                            pdf_bytes=paper_bytes,
-                            page_num=selected_page,
-                            rel_boxes=rel_boxes,
-                            existing_boxes=page_boxes,
-                        )
-
-                        if rebuilt:
-                            rebuilt[-1]["questionNumber"] = normalise_qnum(selected_qnum_for_box)
-                            rebuilt[-1]["notes"] = new_box_notes.strip() or "Manual box"
-
-                        set_boxes_for_page(selected_page, rebuilt)
-                        st.session_state[click_state_key] = []
-                        st.success("Box saved and assigned.")
-                        st.rerun()
-                    else:
-                        st.warning("Box is too small.")
-            c3, c4 = st.columns(2)
-            with c3:
-                if st.button("Reset clicks"):
-                    st.session_state[click_state_key] = []
-                    st.rerun()
-            with c4:
-                st.write(f"Image size: {display_w} × {display_h}")
-
-# ── Step 3: Manual question mapping ───────────────────────────────────────
-if "paper_bytes" in st.session_state:
-    st.subheader("3 · Assign question numbers to boxes")
-    st.caption("Review or edit the question number for each crop. These are now assigned when the box is saved.")
-
-    all_boxes = get_all_boxes()
-    st.write(f"Current saved visual crops: **{len(all_boxes)}**")
-
-    if all_boxes:
-        rows = []
-        for b in all_boxes:
-            rows.append({
-                "Page": b["page"],
-                "Box #": b["boxIndex"],
-                "Image Name": b["name"],
-                "Question Number": b.get("questionNumber", ""),
-                "Notes": b.get("notes", ""),
-            })
-
-        map_df = pd.DataFrame(rows)
-        edited_map_df = st.data_editor(map_df, use_container_width=True, num_rows="fixed", height=360)
-
-        if st.button("Save question-number assignments"):
-            by_page = {}
-            for _, row in edited_map_df.iterrows():
-                page = int(row["Page"])
-                box_index = int(row["Box #"])
-                qnum = normalise_qnum(row["Question Number"])
-                notes = str(row["Notes"] or "")
-
-                by_page.setdefault(page, {})
-                by_page[page][box_index] = {"questionNumber": qnum, "notes": notes}
-
-            store = get_manual_boxes()
-            for page, page_boxes in store.items():
-                for box in page_boxes:
-                    idx = box["boxIndex"]
-                    if page in by_page and idx in by_page[page]:
-                        box["questionNumber"] = by_page[page][idx]["questionNumber"]
-                        box["notes"] = by_page[page][idx]["notes"] or "Manual box"
-
-            st.success("Assignments saved.")
-            st.rerun()
-
-        with st.expander("Preview all crops"):
-            by_page_preview = {}
-            for b in all_boxes:
-                by_page_preview.setdefault(b["page"], []).append(b)
-            for pg in sorted(by_page_preview):
-                st.markdown(f"**Page {pg}**")
-                cols = st.columns(4)
-                for i, box in enumerate(by_page_preview[pg]):
-                    with cols[i % 4]:
-                        qnum = box.get("questionNumber", "")
-                        caption = f"{box['name']}" if not qnum else f"{box['name']} → Q{qnum}"
-                        st.image(box["data"], caption=caption, use_container_width=True)
-
-# ── Step 4: Extract questions / mark scheme ───────────────────────────────
-if "paper_bytes" in st.session_state:
-    st.subheader("4 · Extract questions and mark scheme")
+    st.subheader("2 · Extract questions and mark scheme")
 
     if st.button("Run extraction", type="primary", disabled=not paper_name or not exam_type):
         paper_bytes = st.session_state["paper_bytes"]
@@ -802,17 +611,308 @@ if "paper_bytes" in st.session_state:
             st.session_state["records"] = records
             st.session_state["images"] = all_boxes
 
+            if records:
+                extracted_qnums = [
+                    normalise_qnum(r.get("questionNumber", ""))
+                    for r in records
+                    if normalise_qnum(r.get("questionNumber", ""))
+                ]
+                extracted_qnums = list(dict.fromkeys(extracted_qnums))
+                if extracted_qnums and "selected_question_for_capture" not in st.session_state:
+                    st.session_state["selected_question_for_capture"] = extracted_qnums[0]
+
             status.update(
                 label=f"✅ Done — {len(records)} questions · {len(all_boxes)} visuals",
                 state="complete"
             )
 
-# ── Step 5: Review ────────────────────────────────────────────────────────
+# ── Step 3: Question-first image capture ──────────────────────────────────
+if "paper_bytes" in st.session_state:
+    st.subheader("3 · Capture images by question")
+    st.caption("Select a question, then click two corners on the page. The crop is saved straight to that question.")
+
+    paper_bytes = st.session_state["paper_bytes"]
+    pages = st.session_state.get("question_pages", [])
+
+    extracted_qnums = []
+    if "records" in st.session_state:
+        extracted_qnums = [
+            normalise_qnum(r.get("questionNumber", ""))
+            for r in st.session_state.get("records", [])
+            if normalise_qnum(r.get("questionNumber", ""))
+        ]
+        extracted_qnums = list(dict.fromkeys(extracted_qnums))
+
+    left, right = st.columns([1, 2])
+
+    with left:
+        st.markdown("### Selected question")
+
+        if extracted_qnums:
+            selected_question_for_capture = st.selectbox(
+                "Question",
+                options=extracted_qnums,
+                key="selected_question_for_capture",
+            )
+        else:
+            selected_question_for_capture = st.text_input(
+                "Question number",
+                key="selected_question_for_capture_manual",
+                placeholder="e.g. 2 or 2a"
+            )
+
+        capture_notes = st.text_input(
+            "Notes for new captures",
+            key="capture_notes",
+            placeholder="e.g. graph, diagram, table"
+        )
+
+        if pages:
+            selected_page = st.selectbox(
+                "Page",
+                pages,
+                index=max(0, pages.index(st.session_state.get("selected_page", pages[0])))
+                if st.session_state.get("selected_page") in pages else 0,
+            )
+            st.session_state["selected_page"] = selected_page
+        else:
+            selected_page = 1
+            st.info("No question pages found.")
+
+        all_boxes = get_all_boxes()
+        selected_qnum_norm = normalise_qnum(selected_question_for_capture)
+
+        question_boxes = [
+            b for b in all_boxes
+            if normalise_qnum(b.get("questionNumber", "")) == selected_qnum_norm
+        ]
+
+        st.markdown(f"**Images linked to Q{selected_qnum_norm or '?'}:** {len(question_boxes)}")
+
+        for box in question_boxes:
+            caption = f"{box['name']} (p{box['page']})"
+            st.image(box["data"], caption=caption, use_container_width=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(
+                "Undo last for this question",
+                disabled=not question_boxes,
+                key="undo_last_for_question"
+            ):
+                store = get_manual_boxes()
+                removed = False
+                for page_num in sorted(store.keys(), reverse=True):
+                    page_boxes = store[page_num]
+                    for idx in range(len(page_boxes) - 1, -1, -1):
+                        if normalise_qnum(page_boxes[idx].get("questionNumber", "")) == selected_qnum_norm:
+                            del page_boxes[idx]
+                            for i, b in enumerate(page_boxes, 1):
+                                b["boxIndex"] = i
+                                b["name"] = f"p{page_num}_box{i}.png"
+                            set_boxes_for_page(page_num, page_boxes)
+                            removed = True
+                            break
+                    if removed:
+                        break
+                st.rerun()
+
+        with c2:
+            if st.button(
+                "Clear this question",
+                disabled=not question_boxes,
+                key="clear_this_question"
+            ):
+                store = get_manual_boxes()
+                for page_num, page_boxes in store.items():
+                    filtered = [
+                        b for b in page_boxes
+                        if normalise_qnum(b.get("questionNumber", "")) != selected_qnum_norm
+                    ]
+                    for i, b in enumerate(filtered, 1):
+                        b["boxIndex"] = i
+                        b["name"] = f"p{page_num}_box{i}.png"
+                    set_boxes_for_page(page_num, filtered)
+                st.rerun()
+
+    with right:
+        if pages:
+            _, display_pil, _ = render_page_for_display(
+                paper_bytes,
+                selected_page,
+                max_width=CANVAS_MAX_WIDTH,
+                dpi=RENDER_DPI
+            )
+            display_w, display_h = display_pil.size
+
+            page_boxes = get_boxes_for_page(selected_page)
+            preview_img = draw_boxes_on_preview(display_pil, page_boxes) if page_boxes else display_pil
+
+            st.markdown(f"### Page {selected_page}")
+            st.markdown(f"**Current target question:** `{selected_qnum_norm or 'None'}`")
+
+            click_state_key = f"click_state_{selected_page}"
+            if click_state_key not in st.session_state:
+                st.session_state[click_state_key] = []
+
+            click = streamlit_image_coordinates(
+                preview_img,
+                key=f"page_click_{selected_page}_{len(page_boxes)}_{selected_qnum_norm}",
+            )
+
+            if click:
+                x = int(click["x"])
+                y = int(click["y"])
+                clicks = st.session_state[click_state_key]
+                point = (x, y)
+
+                if not clicks or clicks[-1] != point:
+                    clicks.append(point)
+
+                if len(clicks) > 2:
+                    clicks = clicks[-2:]
+
+                if len(clicks) == 2:
+                    (x1, y1), (x2, y2) = clicks[0], clicks[1]
+
+                    left_x = min(x1, x2)
+                    top_y = min(y1, y2)
+                    width = abs(x2 - x1)
+                    height = abs(y2 - y1)
+
+                    if width > 5 and height > 5 and selected_qnum_norm:
+                        rel = {
+                            "x": left_x / display_w,
+                            "y": top_y / display_h,
+                            "w": width / display_w,
+                            "h": height / display_h,
+                        }
+
+                        save_box_for_selected_question(
+                            pdf_bytes=paper_bytes,
+                            page_num=selected_page,
+                            rel=rel,
+                            selected_qnum=selected_qnum_norm,
+                            notes=capture_notes or "Manual box",
+                        )
+
+                        st.session_state[click_state_key] = []
+                        st.rerun()
+                    else:
+                        if not selected_qnum_norm:
+                            st.warning("Select a question first.")
+                        else:
+                            st.warning("Box is too small.")
+                        st.session_state[click_state_key] = []
+
+                else:
+                    st.session_state[click_state_key] = clicks
+
+            clicks = st.session_state[click_state_key]
+            if len(clicks) == 1:
+                st.info(f"First corner selected: {clicks[0]}. Click the opposite corner to save.")
+
+            c3, c4 = st.columns(2)
+            with c3:
+                if st.button("Reset current click", key="reset_current_click"):
+                    st.session_state[click_state_key] = []
+                    st.rerun()
+            with c4:
+                st.write(f"Image size: {display_w} × {display_h}")
+
+# ── Step 4: Review image assignments ──────────────────────────────────────
+if "paper_bytes" in st.session_state:
+    st.subheader("4 · Review image assignments")
+    st.caption("Review or edit image-to-question assignments. New crops are now assigned when captured.")
+
+    all_boxes = get_all_boxes()
+    st.write(f"Current saved visual crops: **{len(all_boxes)}**")
+
+    if all_boxes:
+        rows = []
+        for b in all_boxes:
+            rows.append({
+                "Page": b["page"],
+                "Box #": b["boxIndex"],
+                "Image Name": b["name"],
+                "Question Number": b.get("questionNumber", ""),
+                "Notes": b.get("notes", ""),
+            })
+
+        map_df = pd.DataFrame(rows)
+        edited_map_df = st.data_editor(map_df, use_container_width=True, num_rows="fixed", height=360)
+
+        if st.button("Save image assignments"):
+            by_page = {}
+            for _, row in edited_map_df.iterrows():
+                page = int(row["Page"])
+                box_index = int(row["Box #"])
+                qnum = normalise_qnum(row["Question Number"])
+                notes = str(row["Notes"] or "")
+
+                by_page.setdefault(page, {})
+                by_page[page][box_index] = {"questionNumber": qnum, "notes": notes}
+
+            store = get_manual_boxes()
+            for page, page_boxes in store.items():
+                for box in page_boxes:
+                    idx = box["boxIndex"]
+                    if page in by_page and idx in by_page[page]:
+                        box["questionNumber"] = by_page[page][idx]["questionNumber"]
+                        box["notes"] = by_page[page][idx]["notes"] or "Manual box"
+
+            st.success("Assignments saved.")
+            st.rerun()
+
+        with st.expander("Preview all crops"):
+            by_page_preview = {}
+            for b in all_boxes:
+                by_page_preview.setdefault(b["page"], []).append(b)
+            for pg in sorted(by_page_preview):
+                st.markdown(f"**Page {pg}**")
+                cols = st.columns(4)
+                for i, box in enumerate(by_page_preview[pg]):
+                    with cols[i % 4]:
+                        qnum = box.get("questionNumber", "")
+                        caption = f"{box['name']}" if not qnum else f"{box['name']} → Q{qnum}"
+                        st.image(box["data"], caption=caption, use_container_width=True)
+
+# ── Step 5: Merge images into extracted records ───────────────────────────
+if "records" in st.session_state:
+    records = st.session_state.get("records", [])
+    all_boxes = get_all_boxes()
+
+    q_to_imgs = {}
+    q_to_notes = {}
+    for b in all_boxes:
+        qn = normalise_qnum(b.get("questionNumber", ""))
+        if qn:
+            q_to_imgs.setdefault(qn, []).append(b["name"])
+            q_to_notes.setdefault(qn, []).append(f"{b['name']}: {b.get('notes', '')}")
+
+    for r in records:
+        qn = normalise_qnum(r.get("questionNumber", ""))
+        imgs = q_to_imgs.get(qn, [])
+        notes = q_to_notes.get(qn, [])
+        r["images"] = imgs
+        if imgs:
+            r["hasImages"] = True
+            r["imageMappingConfidence"] = "manual"
+            r["imageMappingNotes"] = "\n".join(notes)
+        else:
+            r["images"] = []
+            r["imageMappingConfidence"] = ""
+            r["imageMappingNotes"] = ""
+
+    st.session_state["records"] = records
+    st.session_state["images"] = all_boxes
+
+# ── Step 6: Review extracted records ──────────────────────────────────────
 if "records" in st.session_state or "images" in st.session_state:
     records = st.session_state.get("records", [])
     images = st.session_state.get("images", [])
 
-    st.subheader("5 · Review & edit")
+    st.subheader("6 · Review & edit")
 
     if records:
         df = pd.DataFrame([{
@@ -866,12 +966,12 @@ if "records" in st.session_state or "images" in st.session_state:
                     cap = img["name"] if not qn else f"{img['name']} → Q{qn}"
                     st.image(img["data"], caption=cap, use_container_width=True)
 
-# ── Step 6: Export / Sync ────────────────────────────────────────────────
+# ── Step 7: Export / Sync ────────────────────────────────────────────────
 if "images" in st.session_state or "records" in st.session_state:
     records = st.session_state.get("records", [])
     images = st.session_state.get("images", [])
 
-    st.subheader("6 · Export / Sync")
+    st.subheader("7 · Export / Sync")
     dl_col, sync_col = st.columns([1, 2])
 
     with dl_col:
