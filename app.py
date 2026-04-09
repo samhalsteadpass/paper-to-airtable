@@ -6,17 +6,19 @@ Flow:
   2. Extract questions + mark scheme (GPT, parallel)
   3. Draw boxes on page to capture visuals (click two corners)
      → GPT immediately suggests question assignment
-  4. Review / override assignments
-  5. Sync to Airtable (images via Cloudinary)
+  4. Bulk AI assign unassigned boxes
+  5. Review / override assignments
+  6. Review & edit question records
+  7. Sync to Airtable (images via Cloudinary)
 
 requirements.txt:
     streamlit streamlit-image-coordinates openai requests pymupdf pillow pandas
 
 Secrets:
-    OPENAI_API_KEY          = "sk-..."
-    AIRTABLE_TOKEN          = "pat..."
-    AIRTABLE_BASE_ID        = "app..."
-    CLOUDINARY_CLOUD_NAME   = "my-cloud"
+    OPENAI_API_KEY           = "sk-..."
+    AIRTABLE_TOKEN           = "pat..."
+    AIRTABLE_BASE_ID         = "app..."
+    CLOUDINARY_CLOUD_NAME    = "my-cloud"
     CLOUDINARY_UPLOAD_PRESET = "my-preset"
 """
 
@@ -51,8 +53,8 @@ RENDER_DPI        = 150
 EXTRACT_DPI       = 300
 CANVAS_MAX_WIDTH  = 900
 
-AT_API    = "https://api.airtable.com/v0"
-AT_META   = "https://api.airtable.com/v0/meta"
+AT_API         = "https://api.airtable.com/v0"
+AT_META        = "https://api.airtable.com/v0/meta"
 CLOUDINARY_API = "https://api.cloudinary.com/v1_1"
 
 AT_FIELDS = [
@@ -214,10 +216,10 @@ def call_gpt(client: OpenAI, content: list, model: str,
 # ── PDF helpers ───────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def get_question_pages(pdf_bytes: bytes) -> list[int]:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc   = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
     for i in range(len(doc)):
-        pn = i + 1
+        pn   = i + 1
         if pn == 1:
             continue
         text = doc[i].get_text().lower()
@@ -229,7 +231,6 @@ def get_question_pages(pdf_bytes: bytes) -> list[int]:
 @st.cache_data(show_spinner=False)
 def render_page_cached(pdf_bytes: bytes, page_num: int,
                         dpi: int = RENDER_DPI) -> bytes:
-    """Returns PNG bytes of a rendered page. Cached so repeated renders are free."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = doc[page_num - 1].get_pixmap(matrix=mat, alpha=False)
@@ -258,7 +259,6 @@ def pdf_chunk_pils(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> list[Image.Image]
 
 def crop_from_rel(pdf_bytes: bytes, page_num: int,
                    rel: dict, dpi: int = EXTRACT_DPI) -> bytes:
-    """Crop a region (relative coords 0-1) from a page at high DPI."""
     doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[page_num - 1]
     pr   = page.rect
@@ -300,23 +300,23 @@ def reindex(pn: int):
 
 def add_box(pdf_bytes: bytes, pn: int, rel: dict,
             qnum: str = "", notes: str = "") -> dict:
-    pb     = page_boxes(pn)
-    idx    = len(pb) + 1
-    data   = crop_from_rel(pdf_bytes, pn, rel)
-    pil    = Image.open(io.BytesIO(data))
-    b = {
-        "page":          pn,
-        "idx":           idx,
-        "name":          f"p{pn}_box{idx}.png",
-        "rel":           rel,
-        "data":          data,
-        "width":         pil.width,
-        "height":        pil.height,
+    pb   = page_boxes(pn)
+    idx  = len(pb) + 1
+    data = crop_from_rel(pdf_bytes, pn, rel)
+    pil  = Image.open(io.BytesIO(data))
+    b    = {
+        "page":           pn,
+        "idx":            idx,
+        "name":           f"p{pn}_box{idx}.png",
+        "rel":            rel,
+        "data":           data,
+        "width":          pil.width,
+        "height":         pil.height,
         "questionNumber": qnum,
-        "ai_qnum":       "",
-        "ai_conf":       "",
-        "ai_notes":      "",
-        "notes":         notes or "manual",
+        "ai_qnum":        "",
+        "ai_conf":        "",
+        "ai_notes":       "",
+        "notes":          notes or "manual",
     }
     pb.append(b)
     set_page_boxes(pn, pb)
@@ -335,7 +335,7 @@ def extract_questions(client: OpenAI,
         for p in pils:
             content.append({"type": "input_image",
                              "image_url": f"data:image/jpeg;base64,{encode_pil(p)}"})
-        rows = safe_json_loads(call_gpt(client, content, TEXT_MODEL), [])
+        rows  = safe_json_loads(call_gpt(client, content, TEXT_MODEL), [])
         fixed = [{
             "questionNumber":   normalise_qnum(r.get("questionNumber",   "")),
             "questionText":     str(r.get("questionText",     "") or ""),
@@ -372,8 +372,10 @@ def extract_markscheme(client: OpenAI,
             content.append({"type": "input_image",
                              "image_url": f"data:image/jpeg;base64,{encode_pil(p)}"})
         rows  = safe_json_loads(call_gpt(client, content, TEXT_MODEL), [])
-        local = {normalise_qnum(r.get("questionNumber", "")): str(r.get("markSchemeAnswer", "") or "")
-                 for r in rows if r.get("questionNumber") and r.get("markSchemeAnswer")}
+        local = {
+            normalise_qnum(r.get("questionNumber", "")): str(r.get("markSchemeAnswer", "") or "")
+            for r in rows if r.get("questionNumber") and r.get("markSchemeAnswer")
+        }
         return i, local, f"MS chunk {i+1}/{len(chunks)}: {len(local)} entries"
 
     ordered: dict[int, dict] = {}
@@ -390,19 +392,17 @@ def extract_markscheme(client: OpenAI,
 
 # ── AI image assignment ───────────────────────────────────────────────────
 def candidates_for_page(records: list[dict], pn: int) -> list[dict]:
-    """Return questions on same page + adjacent pages, max 25."""
-    same    = [r for r in records if clamp_int(r.get("pageNumber")) == pn]
-    adj     = [r for r in records if clamp_int(r.get("pageNumber")) in {pn-1, pn+1}]
-    seen    = {normalise_qnum(r.get("questionNumber", "")) for r in same}
-    cands   = list(same)
+    same  = [r for r in records if clamp_int(r.get("pageNumber")) == pn]
+    adj   = [r for r in records if clamp_int(r.get("pageNumber")) in {pn-1, pn+1}]
+    seen  = {normalise_qnum(r.get("questionNumber", "")) for r in same}
+    cands = list(same)
     for r in adj:
         qn = normalise_qnum(r.get("questionNumber", ""))
         if qn and qn not in seen:
             cands.append(r); seen.add(qn)
     return (cands or records)[:25]
 
-def ai_assign(client: OpenAI, box: dict,
-               records: list[dict]) -> dict:
+def ai_assign(client: OpenAI, box: dict, records: list[dict]) -> dict:
     cands  = candidates_for_page(records, box["page"])
     cblock = "\n".join(
         f"- {normalise_qnum(r.get('questionNumber',''))} | "
@@ -410,15 +410,15 @@ def ai_assign(client: OpenAI, box: dict,
         f"{re.sub(chr(10), ' ', str(r.get('questionText','') or ''))[:200]}"
         for r in cands
     )
-    prompt = AI_ASSIGN_PROMPT.format(candidates=cblock)
-    img    = Image.open(io.BytesIO(box["data"])).convert("RGB")
     content = [
-        {"type": "input_text",  "text": prompt},
+        {"type": "input_text",
+         "text": AI_ASSIGN_PROMPT.format(candidates=cblock)},
         {"type": "input_image",
-         "image_url": f"data:image/jpeg;base64,{encode_pil(img)}"},
+         "image_url": f"data:image/jpeg;base64,"
+                      f"{encode_pil(Image.open(io.BytesIO(box['data'])).convert('RGB'))}"},
     ]
-    parsed = safe_json_loads(call_gpt(client, content, VISION_MODEL,
-                                       max_tokens=300), {})
+    parsed = safe_json_loads(
+        call_gpt(client, content, VISION_MODEL, max_tokens=300), {})
 
     qn   = normalise_qnum(parsed.get("questionNumber", ""))
     conf = str(parsed.get("confidence", "") or "").strip().lower()
@@ -440,13 +440,13 @@ def draw_overlay(display: Image.Image, pb: list[dict],
     draw = ImageDraw.Draw(img)
     w, h = img.size
     for b in pb:
-        rel     = b["rel"]
-        x0, y0  = rel["x"] * w, rel["y"] * h
-        x1, y1  = x0 + rel["w"] * w, y0 + rel["h"] * h
-        qn      = normalise_qnum(b.get("questionNumber", ""))
-        color   = "#e74c3c" if (highlight_qnum and qn == highlight_qnum) else "#e67e22"
+        rel    = b["rel"]
+        x0, y0 = rel["x"] * w,              rel["y"] * h
+        x1, y1 = (rel["x"]+rel["w"]) * w,   (rel["y"]+rel["h"]) * h
+        qn     = normalise_qnum(b.get("questionNumber", ""))
+        color  = "#e74c3c" if (highlight_qnum and qn == highlight_qnum) else "#e67e22"
         draw.rectangle([x0, y0, x1, y1], outline=color, width=3)
-        label = str(b.get("idx", ""))
+        label  = str(b.get("idx", ""))
         if label:
             draw.rectangle([x0+1, y0-18, x0+26, y0-2], fill=color)
             draw.text((x0+5, y0-17), label, fill="white")
@@ -516,17 +516,17 @@ def push_airtable(token, base_id, table, records) -> list[dict]:
         created.extend(resp.json().get("records", []))
     return created
 
-# ── Streamlit UI ──────────────────────────────────────────────────────────
+# ── UI ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Past Paper → Airtable",
                    page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable")
 st.caption("Draw boxes to capture visuals · AI suggests question assignment · Sync to Airtable")
 
-OPENAI_KEY       = get_secret("OPENAI_API_KEY")
-AT_TOKEN         = get_secret("AIRTABLE_TOKEN")
-AT_BASE          = get_secret("AIRTABLE_BASE_ID")
-CLD_CLOUD        = get_secret("CLOUDINARY_CLOUD_NAME")
-CLD_PRESET       = get_secret("CLOUDINARY_UPLOAD_PRESET")
+OPENAI_KEY  = get_secret("OPENAI_API_KEY")
+AT_TOKEN    = get_secret("AIRTABLE_TOKEN")
+AT_BASE     = get_secret("AIRTABLE_BASE_ID")
+CLD_CLOUD   = get_secret("CLOUDINARY_CLOUD_NAME")
+CLD_PRESET  = get_secret("CLOUDINARY_UPLOAD_PRESET")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -537,14 +537,13 @@ with st.sidebar:
         ("CLOUDINARY_CLOUD_NAME",    "Cloudinary cloud name",    "my-cloud"),
         ("CLOUDINARY_UPLOAD_PRESET", "Cloudinary upload preset", "my-preset"),
     ]:
-        val = get_secret(key)
-        if val:
+        if get_secret(key):
             st.success(f"✓ {label} loaded")
         else:
-            locals()[key.lower()] = st.text_input(label, type="password", placeholder=ph)
+            globals()[key] = st.text_input(label, type="password", placeholder=ph)
 
-    AT_TABLE         = st.text_input("Table name", value="Questions")
-    AUTO_ASSIGN      = st.checkbox("Auto-assign high-confidence AI suggestions", value=True)
+    AT_TABLE    = st.text_input("Table name", value="Questions")
+    AUTO_ASSIGN = st.checkbox("Auto-assign high-confidence AI suggestions", value=True)
     st.divider()
     st.markdown("**Required Airtable fields**")
     for name, ftype in AT_FIELDS:
@@ -566,10 +565,11 @@ with c2:
 if st.button("Load PDF", disabled=not paper_file):
     paper_file.seek(0)
     pdf = paper_file.read()
-    st.session_state["pdf"]   = pdf
-    st.session_state["pages"] = get_question_pages(pdf)
-    st.session_state.pop("records", None)
-    st.session_state["boxes"] = {}
+    st.session_state["pdf"]           = pdf
+    st.session_state["pages"]         = get_question_pages(pdf)
+    st.session_state["sel_page_idx"]  = 0
+    st.session_state["boxes"]         = {}
+    st.session_state.pop("records",   None)
     st.success(f"Loaded — {len(st.session_state['pages'])} question pages found.")
 
 # ── 2. Extract ─────────────────────────────────────────────────────────────
@@ -598,13 +598,13 @@ if "pdf" in st.session_state:
                 qn = normalise_qnum(q.get("questionNumber", ""))
                 records.append({
                     "questionNumber":         qn,
-                    "questionText":           q.get("questionText",     ""),
+                    "questionText":           q.get("questionText",      ""),
                     "markAllocation":         clamp_int(q.get("markAllocation", 0)),
-                    "topic":                  q.get("topic",            ""),
-                    "subtopic":               q.get("subtopic",         ""),
-                    "markSchemeAnswer":        ms_map.get(qn,           ""),
+                    "topic":                  q.get("topic",             ""),
+                    "subtopic":               q.get("subtopic",          ""),
+                    "markSchemeAnswer":        ms_map.get(qn,            ""),
                     "imageDescription":        q.get("imageDescription", ""),
-                    "hasImages":               bool(q.get("hasImages",  False)),
+                    "hasImages":               bool(q.get("hasImages",   False)),
                     "pageNumber":              clamp_int(q.get("pageNumber", 1), 1),
                     "paperName":               paper_name,
                     "examType":                exam_type,
@@ -614,12 +614,13 @@ if "pdf" in st.session_state:
                 })
 
             st.session_state["records"] = records
-            status.update(label=f"✅ {len(records)} questions extracted", state="complete")
+            status.update(label=f"✅ {len(records)} questions extracted",
+                          state="complete")
 
 # ── 3. Capture ─────────────────────────────────────────────────────────────
 if "pdf" in st.session_state:
     st.subheader("3 · Capture visuals")
-    st.caption("Click two corners on the page to draw a box. AI suggests the question assignment automatically.")
+    st.caption("Type a note, then click two corners on the page to draw a box.")
 
     pdf     = st.session_state["pdf"]
     pages   = st.session_state.get("pages", [])
@@ -631,79 +632,81 @@ if "pdf" in st.session_state:
         left, right = st.columns([1, 2])
 
         with left:
-            # Page navigation
-        pages = st.session_state.get("pages", [])
-        if pages:
-            if "sel_page_idx" not in st.session_state:
-                st.session_state["sel_page_idx"] = 0
-            idx = st.session_state["sel_page_idx"]
+            # ── Page navigation ──────────────────────────────────────────
+            idx = st.session_state.get("sel_page_idx", 0)
             idx = max(0, min(idx, len(pages) - 1))
 
             nav1, nav2, nav3 = st.columns([1, 2, 1])
             with nav1:
-                if st.button("◀ Prev", disabled=idx == 0):
-                    st.session_state["sel_page_idx"] = idx - 1
+                if st.button("◀ Prev", disabled=idx == 0, use_container_width=True):
                     st.session_state[f"clicks_{pages[idx]}"] = []
+                    st.session_state["sel_page_idx"] = idx - 1
                     st.rerun()
             with nav2:
                 st.markdown(
                     f"<div style='text-align:center;padding:6px 0;font-weight:500'>"
-                    f"Page {pages[idx]} of {pages[-1]} "
+                    f"Page {pages[idx]}"
                     f"<span style='color:var(--color-text-secondary);font-weight:400'>"
-                    f"({idx+1}/{len(pages)})</span></div>",
+                    f" ({idx+1}/{len(pages)})</span></div>",
                     unsafe_allow_html=True)
             with nav3:
-                if st.button("Next ▶", disabled=idx == len(pages) - 1):
-                    st.session_state["sel_page_idx"] = idx + 1
+                if st.button("Next ▶", disabled=idx == len(pages)-1,
+                              use_container_width=True):
                     st.session_state[f"clicks_{pages[idx]}"] = []
+                    st.session_state["sel_page_idx"] = idx + 1
                     st.rerun()
 
             sel_page = pages[idx]
             st.session_state["sel_page"] = sel_page
-        else:
-            sel_page = 1
-            st.info("Load a PDF first.")
 
-            # Assignment mode
+            # ── Assignment controls ──────────────────────────────────────
             mode = st.radio("Assignment", ["AI suggest", "Manual"],
                             horizontal=True)
             manual_qnum = ""
             if mode == "Manual" and records:
                 qnums = list(dict.fromkeys(
-                    normalise_qnum(r.get("questionNumber", "")) for r in records))
+                    normalise_qnum(r.get("questionNumber", ""))
+                    for r in records))
                 manual_qnum = st.selectbox("Question", qnums)
 
-            notes_input = st.text_input(
-                "Notes (label this crop before drawing)",
+            # Notes — read from session_state key so value is always fresh at draw time
+            st.text_input(
+                "Notes (set before drawing)",
                 key="notes_input",
-                placeholder="e.g. cone diagram, price table"
+                placeholder="e.g. cone diagram, price table",
             )
-            st.caption("Type a note then draw the box — the note is saved with each crop.")
+            st.caption("The note is attached to each box you draw.")
 
-            # Current page boxes
+            # ── Current page boxes ───────────────────────────────────────
             pb = page_boxes(sel_page)
             st.markdown(f"**{len(pb)} box(es) on this page**")
             for b in pb:
                 qn    = b.get("questionNumber", "")
                 ai_qn = b.get("ai_qnum", "")
                 ai_cf = b.get("ai_conf", "")
-                cap   = (f"→ Q{qn}" if qn
-                         else f"→ AI: Q{ai_qn} ({ai_cf})" if ai_qn
-                         else "unassigned")
-                st.image(b["data"],
-                         caption=f"Box {b['idx']} {cap}",
+                note  = b.get("notes", "")
+                if qn:
+                    cap = f"→ Q{qn}"
+                elif ai_qn:
+                    cap = f"→ AI Q{ai_qn} ({ai_cf})"
+                else:
+                    cap = "unassigned"
+                if note and note != "manual":
+                    cap += f" · {note}"
+                st.image(b["data"], caption=f"Box {b['idx']} {cap}",
                          use_container_width=True)
 
             col_a, col_b = st.columns(2)
             with col_a:
-                if st.button("Undo last", disabled=not pb):
-                    pb2 = pb[:-1]
-                    set_page_boxes(sel_page, pb2)
+                if st.button("Undo last", disabled=not pb,
+                              use_container_width=True):
+                    set_page_boxes(sel_page, pb[:-1])
                     reindex(sel_page)
                     st.session_state[f"clicks_{sel_page}"] = []
                     st.rerun()
             with col_b:
-                if st.button("Clear page", disabled=not pb):
+                if st.button("Clear page", disabled=not pb,
+                              use_container_width=True):
                     set_page_boxes(sel_page, [])
                     st.session_state[f"clicks_{sel_page}"] = []
                     st.rerun()
@@ -730,9 +733,9 @@ if "pdf" in st.session_state:
             )
 
             if click:
-                cx, cy   = int(click["x"]), int(click["y"])
-                clicks   = st.session_state[ckey]
-                pt       = (cx, cy)
+                cx, cy = int(click["x"]), int(click["y"])
+                clicks = st.session_state[ckey]
+                pt     = (cx, cy)
 
                 if not clicks or clicks[-1] != pt:
                     clicks.append(pt)
@@ -751,11 +754,12 @@ if "pdf" in st.session_state:
                             "w": bw / dw,
                             "h": bh / dh,
                         }
-                        qn_for_box = normalise_qnum(manual_qnum) if mode == "Manual" else ""
-                        box = add_box(pdf, sel_page, rel, qnum=qn_for_box,
-                                       notes=st.session_state.get("notes_input", "").strip() or "manual")
+                        qn_for_box    = normalise_qnum(manual_qnum) if mode == "Manual" else ""
+                        current_notes = st.session_state.get("notes_input", "").strip() or "manual"
+                        box           = add_box(pdf, sel_page, rel,
+                                                qnum=qn_for_box,
+                                                notes=current_notes)
 
-                        # AI assign
                         if mode == "AI suggest" and OPENAI_KEY and records:
                             try:
                                 client = OpenAI(api_key=OPENAI_KEY)
@@ -766,7 +770,9 @@ if "pdf" in st.session_state:
                                         b["ai_qnum"]  = result["questionNumber"]
                                         b["ai_conf"]  = result["confidence"]
                                         b["ai_notes"] = result["notes"]
-                                        if AUTO_ASSIGN and result["questionNumber"] and result["confidence"] == "high":
+                                        if (AUTO_ASSIGN
+                                                and result["questionNumber"]
+                                                and result["confidence"] == "high"):
                                             b["questionNumber"] = result["questionNumber"]
                                 set_page_boxes(sel_page, pb2)
                                 st.toast(
@@ -781,7 +787,9 @@ if "pdf" in st.session_state:
                         st.warning("Box too small — try again.")
                         st.session_state[ckey] = []
                 else:
-                    st.caption(f"First corner set at {clicks[0]}. Click the second corner.")
+                    st.caption(
+                        f"First corner set at {clicks[0]}. "
+                        "Click the second corner to save.")
 
 # ── 4. Bulk AI assign ──────────────────────────────────────────────────────
 if st.session_state.get("records") and any(all_boxes()):
@@ -790,7 +798,8 @@ if st.session_state.get("records") and any(all_boxes()):
     unassigned = [b for b in ab if not normalise_qnum(b.get("questionNumber", ""))]
     st.write(f"Unassigned: **{len(unassigned)}** of {len(ab)} boxes")
 
-    if st.button("AI assign all unassigned", disabled=not (unassigned and OPENAI_KEY)):
+    if st.button("AI assign all unassigned",
+                  disabled=not (unassigned and OPENAI_KEY)):
         client  = OpenAI(api_key=OPENAI_KEY)
         records = st.session_state["records"]
         done = failed = 0
@@ -807,7 +816,8 @@ if st.session_state.get("records") and any(all_boxes()):
                         b["ai_qnum"]  = r["questionNumber"]
                         b["ai_conf"]  = r["confidence"]
                         b["ai_notes"] = r["notes"]
-                        if AUTO_ASSIGN and r["questionNumber"] and r["confidence"] == "high":
+                        if (AUTO_ASSIGN and r["questionNumber"]
+                                and r["confidence"] == "high"):
                             b["questionNumber"] = r["questionNumber"]
                         done += 1
                         st.write(f"p{pn} box {b['idx']}: "
@@ -816,31 +826,31 @@ if st.session_state.get("records") and any(all_boxes()):
                         failed += 1
                         st.write(f"p{pn} box {b['idx']}: failed — {e}")
                 set_page_boxes(pn, pb)
-            status.update(label=f"✅ {done} done · {failed} failed", state="complete")
+            status.update(label=f"✅ {done} done · {failed} failed",
+                          state="complete")
 
 # ── 5. Review assignments ──────────────────────────────────────────────────
 if any(all_boxes()):
     st.subheader("5 · Review image assignments")
     ab = all_boxes()
 
-    rows = [{
-        "Page":            b["page"],
-        "Box":             b["idx"],
-        "Name":            b["name"],
-        "Final Q #":       b.get("questionNumber",  ""),
-        "AI suggested Q":  b.get("ai_qnum",         ""),
-        "AI confidence":   b.get("ai_conf",          ""),
-        "AI notes":        b.get("ai_notes",         ""),
-        "Notes":           b.get("notes",            ""),
-    } for b in ab]
-
-    edited = st.data_editor(pd.DataFrame(rows),
-                             use_container_width=True,
-                             num_rows="fixed", height=400)
+    edited = st.data_editor(
+        pd.DataFrame([{
+            "Page":           b["page"],
+            "Box":            b["idx"],
+            "Name":           b["name"],
+            "Notes":          b.get("notes", ""),
+            "Final Q #":      b.get("questionNumber",  ""),
+            "AI suggested Q": b.get("ai_qnum",         ""),
+            "AI confidence":  b.get("ai_conf",          ""),
+            "AI notes":       b.get("ai_notes",         ""),
+        } for b in ab]),
+        use_container_width=True, num_rows="fixed", height=380,
+    )
 
     if st.button("Save assignments"):
-        store = boxes()
-        update_map: dict[tuple, dict] = {
+        store      = boxes()
+        update_map = {
             (int(row["Page"]), int(row["Box"])): row
             for _, row in edited.iterrows()
         }
@@ -858,10 +868,11 @@ if any(all_boxes()):
         st.success("Assignments saved.")
         st.rerun()
 
-# ── Merge images into records (runs silently before review) ───────────────
+# ── Merge images into records ──────────────────────────────────────────────
 if "records" in st.session_state:
-    records    = st.session_state["records"]
-    ab         = all_boxes()
+    records = st.session_state["records"]
+    ab      = all_boxes()
+
     q_imgs:  dict[str, list[str]] = {}
     q_notes: dict[str, list[str]] = {}
     for b in ab:
@@ -869,18 +880,22 @@ if "records" in st.session_state:
         if not qn:
             continue
         q_imgs .setdefault(qn, []).append(b["name"])
-        ai_part = (f" | AI {b['ai_qnum']} ({b['ai_conf']})"
+        ai_part = (f" | AI Q{b['ai_qnum']} ({b['ai_conf']})"
                    if b.get("ai_qnum") else "")
-        q_notes.setdefault(qn, []).append(f"{b['name']}: {b.get('notes','')}{ai_part}")
+        note_part = b.get("notes", "")
+        q_notes.setdefault(qn, []).append(
+            f"{b['name']}: {note_part}{ai_part}")
 
     for r in records:
-        qn = normalise_qnum(r.get("questionNumber", ""))
+        qn    = normalise_qnum(r.get("questionNumber", ""))
         imgs  = q_imgs .get(qn, [])
         notes = q_notes.get(qn, [])
-        r["images"]                = imgs
-        r["hasImages"]             = bool(imgs) or r.get("hasImages", False)
-        r["imageMappingConfidence"] = "manual+ai" if any("AI " in n for n in notes) else ("manual" if imgs else "")
-        r["imageMappingNotes"]     = "\n".join(notes)
+        r["images"]                 = imgs
+        r["hasImages"]              = bool(imgs) or r.get("hasImages", False)
+        r["imageMappingConfidence"] = (
+            "manual+ai" if any("AI " in n for n in notes)
+            else "manual" if imgs else "")
+        r["imageMappingNotes"]      = "\n".join(notes)
 
     st.session_state["records"] = records
 
@@ -891,36 +906,38 @@ if "records" in st.session_state:
 
     st.subheader("6 · Review & edit")
 
-    df = pd.DataFrame([{
-        "Q #":           r["questionNumber"],
-        "Question Text": r["questionText"],
-        "Marks":         r["markAllocation"],
-        "Topic":         r["topic"],
-        "Subtopic":      r["subtopic"],
-        "Mark Scheme":   r["markSchemeAnswer"],
-        "Image Desc.":   r["imageDescription"],
-        "Has Images":    r["hasImages"],
-        "Images":        ", ".join(r.get("images", [])),
-        "Conf.":         r.get("imageMappingConfidence", ""),
-        "Page":          r.get("pageNumber", 1),
-    } for r in records])
-
-    edited_df = st.data_editor(df, use_container_width=True,
-                                num_rows="dynamic", height=420)
+    edited_df = st.data_editor(
+        pd.DataFrame([{
+            "Q #":           r["questionNumber"],
+            "Question Text": r["questionText"],
+            "Marks":         r["markAllocation"],
+            "Topic":         r["topic"],
+            "Subtopic":      r["subtopic"],
+            "Mark Scheme":   r["markSchemeAnswer"],
+            "Image Desc.":   r["imageDescription"],
+            "Has Images":    r["hasImages"],
+            "Images":        ", ".join(r.get("images", [])),
+            "Conf.":         r.get("imageMappingConfidence", ""),
+            "Page":          r.get("pageNumber", 1),
+        } for r in records]),
+        use_container_width=True, num_rows="dynamic", height=420,
+    )
 
     for i, row in edited_df.iterrows():
         if i < len(records):
             records[i].update({
-                "questionNumber":    normalise_qnum(row["Q #"]),
-                "questionText":      row["Question Text"],
-                "markAllocation":    clamp_int(row["Marks"], 0),
-                "topic":             row["Topic"],
-                "subtopic":          row["Subtopic"],
-                "markSchemeAnswer":  row["Mark Scheme"],
-                "imageDescription":  row["Image Desc."],
-                "hasImages":         bool(row["Has Images"]),
-                "pageNumber":        clamp_int(row["Page"], 1),
-                "images":            [x.strip() for x in str(row["Images"] or "").split(",") if x.strip()],
+                "questionNumber":   normalise_qnum(row["Q #"]),
+                "questionText":     row["Question Text"],
+                "markAllocation":   clamp_int(row["Marks"], 0),
+                "topic":            row["Topic"],
+                "subtopic":         row["Subtopic"],
+                "markSchemeAnswer": row["Mark Scheme"],
+                "imageDescription": row["Image Desc."],
+                "hasImages":        bool(row["Has Images"]),
+                "pageNumber":       clamp_int(row["Page"], 1),
+                "images":           [x.strip() for x in
+                                     str(row["Images"] or "").split(",")
+                                     if x.strip()],
             })
 
     if ab:
@@ -928,9 +945,12 @@ if "records" in st.session_state:
             cols = st.columns(4)
             for i, b in enumerate(ab):
                 with cols[i % 4]:
-                    qn = b.get("questionNumber", "")
-                    st.image(b["data"],
-                             caption=f"{b['name']} → Q{qn or '?'}",
+                    qn   = b.get("questionNumber", "")
+                    note = b.get("notes", "")
+                    cap  = f"Q{qn or '?'}"
+                    if note and note != "manual":
+                        cap += f" · {note}"
+                    st.image(b["data"], caption=f"{b['name']} → {cap}",
                              use_container_width=True)
 
 # ── 7. Export / Sync ───────────────────────────────────────────────────────
@@ -978,19 +998,18 @@ if "records" in st.session_state:
                 img_url_map: dict[str, str] = {}
                 if ab and CLD_CLOUD and CLD_PRESET:
                     log(f"Uploading {len(ab)} visuals to Cloudinary…")
-                    def _upload(b):
+                    def _up(b):
                         return b["name"], upload_cloudinary(CLD_CLOUD, CLD_PRESET, b)
                     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
                         for name, url in [f.result() for f in
-                                           as_completed([ex.submit(_upload, b)
+                                           as_completed([ex.submit(_up, b)
                                                          for b in ab])]:
                             if url:
-                                img_url_map[name] = url
-                                log(f"  ✅ {name}")
+                                img_url_map[name] = url; log(f"  ✅ {name}")
                             else:
                                 log(f"  ❌ {name} failed")
                 elif ab:
-                    log("⚠️ Cloudinary not configured — images will not be attached.")
+                    log("⚠️ Cloudinary not configured — images not attached.")
 
                 try:
                     existing = get_existing_fields(AT_TOKEN, AT_BASE, AT_TABLE)
@@ -999,20 +1018,20 @@ if "records" in st.session_state:
                         urls   = [img_url_map[n] for n in r.get("images", [])
                                   if n in img_url_map]
                         fields = {
-                            "Question Number":          r.get("questionNumber",         ""),
-                            "Question Text":            r.get("questionText",           ""),
+                            "Question Number":          r.get("questionNumber",          ""),
+                            "Question Text":            r.get("questionText",            ""),
                             "Mark Allocation":          clamp_int(r.get("markAllocation", 0)),
-                            "Topic":                    r.get("topic",                  ""),
-                            "Subtopic":                 r.get("subtopic",               ""),
-                            "Mark Scheme Answer":       r.get("markSchemeAnswer",       ""),
-                            "Image Description":        r.get("imageDescription",       ""),
-                            "Has Images":               bool(urls or r.get("hasImages", False)),
+                            "Topic":                    r.get("topic",                   ""),
+                            "Subtopic":                 r.get("subtopic",                ""),
+                            "Mark Scheme Answer":       r.get("markSchemeAnswer",        ""),
+                            "Image Description":        r.get("imageDescription",        ""),
+                            "Has Images":               bool(urls or r.get("hasImages",  False)),
                             "Images":                   [{"url": u} for u in urls],
-                            "Paper Name":               r.get("paperName",   paper_name),
-                            "Exam Type":                r.get("examType",    exam_type),
+                            "Paper Name":               r.get("paperName",    paper_name),
+                            "Exam Type":                r.get("examType",     exam_type),
                             "Page Number":              clamp_int(r.get("pageNumber", 1), 1),
-                            "Image Mapping Confidence": r.get("imageMappingConfidence", ""),
-                            "Image Mapping Notes":      r.get("imageMappingNotes",      ""),
+                            "Image Mapping Confidence": r.get("imageMappingConfidence",  ""),
+                            "Image Mapping Notes":      r.get("imageMappingNotes",       ""),
                         }
                         fields = {k: v for k, v in fields.items() if k in existing}
                         payload.append({"fields": fields})
