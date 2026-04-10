@@ -476,6 +476,15 @@ def ai_assign(client: OpenAI, box: dict, records: list[dict],
 
     valid = {normalise_qnum(r.get("questionNumber", "")) for r in cands}
 
+    # ── DEBUG: store diagnostics in session state so we can display them ──
+    import streamlit as _st
+    _st.session_state["_debug_last_assign"] = {
+        "ai_raw":    parsed.get("questionNumber", ""),
+        "ai_norm":   qn,
+        "valid_set": sorted(valid),
+        "page":      box["page"],
+    }
+
     # Build an ordered list of candidates (preserving page order) for tiebreaking
     cand_qnums_ordered = [normalise_qnum(r.get("questionNumber", "")) for r in cands]
 
@@ -635,7 +644,6 @@ def push_airtable(token, base_id, table, records) -> list[dict]:
 # Streamlit UI
 # ═════════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
-st.sidebar.caption("v5 – fuzzy match active")
 st.title("📄 Past Paper → Airtable")
 st.caption("Draw boxes to capture visuals · AI suggests question assignment · Sync to Airtable")
 
@@ -954,6 +962,15 @@ if "pdf" in st.session_state:
                 else:
                     st.caption(
                         f"First corner set at {clicks[0]}. Click the second corner.")
+
+            # ── Debug panel ───────────────────────────────────────────────
+            dbg = st.session_state.get("_debug_last_assign")
+            if dbg:
+                with st.expander("🔍 Last AI assignment debug", expanded=True):
+                    st.markdown(f"**Page:** {dbg['page']}")
+                    st.markdown(f"**AI returned (raw):** `{dbg['ai_raw']}`")
+                    st.markdown(f"**AI returned (normalised):** `{dbg['ai_norm']}`")
+                    st.markdown(f"**Valid set:** `{dbg['valid_set']}`")
 
 # ── 4. Bulk AI assign ──────────────────────────────────────────────────────
 if st.session_state.get("records") and any(all_boxes()):
