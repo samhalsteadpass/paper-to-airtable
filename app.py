@@ -193,7 +193,9 @@ def safe_json_loads(raw: str, default: Any):
         return default
 
 def normalise_qnum(v: Any) -> str:
-    return str(v or "").strip().replace(" ", "").replace("(", "").replace(")", "")
+    s = str(v or "").strip()
+    s = s.replace(" ", "").replace("(", "").replace(")", "").replace(".", "")
+    return s
 
 def clamp_int(v: Any, default: int = 0) -> int:
     try:
