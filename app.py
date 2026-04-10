@@ -652,6 +652,10 @@ def push_airtable(token, base_id, table, records) -> list[dict]:
 st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable")
 st.caption("Draw boxes to capture visuals · AI suggests question assignment · Sync to Airtable")
+st.caption("Chicken Jocky")
+
+
+OPENAI_KEY 
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
