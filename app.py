@@ -634,6 +634,7 @@ def push_airtable(token, base_id, table, records) -> list[dict]:
 # ═════════════════════════════════════════════════════════════════════════════
 # Streamlit UI
 # ═════════════════════════════════════════════════════════════════════════════
+st.sidebar.caption("v5 – fuzzy match active")
 st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable")
 st.caption("Draw boxes to capture visuals · AI suggests question assignment · Sync to Airtable")
