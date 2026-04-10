@@ -435,16 +435,22 @@ def extract_markscheme(client: OpenAI,
 
 # ── AI image assignment ───────────────────────────────────────────────────
 def candidates_for_page(records: list[dict], pn: int) -> list[dict]:
-    same  = [r for r in records if clamp_int(r.get("pageNumber")) == pn]
-    adj   = [r for r in records if clamp_int(r.get("pageNumber")) in {pn - 1, pn + 1}]
-    seen  = {normalise_qnum(r.get("questionNumber", "")) for r in same}
-    cands = list(same)
-    for r in adj:
-        qn = normalise_qnum(r.get("questionNumber", ""))
-        if qn and qn not in seen:
-            cands.append(r)
-            seen.add(qn)
-    return (cands or records)[:25]
+    # Search same page, then widen window until we have enough candidates
+    for radius in (0, 1, 2, 3):
+        window = set(range(pn - radius, pn + radius + 1))
+        cands  = [r for r in records if clamp_int(r.get("pageNumber")) in window]
+        if len(cands) >= 3:
+            # Deduplicate while preserving order
+            seen: set = set()
+            out = []
+            for r in cands:
+                qn = normalise_qnum(r.get("questionNumber", ""))
+                if qn and qn not in seen:
+                    out.append(r)
+                    seen.add(qn)
+            return out[:25]
+    # Final fallback: return all records (page numbers may be unreliable)
+    return records[:25]
 
 def ai_assign(client: OpenAI, box: dict, records: list[dict],
                pdf_bytes: bytes = None) -> dict:
