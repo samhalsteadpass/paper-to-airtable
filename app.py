@@ -589,7 +589,9 @@ with st.sidebar:
         else:
             locals()[key.lower()] = st.text_input(label, type="password", placeholder=ph)
 
-    AT_TABLE    = st.text_input("Table name", value="Questions")
+    default_table = st.session_state.get("paper_name_for_table", "Questions")
+    AT_TABLE    = st.text_input("Table name", value=default_table,
+                                help="Each paper gets its own table. Auto-set from paper name.")
     AUTO_ASSIGN = st.checkbox("Auto-assign high-confidence AI suggestions", value=True)
     st.divider()
     st.markdown("**Required Airtable fields**")
@@ -616,6 +618,10 @@ if st.button("Load PDF", disabled=not paper_file):
     st.session_state["pages"] = get_question_pages(pdf)
     st.session_state.pop("records", None)
     st.session_state["boxes"] = {}
+    # Default table name to paper name (sanitised for Airtable)
+    safe_name = re.sub(r"[^a-zA-Z0-9 \-_]", "", paper_name).strip() or "Questions"
+    st.session_state["paper_name_for_table"] = safe_name
+    st.session_state.pop("sync_log", None)
     st.success(f"Loaded — {len(st.session_state['pages'])} question pages found.")
 
 # ── 2. Extract ─────────────────────────────────────────────────────────────
@@ -1065,6 +1071,34 @@ if "records" in st.session_state:
 
                 def log(m):
                     log_lines.append(m)
+
+                # Always re-read and re-merge records fresh so images are attached
+                _records  = st.session_state.get("records", [])
+                _ab       = all_boxes()
+                _q_imgs:  dict[str, list[str]] = {}
+                _q_notes: dict[str, list[str]] = {}
+                for _b in _ab:
+                    _qn = normalise_qnum(_b.get("questionNumber", ""))
+                    if not _qn:
+                        continue
+                    _q_imgs.setdefault(_qn, []).append(_b["name"])
+                    _ai_part = (f" | AI {_b['ai_qnum']} ({_b['ai_conf']})"
+                                if _b.get("ai_qnum") else "")
+                    _q_notes.setdefault(_qn, []).append(
+                        f"{_b['name']}: {_b.get('notes', '')}{_ai_part}")
+                for _r in _records:
+                    _qn   = normalise_qnum(_r.get("questionNumber", ""))
+                    _imgs  = _q_imgs.get(_qn, [])
+                    _notes = _q_notes.get(_qn, [])
+                    _r["images"]                 = _imgs
+                    _r["hasImages"]              = bool(_imgs) or _r.get("hasImages", False)
+                    _r["imageMappingConfidence"] = (
+                        "manual+ai" if any("AI " in n for n in _notes)
+                        else "manual" if _imgs else "")
+                    _r["imageMappingNotes"]      = "\n".join(_notes)
+                records = _records
+                ab      = _ab
+                log(f"Syncing {len(records)} records with {len(ab)} visuals…")
 
                 img_url_map: dict[str, str] = {}
                 if ab and CLD_CLOUD and CLD_PRESET:
