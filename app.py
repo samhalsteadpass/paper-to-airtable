@@ -548,6 +548,43 @@ def ai_assign(client: OpenAI, box: dict, records: list[dict],
         return "", "[outside candidate set]"
 
     matched, match_note = fuzzy_match(qn, valid)
+
+    # ── Global fallback ───────────────────────────────────────────────────
+    # If the local candidate window missed the question entirely, search all records
+    if not matched and qn:
+        all_valid = {normalise_qnum(r.get("questionNumber", "")) for r in records}
+        all_ordered = [normalise_qnum(r.get("questionNumber", "")) for r in records]
+        # Rebuild cand_qnums_ordered for global scope
+        cand_qnums_ordered_global = all_ordered
+        # Re-run fuzzy match against full record set
+        def fuzzy_global(ai_qn: str) -> tuple[str, str]:
+            def bare(s):
+                s = s.lstrip("Qq")
+                return s.lstrip("0") or s
+            def is_child(stored, parent_bare):
+                s = bare(stored)
+                if not s.startswith(parent_bare):
+                    return False
+                rest = s[len(parent_bare):]
+                return len(rest) == 0 or not rest[0].isdigit()
+            ai_bare = bare(ai_qn)
+            if ai_qn in all_valid:
+                return ai_qn, "[global match]"
+            for v in all_valid:
+                if bare(v) == ai_bare:
+                    return v, f"[global matched {ai_qn}→{v}]"
+            children = [v for v in cand_qnums_ordered_global
+                        if v in all_valid and is_child(v, ai_bare)]
+            seen_g: set = set()
+            children = [c for c in children if not (c in seen_g or seen_g.add(c))]
+            if children:
+                return children[0], f"[global matched {ai_qn}→{children[0]} (page mismatch)]"
+            parents = [v for v in all_valid if is_child(ai_bare, bare(v))]
+            if len(parents) == 1:
+                return parents[0], f"[global matched {ai_qn}→{parents[0]}]"
+            return "", "[outside candidate set]"
+
+        matched, match_note = fuzzy_global(qn)
     if not matched:
         qn   = ""
         conf = "low"
@@ -652,7 +689,7 @@ def push_airtable(token, base_id, table, records) -> list[dict]:
 st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
 st.title("📄 Past Paper → Airtable")
 st.caption("Draw boxes to capture visuals · AI suggests question assignment · Sync to Airtable")
-st.caption("Chicken Jocky")
+st.caption("Chciken Jocky 2")
 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
