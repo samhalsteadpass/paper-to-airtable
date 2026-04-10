@@ -377,14 +377,15 @@ def extract_questions(client: OpenAI,
                              "image_url": f"data:image/jpeg;base64,{encode_pil(p)}"})
         rows = safe_json_loads(call_gpt(client, content, TEXT_MODEL), [])
         fixed = [{
-            "questionNumber":   normalise_qnum(r.get("questionNumber",   "")),
-            "questionText":     str(r.get("questionText",     "") or ""),
-            "markAllocation":   clamp_int(r.get("markAllocation", 0), 0),
-            "topic":            str(r.get("topic",            "") or ""),
-            "subtopic":         str(r.get("subtopic",         "") or ""),
-            "hasImages":        bool(r.get("hasImages",       False)),
-            "imageDescription": str(r.get("imageDescription", "") or ""),
-            "pageNumber":       clamp_int(r.get("pageNumber", 1), 1) + offset,
+            "questionNumber":         normalise_qnum(r.get("questionNumber", "")),
+            "originalQuestionNumber": str(r.get("questionNumber", "") or "").strip(),
+            "questionText":           str(r.get("questionText",     "") or ""),
+            "markAllocation":         clamp_int(r.get("markAllocation", 0), 0),
+            "topic":                  str(r.get("topic",            "") or ""),
+            "subtopic":               str(r.get("subtopic",         "") or ""),
+            "hasImages":              bool(r.get("hasImages",       False)),
+            "imageDescription":       str(r.get("imageDescription", "") or ""),
+            "pageNumber":             clamp_int(r.get("pageNumber", 1), 1) + offset,
         } for r in rows]
         return i, fixed, f"Chunk {i+1}/{len(chunks)}: {len(fixed)} questions"
 
@@ -758,6 +759,7 @@ if "pdf" in st.session_state:
                 qn = normalise_qnum(q.get("questionNumber", ""))
                 records.append({
                     "questionNumber":          qn,
+                    "originalQuestionNumber":  q.get("originalQuestionNumber", qn),
                     "questionText":            q.get("questionText",      ""),
                     "markAllocation":          clamp_int(q.get("markAllocation", 0)),
                     "topic":                   q.get("topic",             ""),
@@ -1241,7 +1243,7 @@ if "records" in st.session_state:
                         urls   = [img_url_map[n] for n in r.get("images", [])
                                   if n in img_url_map]
                         fields = {
-                            "Question Number":          r.get("questionNumber",          ""),
+                            "Question Number":          r.get("originalQuestionNumber", r.get("questionNumber", "")),
                             "Question Text":            r.get("questionText",            ""),
                             "Mark Allocation":          clamp_int(r.get("markAllocation", 0)),
                             "Topic":                    r.get("topic",                   ""),
