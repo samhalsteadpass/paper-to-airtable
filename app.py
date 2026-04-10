@@ -481,33 +481,55 @@ def ai_assign(client: OpenAI, box: dict, records: list[dict],
 
     def fuzzy_match(ai_qn: str, valid_set: set) -> tuple[str, str]:
         """Return (matched_qnum, note_suffix) or ('', note_suffix) if no match."""
+        if not ai_qn:
+            return "", "[outside candidate set]"
+
+        # Normalise the AI value the same way records are normalised
+        # (already done via normalise_qnum above, but also strip leading zeros/Q)
+        def bare(s: str) -> str:
+            """Strip leading Q/q then leading zeros, keep at least one char."""
+            s = s.lstrip("Qq")
+            return s.lstrip("0") or s
+
+        ai_bare = bare(ai_qn)
+
+        # 1. Exact match
         if ai_qn in valid_set:
             return ai_qn, ""
-        # Strip leading Q/q and zeros, try again
-        stripped = ai_qn.lstrip("Qq0") or ai_qn
-        if stripped in valid_set:
-            return stripped, f"[matched {ai_qn}→{stripped}]"
-        # Gather all children e.g. AI said "9", records have "9a","9b","9c"
+
+        # 2. Match after stripping leading Q/zeros from AI value
+        for v in valid_set:
+            if bare(v) == ai_bare:
+                return v, f"[matched {ai_qn}→{v}]"
+
+        # 3. AI returned a parent number — find all children
+        #    e.g. AI said "7", records have "7a","7b","7c"
+        #    Match if stored value starts with ai_bare (after stripping its own zeros)
+        def is_child(stored: str, parent_bare: str) -> bool:
+            s = bare(stored)
+            # child starts with the parent digits and the next char is non-digit
+            if not s.startswith(parent_bare):
+                return False
+            rest = s[len(parent_bare):]
+            return len(rest) == 0 or not rest[0].isdigit()
+
         children = [v for v in cand_qnums_ordered
-                    if v in valid_set and (
-                        v.startswith(ai_qn) or
-                        v.lstrip("Qq0").startswith(ai_qn) or
-                        v.lstrip("Qq0").startswith(stripped)
-                    )]
+                    if v in valid_set and is_child(v, ai_bare)]
         # Deduplicate while preserving order
         seen_c: set = set()
         children = [c for c in children if not (c in seen_c or seen_c.add(c))]
         if len(children) == 1:
             return children[0], f"[matched {ai_qn}→{children[0]}]"
         if len(children) > 1:
-            # Multiple sub-parts: diagram belongs to the question group.
-            # Pick the first child on the same page as the box.
             first = children[0]
             return first, f"[matched {ai_qn}→{first} (first of {len(children)} sub-parts)]"
-        # Candidate is a parent of what AI returned e.g. AI said "9a", record is "9"
-        parents = [v for v in valid_set if ai_qn.startswith(v) and v]
+
+        # 4. AI returned a child, record is the parent
+        #    e.g. AI said "7a", record is "7"
+        parents = [v for v in valid_set if is_child(ai_bare, bare(v))]
         if len(parents) == 1:
             return parents[0], f"[matched {ai_qn}→{parents[0]}]"
+
         return "", "[outside candidate set]"
 
     matched, match_note = fuzzy_match(qn, valid)
