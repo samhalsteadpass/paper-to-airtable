@@ -654,9 +654,6 @@ st.title("📄 Past Paper → Airtable")
 st.caption("Draw boxes to capture visuals · AI suggests question assignment · Sync to Airtable")
 st.caption("Chicken Jocky")
 
-
-OPENAI_KEY 
-
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
 AT_BASE    = get_secret("AIRTABLE_BASE_ID")
