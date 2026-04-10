@@ -141,6 +141,36 @@ Rules:
 - questionNumber must be exactly as shown in the candidates list.
 """
 
+
+COVER_PROMPT = """Look at this exam paper cover page and extract the paper name and exam type.
+
+Return ONLY raw JSON:
+{
+  "paperName": "AQA Mathematics Paper 1 (Non-Calculator) 2023",
+  "examType": "GCSE"
+}
+
+paperName: include the exam board, subject, paper number/name, and year if visible.
+examType: one of GCSE, A-Level, AS-Level, IB HL, IB SL, or describe it briefly if none of these fit.
+If a field is not clearly visible, make your best guess from context.
+"""
+
+def read_cover_page(client: OpenAI, pdf_bytes: bytes) -> tuple[str, str]:
+    """Read the first page of a PDF and extract paper name and exam type."""
+    page_png = render_page_cached(pdf_bytes, 1, dpi=RENDER_DPI)
+    page_pil = Image.open(io.BytesIO(page_png)).convert("RGB")
+    content  = [
+        {"type": "input_text",  "text": COVER_PROMPT},
+        {"type": "input_image",
+         "image_url": f"data:image/jpeg;base64,{encode_pil(page_pil)}"},
+    ]
+    parsed = safe_json_loads(
+        call_gpt(client, content, VISION_MODEL, max_tokens=200), {})
+    return (
+        str(parsed.get("paperName", "") or "").strip(),
+        str(parsed.get("examType",  "") or "").strip(),
+    )
+
 # ── Secrets ───────────────────────────────────────────────────────────────
 def get_secret(key: str, fallback: str = "") -> str:
     try:
@@ -602,27 +632,47 @@ with st.sidebar:
 st.subheader("1 · Upload PDFs")
 c1, c2 = st.columns(2)
 with c1:
-    paper_name = st.text_input("Paper name", placeholder="AQA Maths P1 2024")
-    exam_type  = st.text_input("Exam type",  placeholder="GCSE / A-Level / IB HL")
     paper_file = st.file_uploader("Past paper PDF *", type="pdf")
+    paper_name = st.text_input(
+        "Paper name",
+        value=st.session_state.get("paper_name", ""),
+        placeholder="Auto-filled from cover page",
+    )
+    exam_type = st.text_input(
+        "Exam type",
+        value=st.session_state.get("exam_type", ""),
+        placeholder="Auto-filled from cover page",
+    )
 with c2:
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-    st.markdown("&nbsp;", unsafe_allow_html=True)
     st.markdown("&nbsp;", unsafe_allow_html=True)
     ms_file = st.file_uploader("Mark scheme PDF (optional)", type="pdf")
 
-if st.button("Load PDF", disabled=not paper_file):
+if st.button("Load PDF", disabled=not (paper_file and OPENAI_KEY)):
     paper_file.seek(0)
-    pdf = paper_file.read()
-    st.session_state["pdf"]   = pdf
-    st.session_state["pages"] = get_question_pages(pdf)
+    pdf    = paper_file.read()
+    client = OpenAI(api_key=OPENAI_KEY)
+
+    with st.spinner("Reading cover page…"):
+        detected_name, detected_type = read_cover_page(client, pdf)
+
+    st.session_state["pdf"]        = pdf
+    st.session_state["pages"]      = get_question_pages(pdf)
+    st.session_state["paper_name"] = detected_name
+    st.session_state["exam_type"]  = detected_type
     st.session_state.pop("records", None)
     st.session_state["boxes"] = {}
-    # Default table name to paper name (sanitised for Airtable)
-    safe_name = re.sub(r"[^a-zA-Z0-9 \-_]", "", paper_name).strip() or "Questions"
+    safe_name = re.sub(r"[^a-zA-Z0-9 _-]", "", detected_name).strip() or "Questions"
     st.session_state["paper_name_for_table"] = safe_name
     st.session_state.pop("sync_log", None)
-    st.success(f"Loaded — {len(st.session_state['pages'])} question pages found.")
+    st.success(
+        f"Loaded — {len(st.session_state['pages'])} question pages found.  "
+        f"Detected: **{detected_name}** · **{detected_type}**"
+    )
+    st.rerun()
+
+# Keep paper_name / exam_type in sync with what user may have edited
+paper_name = st.session_state.get("paper_name", paper_name)
+exam_type  = st.session_state.get("exam_type",  exam_type)
 
 # ── 2. Extract ─────────────────────────────────────────────────────────────
 if "pdf" in st.session_state:
