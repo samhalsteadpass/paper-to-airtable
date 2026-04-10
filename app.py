@@ -1237,12 +1237,25 @@ if "records" in st.session_state:
                     log("⚠️ Cloudinary not configured — images will not be attached.")
 
                 try:
-                    existing = get_existing_fields(AT_TOKEN, AT_BASE, AT_TABLE)
+                    # Ensure table exists first, then fetch fields separately
+                    ensure_table(AT_TOKEN, AT_BASE, AT_TABLE)
+                    # Retry field fetch — newly created tables may need a moment
+                    existing = set()
+                    for _attempt in range(3):
+                        existing = get_existing_fields(AT_TOKEN, AT_BASE, AT_TABLE)
+                        if existing:
+                            break
+                        time.sleep(1)
+                    log(f"Table fields found: {len(existing)}")
+
+                    _pn   = st.session_state.get("paper_name", paper_name)
+                    _et   = st.session_state.get("exam_type",  exam_type)
+
                     payload  = []
                     for r in records:
                         urls   = [img_url_map[n] for n in r.get("images", [])
                                   if n in img_url_map]
-                        fields = {
+                        all_fields = {
                             "Question Number":          r.get("originalQuestionNumber", r.get("questionNumber", "")),
                             "Question Text":            r.get("questionText",            ""),
                             "Mark Allocation":          clamp_int(r.get("markAllocation", 0)),
@@ -1252,17 +1265,27 @@ if "records" in st.session_state:
                             "Image Description":        r.get("imageDescription",        ""),
                             "Has Images":               bool(urls or r.get("hasImages",  False)),
                             "Images":                   [{"url": u} for u in urls],
-                            "Paper Name":               r.get("paperName",    paper_name),
-                            "Exam Type":                r.get("examType",     exam_type),
+                            "Paper Name":               r.get("paperName",    _pn),
+                            "Exam Type":                r.get("examType",     _et),
                             "Page Number":              clamp_int(r.get("pageNumber", 1), 1),
                             "Image Mapping Confidence": r.get("imageMappingConfidence",  ""),
                             "Image Mapping Notes":      r.get("imageMappingNotes",       ""),
                         }
-                        fields = {k: v for k, v in fields.items() if k in existing}
-                        payload.append({"fields": fields})
+                        # Only filter if we actually got fields back
+                        if existing:
+                            all_fields = {k: v for k, v in all_fields.items() if k in existing}
+                        payload.append({"fields": all_fields})
 
                     log(f"Pushing {len(payload)} records…")
-                    created = push_airtable(AT_TOKEN, AT_BASE, AT_TABLE, payload)
+                    # Push directly — ensure_table already called above
+                    url = f"{AT_API}/{AT_BASE}/{requests.utils.quote(AT_TABLE, safe='')}"
+                    created = []
+                    for batch in chunk_list(payload, 10):
+                        resp = requests.post(url, headers=at_headers(AT_TOKEN),
+                                             json={"records": batch}, timeout=60)
+                        if not resp.ok:
+                            raise RuntimeError(f"Airtable {resp.status_code}: {resp.text[:400]}")
+                        created.extend(resp.json().get("records", []))
                     log(f"✅ {len(created)} records synced!")
                 except Exception as e:
                     log(f"❌ Sync failed: {e}")
