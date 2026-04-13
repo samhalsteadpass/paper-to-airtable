@@ -703,15 +703,18 @@ def upload_cloudinary(cloud: str, preset: str, img: dict, paper_name: str = "") 
     pid  = f"{safe_paper}_{base}"
     resp = requests.post(
         f"{CLOUDINARY_API}/{cloud}/image/upload",
-        data={"upload_preset": preset, "public_id": pid, "overwrite": "true",
-              "invalidate": "true"},
+        data={"upload_preset": preset, "public_id": pid},
         files={"file": (img["name"], img["data"], "image/png")},
         timeout=120,
     )
     if resp.ok:
         return resp.json().get("secure_url")
-    # Return None but the caller will log the failure
-    return None
+    # Embed error in return so caller can log it
+    try:
+        err = resp.json().get("error", {}).get("message", resp.text[:200])
+    except Exception:
+        err = resp.text[:200]
+    return f"ERROR:{err}"
 
 def push_airtable(token, base_id, table, records) -> list[dict]:
     ensure_table(token, base_id, table)
@@ -1420,11 +1423,13 @@ if "records" in st.session_state:
                         for name, url in [f.result() for f in
                                            as_completed([ex.submit(_upload, b)
                                                          for b in ab])]:
-                            if url:
+                            if url and not str(url).startswith("ERROR:"):
                                 img_url_map[name] = url
                                 log(f"  ✅ {name}")
+                            elif url:
+                                log(f"  ❌ {name} failed: {url[6:]}")
                             else:
-                                log(f"  ❌ {name} failed")
+                                log(f"  ❌ {name} failed: no response")
                 elif ab:
                     log("⚠️ Cloudinary not configured — images will not be attached.")
 
@@ -1487,3 +1492,4 @@ if "records" in st.session_state:
             if "sync_log" in st.session_state:
                 st.text("\n".join(st.session_state["sync_log"]))
                 st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
+            
