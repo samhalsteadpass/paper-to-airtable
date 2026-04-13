@@ -726,77 +726,77 @@ def ai_assign(client: OpenAI, box: dict, records: list[dict],
     return {"questionNumber": qn, "confidence": conf, "notes": note or "—"}
 
 # ── Nova Airtable schema ──────────────────────────────────────────────────
-# ── Per-type table schemas ────────────────────────────────────────────────
-# Each Nova type gets its own table with only its relevant fields.
-# No filtering needed — the table itself IS the filter.
+# ── Nova Airtable schema ──────────────────────────────────────────────────
+# ONE table, multiple views — one view per question type.
 
-_SHARED_FIELDS: list[tuple[str, str]] = [
-    ("Question Number",  "singleLineText"),
-    ("Paper Name",       "singleLineText"),
-    ("Friendly Name",    "singleLineText"),
-    ("Body",             "multilineText"),
-    ("Marks",            "number"),
-    ("Difficulty",       "number"),
-    ("Written Solution", "multilineText"),
-    ("Is Sub-question",  "checkbox"),
-    ("Parent Question",  "singleLineText"),
+NOVA_ALL_FIELDS: list[tuple[str, str]] = [
+    # Shared
+    ("Question Number",        "singleLineText"),
+    ("Paper Name",             "singleLineText"),
+    ("Nova Type",              "singleLineText"),
+    ("Friendly Name",          "singleLineText"),
+    ("Body",                   "multilineText"),
+    ("Marks",                  "number"),
+    ("Difficulty",             "number"),
+    ("Written Solution",       "multilineText"),
+    ("Is Sub-question",        "checkbox"),
+    ("Parent Question",        "singleLineText"),
+    # Simple
+    ("Answer Prefix",          "singleLineText"),
+    ("Answer",                 "singleLineText"),
+    ("Answer Unit",            "singleLineText"),
+    # Multiple Choice
+    ("MC Style",               "singleLineText"),
+    ("MC Options",             "multilineText"),
+    # Multiple Answer
+    ("Require Specific Order", "checkbox"),
+    ("MA Answers",             "multilineText"),
+    # Fraction
+    ("Answer Label",           "singleLineText"),
+    ("Numerator",              "singleLineText"),
+    ("Denominator",            "singleLineText"),
+    # Fill in Blank
+    ("Preamble",               "multilineText"),
+    ("Blank Content",          "multilineText"),
+    ("Blanks",                 "multilineText"),
+    # Essay
+    ("Question for AI",        "multilineText"),
+    ("AI Marking Criteria",    "multilineText"),
+    ("Marking Criteria",       "multilineText"),
+    ("AI Role Prompt",         "multilineText"),
+    ("ChatGPT Model",          "singleLineText"),
+    ("Pass Marks",             "number"),
+    ("Min Word Count",         "number"),
+    ("Marking Method",         "singleLineText"),
 ]
 
-NOVA_TYPE_TABLE_FIELDS: dict[str, list[tuple[str, str]]] = {
-    "simple": _SHARED_FIELDS + [
-        ("Answer Prefix", "singleLineText"),
-        ("Answer",        "singleLineText"),
-        ("Answer Unit",   "singleLineText"),
-    ],
-    "multiple_choice": _SHARED_FIELDS + [
-        ("MC Style",   "singleLineText"),
-        ("MC Options", "multilineText"),
-    ],
-    "multiple_answer": _SHARED_FIELDS + [
-        ("Require Specific Order", "checkbox"),
-        ("MA Answers",             "multilineText"),
-    ],
-    "fraction": _SHARED_FIELDS + [
-        ("Answer Label", "singleLineText"),
-        ("Numerator",    "singleLineText"),
-        ("Denominator",  "singleLineText"),
-    ],
-    "fill_in_blank": _SHARED_FIELDS + [
-        ("Preamble",      "multilineText"),
-        ("Blank Content", "multilineText"),
-        ("Blanks",        "multilineText"),
-    ],
-    "essay": _SHARED_FIELDS + [
-        ("Question for AI",     "multilineText"),
-        ("AI Marking Criteria", "multilineText"),
-        ("Marking Criteria",    "multilineText"),
-        ("AI Role Prompt",      "multilineText"),
-        ("ChatGPT Model",       "singleLineText"),
-        ("Pass Marks",          "number"),
-        ("Min Word Count",      "number"),
-        ("Marking Method",      "singleLineText"),
+# Columns shown in each type's view
+_SHARED_COLS = [
+    "Question Number", "Paper Name", "Nova Type", "Friendly Name",
+    "Body", "Marks", "Difficulty", "Written Solution",
+    "Is Sub-question", "Parent Question",
+]
+NOVA_VIEW_VISIBLE: dict[str, list[str]] = {
+    "simple":          _SHARED_COLS + ["Answer Prefix", "Answer", "Answer Unit"],
+    "multiple_choice": _SHARED_COLS + ["MC Style", "MC Options"],
+    "multiple_answer": _SHARED_COLS + ["Require Specific Order", "MA Answers"],
+    "fraction":        _SHARED_COLS + ["Answer Label", "Numerator", "Denominator"],
+    "fill_in_blank":   _SHARED_COLS + ["Preamble", "Blank Content", "Blanks"],
+    "essay": [
+        "Question Number", "Paper Name", "Nova Type", "Friendly Name",
+        "Body", "Question for AI", "AI Marking Criteria", "Marking Criteria",
+        "AI Role Prompt", "ChatGPT Model", "Pass Marks", "Min Word Count",
+        "Marking Method", "Is Sub-question", "Parent Question",
     ],
 }
-
-NOVA_TYPE_TABLE_NAMES: dict[str, str] = {
-    "simple":          "Nova – Simple Questions",
-    "multiple_choice": "Nova – Multiple Choice",
-    "multiple_answer": "Nova – Multiple Answer",
-    "fraction":        "Nova – Fraction",
-    "fill_in_blank":   "Nova – Fill in the Blank",
-    "essay":           "Nova – Essay (AI)",
+NOVA_VIEW_NAMES: dict[str, str] = {
+    "simple":          "Simple Questions",
+    "multiple_choice": "Multiple Choice",
+    "multiple_answer": "Multiple Answer",
+    "fraction":        "Fraction",
+    "fill_in_blank":   "Fill in the Blank",
+    "essay":           "Essay (AI)",
 }
-
-NOVA_VIEW_NAMES: dict[str, str] = NOVA_TYPE_TABLE_NAMES  # alias for UI labels
-
-
-def _get_all_tables(token: str, base_id: str) -> dict[str, str]:
-    """Return {table_name: table_id} for every table in the base."""
-    r = requests.get(f"{AT_META}/bases/{base_id}/tables",
-                     headers=at_headers(token), timeout=60)
-    if not r.ok:
-        return {}
-    return {t["name"]: t["id"] for t in r.json().get("tables", [])}
 
 
 def _build_fields_payload(fields: list[tuple[str, str]]) -> list[dict]:
@@ -813,37 +813,32 @@ def _build_fields_payload(fields: list[tuple[str, str]]) -> list[dict]:
     return out
 
 
-def ensure_nova_type_table(token: str, base_id: str,
-                            nova_type: str,
-                            prefix: str = "") -> tuple[str, str]:
-    """
-    Ensure a per-type Nova table exists. Returns (table_name, table_id).
-    prefix is prepended so different papers don't collide.
-    """
-    base_name = NOVA_TYPE_TABLE_NAMES.get(nova_type, f"Nova – {nova_type}")
-    tbl_name  = f"{prefix} {base_name}".strip() if prefix else base_name
-
-    existing = _get_all_tables(token, base_id)
-    if tbl_name in existing:
-        return tbl_name, existing[tbl_name]
-
-    fields_def = NOVA_TYPE_TABLE_FIELDS.get(nova_type, _SHARED_FIELDS)
-    r = requests.post(
+def ensure_nova_table(token: str, base_id: str,
+                       table_name: str) -> str:
+    """Create the Nova Questions table if it doesn't exist. Returns table_id."""
+    r = requests.get(f"{AT_META}/bases/{base_id}/tables",
+                     headers=at_headers(token), timeout=60)
+    r.raise_for_status()
+    for t in r.json().get("tables", []):
+        if t["name"] == table_name:
+            return t["id"]
+    r2 = requests.post(
         f"{AT_META}/bases/{base_id}/tables",
         headers=at_headers(token),
-        json={"name": tbl_name,
-              "fields": _build_fields_payload(fields_def)},
+        json={"name": table_name,
+              "fields": _build_fields_payload(NOVA_ALL_FIELDS)},
         timeout=60,
     )
-    if not r.ok:
+    if not r2.ok:
         raise RuntimeError(
-            f"Could not create table '{tbl_name}': {r.status_code} {r.text[:300]}")
-    return tbl_name, r.json()["id"]
+            f"Could not create table '{table_name}': "
+            f"{r2.status_code} {r2.text[:300]}")
+    return r2.json()["id"]
 
 
 def get_table_field_map(token: str, base_id: str,
                          table_id: str) -> dict[str, str]:
-    """Return {field_name: field_id} for every field in the table."""
+    """Return {field_name: field_id}."""
     r = requests.get(f"{AT_META}/bases/{base_id}/tables",
                      headers=at_headers(token), timeout=60)
     r.raise_for_status()
@@ -853,8 +848,51 @@ def get_table_field_map(token: str, base_id: str,
     return {}
 
 
-def nova_record_to_type_fields(item: dict, paper_name: str = "") -> dict:
-    """Convert a classified nova item into fields for its type-specific table."""
+def create_nova_views(token: str, base_id: str, table_id: str,
+                       field_map: dict[str, str]) -> list[str]:
+    """
+    Create one grid view per Nova type with only the relevant columns visible.
+    Returns list of log lines.
+    """
+    logs: list[str] = []
+
+    # Fetch existing views
+    r = requests.get(
+        f"{AT_META}/bases/{base_id}/tables/{table_id}/views",
+        headers=at_headers(token), timeout=60)
+    existing: dict[str, str] = {}
+    if r.ok:
+        for v in r.json().get("views", []):
+            existing[v["name"]] = v["id"]
+
+    for nova_type, view_name in NOVA_VIEW_NAMES.items():
+        if view_name in existing:
+            logs.append(f"  ↩ '{view_name}' already exists — skipped")
+            continue
+
+        visible_ids = [
+            field_map[n]
+            for n in NOVA_VIEW_VISIBLE.get(nova_type, _SHARED_COLS)
+            if n in field_map
+        ]
+        payload: dict = {"name": view_name, "type": "grid"}
+        if visible_ids:
+            payload["visibleFieldIds"] = visible_ids
+
+        r2 = requests.post(
+            f"{AT_META}/bases/{base_id}/tables/{table_id}/views",
+            headers=at_headers(token), json=payload, timeout=60)
+        if r2.ok:
+            logs.append(f"  ✓ View '{view_name}' created")
+        else:
+            logs.append(
+                f"  ⚠ View '{view_name}' failed: "
+                f"{r2.status_code} {r2.text[:100]}")
+    return logs
+
+
+def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
+    """Flatten a classified nova item into a full Airtable field dict."""
     nd  = item.get("novaData") or {}
     nt  = nd.get("novaType", "")
     rec = item.get("originalRecord") or {}
@@ -863,6 +901,7 @@ def nova_record_to_type_fields(item: dict, paper_name: str = "") -> dict:
     fields: dict = {
         "Question Number":  rec.get("questionNumber", ""),
         "Paper Name":       pn,
+        "Nova Type":        nt,
         "Friendly Name":    nd.get("friendlyName", ""),
         "Body":             nd.get("body", ""),
         "Marks":            clamp_int(nd.get("marks", 0)),
@@ -914,67 +953,55 @@ def nova_record_to_type_fields(item: dict, paper_name: str = "") -> dict:
     return fields
 
 
-def push_nova_to_airtable(token: str, base_id: str,
+def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                             items: list[dict],
-                            paper_name: str = "",
-                            table_prefix: str = "") -> tuple[int, list[str]]:
+                            paper_name: str = "") -> tuple[int, list[str]]:
     """
-    Create one table per Nova type (if needed), push records into each.
-    Returns (total_records_created, log_lines).
+    Ensure the Nova Questions table + per-type views exist, then push records.
+    Returns (records_created, log_lines).
     """
     logs: list[str] = []
 
-    by_type: dict[str, list[dict]] = {}
+    table_id = ensure_nova_table(token, base_id, table_name)
+    logs.append(f"Table '{table_name}' ready")
+
+    # Retry field map — new tables need a moment
+    field_map: dict[str, str] = {}
+    for _ in range(3):
+        field_map = get_table_field_map(token, base_id, table_id)
+        if field_map:
+            break
+        time.sleep(1)
+    logs.append(f"{len(field_map)} fields found")
+
+    view_logs = create_nova_views(token, base_id, table_id, field_map)
+    logs.extend(view_logs)
+
+    # Push records
+    payload = []
     for item in items:
         if item.get("isParent") or item.get("error"):
             continue
-        nt = (item.get("novaData") or {}).get("novaType", "")
-        if nt:
-            by_type.setdefault(nt, []).append(item)
+        raw      = nova_record_to_fields(item, paper_name)
+        filtered = {k: v for k, v in raw.items() if k in field_map}
+        payload.append({"fields": filtered})
 
-    if not by_type:
-        logs.append("No classified records to push.")
+    if not payload:
+        logs.append("No records to push.")
         return 0, logs
 
-    total_created = 0
+    url     = f"{AT_API}/{base_id}/{requests.utils.quote(table_name, safe='')}"
+    created = 0
+    for batch in chunk_list(payload, 10):
+        resp = requests.post(url, headers=at_headers(token),
+                             json={"records": batch}, timeout=60)
+        if not resp.ok:
+            logs.append(f"❌ Batch failed: {resp.status_code} {resp.text[:200]}")
+        else:
+            created += len(resp.json().get("records", []))
 
-    for nova_type, type_items in by_type.items():
-        try:
-            tbl_name, tbl_id = ensure_nova_type_table(
-                token, base_id, nova_type, prefix=table_prefix)
-            logs.append(f"✓ '{tbl_name}' — {len(type_items)} records")
-        except Exception as e:
-            logs.append(f"❌ Table creation failed for '{nova_type}': {e}")
-            continue
-
-        field_map: dict[str, str] = {}
-        for _ in range(3):
-            field_map = get_table_field_map(token, base_id, tbl_id)
-            if field_map:
-                break
-            time.sleep(1)
-
-        url     = f"{AT_API}/{base_id}/{requests.utils.quote(tbl_name, safe='')}"
-        payload = [
-            {"fields": {k: v for k, v in
-                        nova_record_to_type_fields(item, paper_name).items()
-                        if k in field_map}}
-            for item in type_items
-        ]
-
-        created = 0
-        for batch in chunk_list(payload, 10):
-            resp = requests.post(url, headers=at_headers(token),
-                                 json={"records": batch}, timeout=60)
-            if not resp.ok:
-                logs.append(f"  ❌ Batch failed: {resp.status_code} {resp.text[:150]}")
-            else:
-                created += len(resp.json().get("records", []))
-        logs.append(f"  → {created}/{len(payload)} pushed")
-        total_created += created
-
-    logs.append(f"✅ {total_created} total records across {len(by_type)} tables")
-    return total_created, logs
+    logs.append(f"✅ {created} records pushed")
+    return created, logs
 
 # ── Nova classification ───────────────────────────────────────────────────
 NOVA_TYPE_LABELS = {
@@ -2255,19 +2282,17 @@ if "nova_classified" in st.session_state:
         if not (AT_TOKEN and AT_BASE):
             st.warning("Add Airtable credentials in the sidebar to sync.")
         else:
-            nova_prefix = st.text_input(
-                "Table name prefix (optional)",
-                value=pname or "",
+            nova_tbl_name = st.text_input(
+                "Nova table name",
+                value=f"{pname or 'Nova'} – Nova Questions",
                 key="nova_sync_table",
-                help=(
-                    "Prepended to each table name, e.g. 'AQA Maths 2023' → "
-                    "'AQA Maths 2023 Nova – Simple Questions'. "
-                    "Leave blank to use the default names."
-                ),
+                help="One table is created with all fields. Six views are created inside it, one per question type.",
             )
             st.caption(
-                "Creates up to 6 tables in your base — one per question type — "
-                "each with only its relevant columns."
+                "Creates **1 table** + **6 views** (Simple, Multiple Choice, "
+                "Multiple Answer, Fraction, Fill in the Blank, Essay). "
+                "Each view shows only its relevant columns. "
+                "Add `Nova Type = [type]` as a filter in each view to finish."
             )
             if st.button("🚀 Sync Nova records to Airtable", type="primary",
                          key="nova_sync_btn"):
@@ -2277,18 +2302,23 @@ if "nova_classified" in st.session_state:
 
     if st.session_state.get("do_nova_sync"):
         st.session_state["do_nova_sync"] = False
-        _prefix = st.session_state.get("nova_sync_table", pname or "")
-        _items  = [x for x in all_nova if not x.get("isParent")]
+        _tbl   = st.session_state.get("nova_sync_table",
+                                       f"{pname or 'Nova'} – Nova Questions")
+        _items = [x for x in all_nova if not x.get("isParent")]
         with st.status("Syncing to Airtable…", expanded=True) as _status:
             try:
                 _n, _logs = push_nova_to_airtable(
-                    AT_TOKEN, AT_BASE, _items,
-                    paper_name=pname,
-                    table_prefix=_prefix)
+                    AT_TOKEN, AT_BASE, _tbl, _items, pname)
                 for line in _logs:
                     st.write(line)
+                st.info(
+                    "**One manual step per view:** open each view in Airtable, "
+                    "click Filter → Add condition → `Nova Type` is `simple` "
+                    "(or `multiple_choice`, `essay`, etc.)",
+                    icon="ℹ️",
+                )
                 _status.update(
-                    label=f"✅ {_n} records synced across question-type tables",
+                    label=f"✅ {_n} records + 6 views synced to '{_tbl}'",
                     state="complete")
                 st.session_state["nova_sync_log"] = _logs
             except Exception as e:
