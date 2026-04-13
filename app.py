@@ -1127,6 +1127,18 @@ if st.session_state.get("records") and any(all_boxes()):
         client  = OpenAI(api_key=OPENAI_KEY)
         records = st.session_state["records"]
         done = failed = 0
+        # Re-crop any boxes that lost their image data (e.g. after session restore)
+        _pdf = get_pdf()
+        if _pdf:
+            _store = boxes()
+            for _pn in _store:
+                for _b in _store[_pn]:
+                    if not _b.get("data"):
+                        try:
+                            _b["data"] = crop_from_rel(_pdf, _b["page"], _b["rel"])
+                        except Exception:
+                            pass
+                set_page_boxes(_pn, _store[_pn])
 
         with st.status("Assigning…", expanded=True) as status:
             store = boxes()
@@ -1324,6 +1336,19 @@ if "records" in st.session_state:
 
                 def log(m):
                     log_lines.append(m)
+
+                # Re-crop all boxes from current PDF so we always have fresh image data
+                _sync_pdf = get_pdf()
+                if _sync_pdf:
+                    _store = boxes()
+                    for _pn in _store:
+                        for _b in _store[_pn]:
+                            if not _b.get("data"):
+                                try:
+                                    _b["data"] = crop_from_rel(_sync_pdf, _b["page"], _b["rel"])
+                                except Exception:
+                                    pass
+                        set_page_boxes(_pn, _store[_pn])
 
                 # Always re-read and re-merge records fresh so images are attached
                 _records  = st.session_state.get("records", [])
