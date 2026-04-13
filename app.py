@@ -1995,8 +1995,7 @@ if "nova_classified" in st.session_state:
 
     if st.session_state.get("do_nova_sync"):
         st.session_state["do_nova_sync"] = False
-        _tbl   = st.session_state.get("nova_sync_table",
-                                       f"{pname or 'Nova'} – Nova Questions")
+        _tbl   = st.session_state.get("nova_sync_table", "Questions")
         _items = list(all_nova)  # includes parents (preambles)
         with st.status("Syncing to Airtable…", expanded=True) as _status:
             try:
