@@ -555,15 +555,6 @@ def ai_assign(client: OpenAI, box: dict, records: list[dict],
 
     valid = {normalise_qnum(r.get("questionNumber", "")) for r in records}
 
-    # ── DEBUG: store diagnostics in session state so we can display them ──
-    import streamlit as _st
-    _st.session_state["_debug_last_assign"] = {
-        "ai_raw":    parsed.get("questionNumber", ""),
-        "ai_norm":   qn,
-        "valid_set": sorted(valid),
-        "page":      box["page"],
-    }
-
     # Build an ordered list of all records for tiebreaking
     cand_qnums_ordered = [normalise_qnum(r.get("questionNumber", "")) for r in records]
 
@@ -868,7 +859,6 @@ if st.button("Load PDF", disabled=not (paper_file and OPENAI_KEY)):
     st.session_state["boxes"] = {}
     st.session_state.pop("sync_log", None)
     st.session_state.pop("_save_json", None)
-    st.session_state.pop("_debug_last_assign", None)
     st.session_state["sel_page_idx"] = 0
     safe_name = re.sub(r"[^a-zA-Z0-9 _-]", "", detected_name).strip() or "Questions"
     st.session_state["paper_name_for_table"] = safe_name
@@ -1159,14 +1149,7 @@ if st.session_state.get("pages") or PDF_PATH.exists():
                     st.caption(
                         f"First corner set at {clicks[0]}. Click the second corner.")
 
-            # ── Debug panel ───────────────────────────────────────────────
-            dbg = st.session_state.get("_debug_last_assign")
-            if dbg:
-                with st.expander("🔍 Last AI assignment debug", expanded=True):
-                    st.markdown(f"**Page:** {dbg['page']}")
-                    st.markdown(f"**AI returned (raw):** `{dbg['ai_raw']}`")
-                    st.markdown(f"**AI returned (normalised):** `{dbg['ai_norm']}`")
-                    st.markdown(f"**Valid set:** `{dbg['valid_set']}`")
+
 
 # ── 4. Bulk AI assign ──────────────────────────────────────────────────────
 if st.session_state.get("records") and any(all_boxes()):
