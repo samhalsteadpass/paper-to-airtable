@@ -804,6 +804,39 @@ def _build_fields_payload(fields: list[tuple[str, str]]) -> list[dict]:
     return out
 
 
+def ensure_nova_fields(token: str, base_id: str, table_id: str,
+                        field_map: dict[str, str]) -> dict[str, str]:
+    """
+    Add any NOVA_ALL_FIELDS that are missing from the existing table.
+    Returns an updated field_map.
+    """
+    existing_names = set(field_map.keys())
+    for name, ftype in NOVA_ALL_FIELDS:
+        if name in existing_names:
+            continue
+        # Build the field definition
+        if ftype == "number":
+            field_def = {"name": name, "type": "number",
+                         "options": {"precision": 0}}
+        elif ftype == "checkbox":
+            field_def = {"name": name, "type": "checkbox",
+                         "options": {"icon": "check", "color": "greenBright"}}
+        elif ftype == "multipleAttachments":
+            field_def = {"name": name, "type": "multipleAttachments"}
+        else:
+            field_def = {"name": name, "type": ftype}
+
+        r = requests.post(
+            f"{AT_META}/bases/{base_id}/tables/{table_id}/fields",
+            headers=at_headers(token),
+            json=field_def,
+            timeout=60,
+        )
+        if r.ok:
+            field_map[name] = r.json()["id"]
+    return field_map
+
+
 def upload_attachment_direct(token: str, base_id: str, table_name: str,
                               record_id: str, field_id: str,
                               filename: str, image_bytes: bytes) -> bool:
@@ -1025,6 +1058,10 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
             break
         time.sleep(1)
     logs.append(f"{len(field_map)} fields found")
+
+    # Add any fields that are missing from an older table
+    field_map = ensure_nova_fields(token, base_id, table_id, field_map)
+    logs.append(f"{len(field_map)} fields after update")
 
     # Build image map if boxes provided
     img_map = build_qnum_image_map(boxes_list or [])
