@@ -856,31 +856,30 @@ def get_table_field_map(token: str, base_id: str,
 def generate_view_script(table_name: str) -> str:
     """
     Generate an Airtable Scripting extension snippet that creates
-    all Nova views in one click. User pastes this into the Scripting
-    extension inside Airtable.
+    all Nova views in every table in the base.
     """
     view_names = list(NOVA_VIEW_NAMES.values())
     views_js   = json.dumps(view_names, indent=4)
     return f"""\
 // ── Nova Views Setup ─────────────────────────────────────────────
-// Paste this into the Airtable Scripting extension in your base,
-// then click "Run". It creates all 7 Nova question-type views.
+// Paste this into the Airtable Scripting extension, then click Run.
+// Creates all Nova question-type views in EVERY table in the base.
 // ────────────────────────────────────────────────────────────────
-const TABLE_NAME = {json.dumps(table_name)};
 const VIEW_NAMES = {views_js};
 
-const table = base.getTable(TABLE_NAME);
-const existing = new Set(table.views.map(v => v.name));
-
-for (const name of VIEW_NAMES) {{
-    if (existing.has(name)) {{
-        output.text(`↩ Already exists: ${{name}}`);
-    }} else {{
-        await table.createViewAsync(name);
-        output.text(`✓ Created: ${{name}}`);
+for (const table of base.tables) {{
+    output.text(`\\n📋 Table: ${{table.name}}`);
+    const existing = new Set(table.views.map(v => v.name));
+    for (const name of VIEW_NAMES) {{
+        if (existing.has(name)) {{
+            output.text(`  ↩ Already exists: ${{name}}`);
+        }} else {{
+            await table.createViewAsync(name);
+            output.text(`  ✓ Created: ${{name}}`);
+        }}
     }}
 }}
-output.text('Done! Add a filter to each view: Nova Type = [type]');
+output.text('\\nDone! Add a filter to each view: Nova Type = [type]');
 """
 
 
@@ -2695,3 +2694,4 @@ if "nova_classified" in st.session_state:
 
     if rendered == 0:
         st.info("No questions match the current filter.")
+      
