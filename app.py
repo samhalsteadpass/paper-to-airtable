@@ -839,11 +839,10 @@ def ensure_nova_fields(token: str, base_id: str, table_id: str,
 
 def upload_attachment_direct(token: str, base_id: str, table_name: str,
                               record_id: str, field_id: str,
-                              filename: str, image_bytes: bytes) -> bool:
+                              filename: str, image_bytes: bytes) -> tuple[bool, str]:
     """
-    Upload image bytes directly to an Airtable attachment field using the
-    uploadAttachment endpoint (no external hosting needed, 5 MB limit).
-    Returns True on success.
+    Upload image bytes directly to an Airtable attachment field.
+    Returns (success, error_message).
     """
     url = (f"https://api.airtable.com/v0/{base_id}/"
            f"{requests.utils.quote(table_name, safe='')}/{record_id}/{field_id}")
@@ -858,7 +857,13 @@ def upload_attachment_direct(token: str, base_id: str, table_name: str,
         },
         timeout=60,
     )
-    return resp.ok
+    if resp.ok:
+        return True, ""
+    try:
+        err = resp.json().get("error", {}).get("message", resp.text[:200])
+    except Exception:
+        err = resp.text[:200]
+    return False, f"{resp.status_code}: {err}"
 
 
 def build_qnum_image_map(boxes: list[dict]) -> dict[str, list[tuple[str, bytes]]]:
@@ -1107,10 +1112,11 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
     if img_map and created_records and "Images" in field_map:
         images_field_id = field_map["Images"]
         ok = fail = 0
+        first_err = ""
         for rec in created_records:
             imgs = img_map.get(rec["qn"], [])
             for filename, img_bytes in imgs:
-                success = upload_attachment_direct(
+                success, err = upload_attachment_direct(
                     token, base_id, table_name,
                     rec["id"], images_field_id,
                     filename, img_bytes)
@@ -1118,8 +1124,13 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                     ok += 1
                 else:
                     fail += 1
+                    if not first_err:
+                        first_err = err
         if ok or fail:
-            logs.append(f"🖼 Images: {ok} uploaded · {fail} failed")
+            msg = f"🖼 Images: {ok} uploaded · {fail} failed"
+            if first_err:
+                msg += f" (first error: {first_err})"
+            logs.append(msg)
     elif img_map:
         logs.append("⚠ Images field not found in table — re-sync to create it")
 
