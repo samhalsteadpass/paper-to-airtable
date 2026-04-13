@@ -877,15 +877,16 @@ def create_nova_views(token: str, base_id: str, table_id: str,
 
         payload: dict = {"name": view_name, "type": "grid"}
 
-        r2 = requests.post(
-            f"{AT_META}/bases/{base_id}/tables/{table_id}/views",
-            headers=at_headers(token), json=payload, timeout=60)
+        url_v = f"{AT_META}/bases/{base_id}/tables/{table_id}/views"
+        r2 = requests.post(url_v, headers=at_headers(token),
+                           json=payload, timeout=60)
         if r2.ok:
             logs.append(f"  ✓ View '{view_name}' created")
         else:
             logs.append(
-                f"  ⚠ View '{view_name}' failed: "
-                f"{r2.status_code} {r2.text[:100]}")
+                f"  ⚠ View '{view_name}' failed {r2.status_code}: "
+                f"url={url_v} body={json.dumps(payload)} "
+                f"resp={r2.text[:200]}")
     return logs
 
 
