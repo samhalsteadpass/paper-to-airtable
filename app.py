@@ -173,8 +173,16 @@ Rules:
   turn left? Give your answer in its simplest form.", markAllocation 2
 
 - If a multipart question has NO shared preamble (each sub-part is fully
-  self-contained), do NOT create a parent row.
-- For standalone single-part questions, extract as one row normally.
+  self-contained with its own complete question text), do NOT create a parent
+  row — just extract each sub-part directly. Example: Q20 has 20a, 20b, 20c
+  each with their own complete instruction, so extract three rows with no parent.
+- For standalone single-part questions (even if they include context or a
+  diagram before a single task), extract as ONE row with ALL the context
+  included in questionText. Do NOT split into a parent + child.
+  Example: Q26 ("A large circle and a small circle are shown...
+  Work out the shaded area.") is ONE question — extract as a single row.
+- A parent row is ONLY valid when: (1) there are 2+ answerable sub-parts AND
+  (2) there is shared text/diagram that ALL sub-parts refer back to.
 - NEVER invent a preamble that is not printed in the paper.
 - markAllocation must be an integer (0 if missing or preamble-only).
 - pageNumber = page number within this chunk only.
