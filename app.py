@@ -155,12 +155,17 @@ Each element:
 }
 
 Rules:
-- For multipart questions (e.g. Q2 with parts 2a, 2b, 2c):
-  * Create a SEPARATE row for the parent (e.g. "2") with ONLY the shared
-    preamble/context, markAllocation: 0, and hasImages: true if there is a diagram.
+- For multipart questions (e.g. Q2 with parts 2a, 2b, 2c) that have a shared
+  preamble, diagram, or context printed before the sub-parts:
+  * ONLY IF a preamble/shared context actually exists in the paper, create a
+    SEPARATE row for the parent (e.g. "2") containing ONLY that shared text,
+    with markAllocation: 0 and hasImages: true if there is a diagram.
   * Then create rows for each sub-part (2a, 2b, 2c) with just their own question text.
   * Do NOT copy the preamble into each sub-part row.
+- If a multipart question has NO shared preamble (sub-parts are self-contained),
+  do NOT create a parent row — just extract each sub-part directly.
 - For standalone questions with no sub-parts, extract as a single row normally.
+- NEVER invent or fabricate a preamble row that does not exist in the paper.
 - markAllocation must be an integer (0 if missing or preamble-only).
 - pageNumber = page number within this chunk only.
 """
