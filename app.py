@@ -145,7 +145,7 @@ Return ONLY a raw JSON array. No markdown fences. No explanation.
 Each element:
 {
   "questionNumber": "1a",
-  "questionText": "Full question including shared context",
+  "questionText": "Question text only (not shared preamble)",
   "markAllocation": 4,
   "topic": "Algebra",
   "subtopic": "Quadratics",
@@ -155,9 +155,13 @@ Each element:
 }
 
 Rules:
-- Split answerable sub-questions into separate rows.
-- Attach shared context to each child question.
-- markAllocation must be an integer (0 if missing).
+- For multipart questions (e.g. Q2 with parts 2a, 2b, 2c):
+  * Create a SEPARATE row for the parent (e.g. "2") with ONLY the shared
+    preamble/context, markAllocation: 0, and hasImages: true if there is a diagram.
+  * Then create rows for each sub-part (2a, 2b, 2c) with just their own question text.
+  * Do NOT copy the preamble into each sub-part row.
+- For standalone questions with no sub-parts, extract as a single row normally.
+- markAllocation must be an integer (0 if missing or preamble-only).
 - pageNumber = page number within this chunk only.
 """
 
@@ -977,6 +981,28 @@ if st.session_state.get("pages") or PDF_PATH.exists():
                     st.session_state["sel_page_idx"] = idx + 1
                     st.rerun()
 
+            # ── Go to page ────────────────────────────────────────────────
+            goto_col1, goto_col2 = st.columns([2, 1])
+            with goto_col1:
+                goto_val = st.number_input(
+                    "Go to page",
+                    min_value=pages[0],
+                    max_value=pages[-1],
+                    value=sel_page,
+                    step=1,
+                    key="goto_page_input",
+                    label_visibility="collapsed",
+                )
+            with goto_col2:
+                if st.button("Go", key="goto_page_btn"):
+                    # Find the closest page in the pages list
+                    target = min(pages, key=lambda p: abs(p - int(goto_val)))
+                    new_idx = pages.index(target)
+                    if new_idx != idx:
+                        st.session_state[f"clicks_{sel_page}"] = []
+                        st.session_state["sel_page_idx"] = new_idx
+                        st.rerun()
+
             # ── Assignment mode ───────────────────────────────────────────
             mode        = st.radio("Assignment mode", ["AI suggest", "Manual"],
                                    horizontal=True,
@@ -1247,10 +1273,31 @@ if "records" in st.session_state:
         q_notes.setdefault(qn, []).append(
             f"{b['name']}: {b.get('notes', '')}{ai_part}")
 
+    def bare_num(s: str) -> str:
+        s = s.lstrip("Qq")
+        return s.lstrip("0") or s
+
+    def is_child_of(child_qn: str, parent_qn: str) -> bool:
+        c = bare_num(child_qn); p = bare_num(parent_qn)
+        if not c.startswith(p): return False
+        rest = c[len(p):]
+        return len(rest) > 0 and not rest[0].isdigit()
+
     for r in records:
         qn    = normalise_qnum(r.get("questionNumber", ""))
-        imgs  = q_imgs.get(qn, [])
-        notes = q_notes.get(qn, [])
+        imgs  = list(q_imgs.get(qn, []))
+        notes = list(q_notes.get(qn, []))
+        # Propagate images from parent to children
+        # e.g. box assigned to "2" also appears on "2a", "2b", "2c"
+        for parent_qn, parent_imgs in q_imgs.items():
+            if parent_qn != qn and is_child_of(qn, parent_qn):
+                for img in parent_imgs:
+                    if img not in imgs:
+                        imgs.append(img)
+                for note in q_notes.get(parent_qn, []):
+                    prop = f"{note} [from Q{parent_qn}]"
+                    if prop not in notes:
+                        notes.append(prop)
         r["images"]                 = imgs
         r["hasImages"]              = bool(imgs) or r.get("hasImages", False)
         r["imageMappingConfidence"] = (
@@ -1397,10 +1444,25 @@ if "records" in st.session_state:
                                 if _b.get("ai_qnum") else "")
                     _q_notes.setdefault(_qn, []).append(
                         f"{_b['name']}: {_b.get('notes', '')}{_ai_part}")
+                def _bare(s):
+                    s = s.lstrip("Qq"); return s.lstrip("0") or s
+                def _is_child_of(c, p):
+                    cb = _bare(c); pb = _bare(p)
+                    if not cb.startswith(pb): return False
+                    rest = cb[len(pb):]
+                    return len(rest) > 0 and not rest[0].isdigit()
+
                 for _r in _records:
-                    _qn   = normalise_qnum(_r.get("questionNumber", ""))
-                    _imgs  = _q_imgs.get(_qn, [])
-                    _notes = _q_notes.get(_qn, [])
+                    _qn    = normalise_qnum(_r.get("questionNumber", ""))
+                    _imgs  = list(_q_imgs.get(_qn, []))
+                    _notes = list(_q_notes.get(_qn, []))
+                    for _pqn, _pimgs in _q_imgs.items():
+                        if _pqn != _qn and _is_child_of(_qn, _pqn):
+                            for _img in _pimgs:
+                                if _img not in _imgs: _imgs.append(_img)
+                            for _note in _q_notes.get(_pqn, []):
+                                _prop = f"{_note} [from Q{_pqn}]"
+                                if _prop not in _notes: _notes.append(_prop)
                     _r["images"]                 = _imgs
                     _r["hasImages"]              = bool(_imgs) or _r.get("hasImages", False)
                     _r["imageMappingConfidence"] = (
@@ -1492,4 +1554,3 @@ if "records" in st.session_state:
             if "sync_log" in st.session_state:
                 st.text("\n".join(st.session_state["sync_log"]))
                 st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
-            
