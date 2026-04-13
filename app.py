@@ -853,41 +853,35 @@ def get_table_field_map(token: str, base_id: str,
     return {}
 
 
-def create_nova_views(token: str, base_id: str, table_id: str,
-                       field_map: dict[str, str]) -> list[str]:
+def generate_view_script(table_name: str) -> str:
     """
-    Create one grid view per Nova type with only the relevant columns visible.
-    Returns list of log lines.
+    Generate an Airtable Scripting extension snippet that creates
+    all Nova views in one click. User pastes this into the Scripting
+    extension inside Airtable.
     """
-    logs: list[str] = []
+    view_names = list(NOVA_VIEW_NAMES.values())
+    views_js   = json.dumps(view_names, indent=4)
+    return f"""\
+// ── Nova Views Setup ─────────────────────────────────────────────
+// Paste this into the Airtable Scripting extension in your base,
+// then click "Run". It creates all 7 Nova question-type views.
+// ────────────────────────────────────────────────────────────────
+const TABLE_NAME = {json.dumps(table_name)};
+const VIEW_NAMES = {views_js};
 
-    # Fetch existing views
-    r = requests.get(
-        f"{AT_META}/bases/{base_id}/tables/{table_id}/views",
-        headers=at_headers(token), timeout=60)
-    existing: dict[str, str] = {}
-    if r.ok:
-        for v in r.json().get("views", []):
-            existing[v["name"]] = v["id"]
+const table = base.getTable(TABLE_NAME);
+const existing = new Set(table.views.map(v => v.name));
 
-    for nova_type, view_name in NOVA_VIEW_NAMES.items():
-        if view_name in existing:
-            logs.append(f"  ↩ '{view_name}' already exists — skipped")
-            continue
-
-        payload: dict = {"name": view_name, "type": "grid"}
-
-        url_v = f"{AT_META}/bases/{base_id}/tables/{table_id}/views"
-        r2 = requests.post(url_v, headers=at_headers(token),
-                           json=payload, timeout=60)
-        if r2.ok:
-            logs.append(f"  ✓ View '{view_name}' created")
-        else:
-            logs.append(
-                f"  ⚠ View '{view_name}' failed {r2.status_code}: "
-                f"url={url_v} body={json.dumps(payload)} "
-                f"resp={r2.text[:200]}")
-    return logs
+for (const name of VIEW_NAMES) {{
+    if (existing.has(name)) {{
+        output.text(`↩ Already exists: ${{name}}`);
+    }} else {{
+        await table.createViewAsync(name);
+        output.text(`✓ Created: ${{name}}`);
+    }}
+}}
+output.text('Done! Add a filter to each view: Nova Type = [type]');
+"""
 
 
 def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
@@ -969,11 +963,12 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
 
 def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                             items: list[dict],
-                            paper_name: str = "") -> tuple[int, list[str]]:
+                            paper_name: str = "") -> tuple[int, list[str], str]:
     """
-    Ensure the Nova Questions table + per-type views exist, then push records.
-    Includes parent preamble records as Nova Type = multi_part.
-    Returns (records_created, log_lines).
+    Ensure the Nova Questions table exists, push records.
+    Returns (records_created, log_lines, airtable_view_script).
+    Views cannot be created via the REST API — caller should show
+    the returned script to the user to run in the Scripting extension.
     """
     logs: list[str] = []
 
@@ -988,10 +983,6 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
         time.sleep(1)
     logs.append(f"{len(field_map)} fields found")
 
-    view_logs = create_nova_views(token, base_id, table_id, field_map)
-    logs.extend(view_logs)
-
-    # Push all items — including parent preamble records, skip errored ones
     payload = []
     for item in items:
         if item.get("error"):
@@ -1002,7 +993,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
 
     if not payload:
         logs.append("No records to push.")
-        return 0, logs
+        return 0, logs, generate_view_script(table_name)
 
     url     = f"{AT_API}/{base_id}/{requests.utils.quote(table_name, safe='')}"
     created = 0
@@ -1015,7 +1006,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
             created += len(resp.json().get("records", []))
 
     logs.append(f"✅ {created} records pushed")
-    return created, logs
+    return created, logs, generate_view_script(table_name)
 
 # ── Nova classification ───────────────────────────────────────────────────
 NOVA_TYPE_LABELS = {
@@ -2321,26 +2312,40 @@ if "nova_classified" in st.session_state:
         _items = list(all_nova)  # includes parents (preambles)
         with st.status("Syncing to Airtable…", expanded=True) as _status:
             try:
-                _n, _logs = push_nova_to_airtable(
+                _n, _logs, _script = push_nova_to_airtable(
                     AT_TOKEN, AT_BASE, _tbl, _items, pname)
                 for line in _logs:
                     st.write(line)
-                st.info(
-                    "**One manual step per view:** open each view in Airtable, "
-                    "click Filter → Add condition → `Nova Type` is `simple` "
-                    "(or `multiple_choice`, `essay`, etc.)",
-                    icon="ℹ️",
-                )
                 _status.update(
-                    label=f"✅ {_n} records + 6 views synced to '{_tbl}'",
+                    label=f"✅ {_n} records pushed to '{_tbl}'",
                     state="complete")
-                st.session_state["nova_sync_log"] = _logs
+                st.session_state["nova_sync_log"]    = _logs
+                st.session_state["nova_view_script"] = _script
+                st.session_state["nova_sync_table_done"] = _tbl
             except Exception as e:
                 st.error(f"Sync failed: {e}")
                 _status.update(label="❌ Sync failed", state="error")
 
     if "nova_sync_log" in st.session_state:
         st.markdown(f"[Open base in Airtable →](https://airtable.com/{AT_BASE})")
+
+    if "nova_view_script" in st.session_state:
+        _done_tbl = st.session_state.get("nova_sync_table_done", "")
+        st.divider()
+        st.markdown("**Step 2 — Create views in Airtable (30 seconds)**")
+        st.caption(
+            "The Airtable REST API can't create views, but the built-in "
+            "**Scripting extension** can. Copy the script below, open your base, "
+            "add a Scripting extension, paste and click **Run**. "
+            "All 7 views appear instantly."
+        )
+        st.code(st.session_state["nova_view_script"], language="javascript")
+        st.info(
+            "After running the script, open each view → click **Filter** → "
+            "**Add condition** → `Nova Type` **is** `simple` "
+            "(use the matching type for each view).",
+            icon="ℹ️",
+        )
 
     st.divider()
 
