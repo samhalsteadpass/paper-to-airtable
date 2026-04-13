@@ -860,26 +860,35 @@ def generate_view_script(table_name: str) -> str:
     """
     view_names = list(NOVA_VIEW_NAMES.values())
     views_js   = json.dumps(view_names, indent=4)
+    # Build the filter instructions comment
+    filter_lines = "\n".join(
+        f"//   {v}  →  Nova Type  is  \"{k}\""
+        for k, v in NOVA_VIEW_NAMES.items()
+    )
     return f"""\
 // ── Nova Views Setup ─────────────────────────────────────────────
-// Paste this into the Airtable Scripting extension, then click Run.
-// Creates all Nova question-type views in EVERY table in the base.
+// Paste into the Airtable Scripting extension, then click Run.
+// Creates all Nova question-type views in every table in the base.
+//
+// After running, manually add a filter to each view:
+//   Open view → Filter → Add condition → Nova Type → is → [value]
+{filter_lines}
 // ────────────────────────────────────────────────────────────────
 const VIEW_NAMES = {views_js};
 
 for (const table of base.tables) {{
-    output.text(`\\n📋 Table: ${{table.name}}`);
+    output.text(`\\n📋 ${{table.name}}`);
     const existing = new Set(table.views.map(v => v.name));
     for (const name of VIEW_NAMES) {{
         if (existing.has(name)) {{
-            output.text(`  ↩ Already exists: ${{name}}`);
+            output.text(`  ↩  ${{name}} (already exists)`);
         }} else {{
             await table.createViewAsync(name);
-            output.text(`  ✓ Created: ${{name}}`);
+            output.text(`  ✓  ${{name}}`);
         }}
     }}
 }}
-output.text('\\nDone! Add a filter to each view: Nova Type = [type]');
+output.text('\\n✅ Done.');
 """
 
 
@@ -2694,4 +2703,3 @@ if "nova_classified" in st.session_state:
 
     if rendered == 0:
         st.info("No questions match the current filter.")
-      
