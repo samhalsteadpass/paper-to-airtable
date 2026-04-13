@@ -42,7 +42,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 TEXT_MODEL        = "gpt-4.1-mini"
 VISION_MODEL      = "gpt-4.1"
 MAX_OUTPUT_TOKENS = 8000
-CHUNK_PAGES       = 2
+CHUNK_PAGES       = 3
 MAX_WORKERS       = 3
 MAX_RETRIES       = 4
 BASE_BACKOFF      = 2
@@ -155,17 +155,27 @@ Each element:
 }
 
 Rules:
-- For multipart questions (e.g. Q2 with parts 2a, 2b, 2c) that have a shared
-  preamble, diagram, or context printed before the sub-parts:
-  * ONLY IF a preamble/shared context actually exists in the paper, create a
-    SEPARATE row for the parent (e.g. "2") containing ONLY that shared text,
-    with markAllocation: 0 and hasImages: true if there is a diagram.
-  * Then create rows for each sub-part (2a, 2b, 2c) with just their own question text.
-  * Do NOT copy the preamble into each sub-part row.
-- If a multipart question has NO shared preamble (sub-parts are self-contained),
-  do NOT create a parent row — just extract each sub-part directly.
-- For standalone questions with no sub-parts, extract as a single row normally.
-- NEVER invent or fabricate a preamble row that does not exist in the paper.
+- For multipart questions that have shared context/preamble printed BEFORE the
+  sub-parts (e.g. a scenario, diagram, or data that all sub-parts refer to):
+  * Create a SEPARATE parent row (e.g. "7") with ONLY that shared text,
+    markAllocation: 0, and hasImages: true if a diagram/table/image is present.
+  * Then create rows for each sub-part (7a, 7b) with just their own question text.
+  * Do NOT copy the preamble text into the sub-part rows.
+
+  EXAMPLE — this paper's Q7:
+  Parent row: questionNumber "7", questionText "120 people visit a maze.
+  80 are children, the rest are adults. At the start of the maze you can turn
+  left or right. 45 children turn left. 75 people in total turn left.",
+  markAllocation 0, hasImages true (frequency tree diagram)
+  Child row: questionNumber "7a", questionText "Complete the frequency tree.",
+  markAllocation 4
+  Child row: questionNumber "7b", questionText "What fraction of the children
+  turn left? Give your answer in its simplest form.", markAllocation 2
+
+- If a multipart question has NO shared preamble (each sub-part is fully
+  self-contained), do NOT create a parent row.
+- For standalone single-part questions, extract as one row normally.
+- NEVER invent a preamble that is not printed in the paper.
 - markAllocation must be an integer (0 if missing or preamble-only).
 - pageNumber = page number within this chunk only.
 """
