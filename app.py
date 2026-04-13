@@ -724,6 +724,7 @@ NOVA_ALL_FIELDS: list[tuple[str, str]] = [
     ("Written Solution",       "multilineText"),
     ("Is Sub-question",        "checkbox"),
     ("Parent Question",        "singleLineText"),
+    ("Images",                 "multipleAttachments"),
     # Simple
     ("Answer Prefix",          "singleLineText"),
     ("Answer",                 "singleLineText"),
@@ -796,9 +797,75 @@ def _build_fields_payload(fields: list[tuple[str, str]]) -> list[dict]:
         elif ftype == "checkbox":
             out.append({"name": name, "type": "checkbox",
                         "options": {"icon": "check", "color": "greenBright"}})
+        elif ftype == "multipleAttachments":
+            out.append({"name": name, "type": "multipleAttachments"})
         else:
             out.append({"name": name, "type": ftype})
     return out
+
+
+def upload_attachment_direct(token: str, base_id: str, table_name: str,
+                              record_id: str, field_id: str,
+                              filename: str, image_bytes: bytes) -> bool:
+    """
+    Upload image bytes directly to an Airtable attachment field using the
+    uploadAttachment endpoint (no external hosting needed, 5 MB limit).
+    Returns True on success.
+    """
+    url = (f"https://api.airtable.com/v0/{base_id}/"
+           f"{requests.utils.quote(table_name, safe='')}/{record_id}/{field_id}")
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
+        json={
+            "contentType": "image/png",
+            "file":        base64.b64encode(image_bytes).decode(),
+            "filename":    filename,
+        },
+        timeout=60,
+    )
+    return resp.ok
+
+
+def build_qnum_image_map(boxes: list[dict]) -> dict[str, list[tuple[str, bytes]]]:
+    """
+    Build {question_number: [(filename, image_bytes), ...]} from drawn boxes.
+    Also propagates parent-assigned boxes to child question numbers.
+    """
+    def _bare(s: str) -> str:
+        s = normalise_qnum(s).lstrip("Qq")
+        return s.lstrip("0") or s
+
+    def _is_child_of(child: str, parent: str) -> bool:
+        cb, pb = _bare(child), _bare(parent)
+        if not cb.startswith(pb): return False
+        rest = cb[len(pb):]
+        return len(rest) > 0 and not rest[0].isdigit()
+
+    direct: dict[str, list[tuple[str, bytes]]] = {}
+    for b in boxes:
+        qn = normalise_qnum(b.get("questionNumber", ""))
+        if not qn or not b.get("data"):
+            continue
+        direct.setdefault(qn, []).append((b["name"], b["data"]))
+
+    # Propagate: if a box is assigned to parent "7", also add to "7a", "7b"
+    result: dict[str, list[tuple[str, bytes]]] = {}
+    for qn, imgs in direct.items():
+        result.setdefault(qn, []).extend(imgs)
+
+    # Second pass: add parent images to children
+    all_qnums = list(direct.keys())
+    for parent_qn, parent_imgs in direct.items():
+        for child_qn in all_qnums:
+            if child_qn != parent_qn and _is_child_of(child_qn, parent_qn):
+                result.setdefault(child_qn, [])
+                for img in parent_imgs:
+                    if img not in result[child_qn]:
+                        result[child_qn].append(img)
+
+    return result
 
 
 def ensure_nova_table(token: str, base_id: str,
@@ -939,12 +1006,12 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
 
 def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                             items: list[dict],
-                            paper_name: str = "") -> tuple[int, list[str], str]:
+                            paper_name: str = "",
+                            boxes_list: list[dict] | None = None,
+                            ) -> tuple[int, list[str], str]:
     """
-    Ensure the Nova Questions table exists, push records.
+    Ensure the Questions table exists, push records, then upload images.
     Returns (records_created, log_lines, manual_view_instructions).
-    Views cannot be created via any Airtable API — caller shows
-    the returned instructions to the user.
     """
     logs: list[str] = []
 
@@ -959,13 +1026,21 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
         time.sleep(1)
     logs.append(f"{len(field_map)} fields found")
 
+    # Build image map if boxes provided
+    img_map = build_qnum_image_map(boxes_list or [])
+
     payload = []
+    payload_qnums = []  # track question number per payload record
     for item in items:
         if item.get("error"):
             continue
-        raw      = nova_record_to_fields(item, paper_name)
-        filtered = {k: v for k, v in raw.items() if k in field_map}
+        raw     = nova_record_to_fields(item, paper_name)
+        filtered = {k: v for k, v in raw.items()
+                    if k in field_map and k != "Images"}  # images uploaded separately
         payload.append({"fields": filtered})
+        payload_qnums.append(normalise_qnum(
+            (item.get("originalRecord") or {}).get("questionNumber",
+             item.get("questionNumber", ""))))
 
     if not payload:
         logs.append("No records to push.")
@@ -973,15 +1048,44 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
 
     url     = f"{AT_API}/{base_id}/{requests.utils.quote(table_name, safe='')}"
     created = 0
-    for batch in chunk_list(payload, 10):
+    created_records: list[dict] = []  # collect {id, questionNumber}
+
+    for i, batch in enumerate(chunk_list(payload, 10)):
         resp = requests.post(url, headers=at_headers(token),
                              json={"records": batch}, timeout=60)
         if not resp.ok:
             logs.append(f"❌ Batch failed: {resp.status_code} {resp.text[:200]}")
         else:
-            created += len(resp.json().get("records", []))
+            batch_records = resp.json().get("records", [])
+            created += len(batch_records)
+            # Map each returned record ID to its question number
+            for j, rec in enumerate(batch_records):
+                global_idx = i * 10 + j
+                qn = payload_qnums[global_idx] if global_idx < len(payload_qnums) else ""
+                created_records.append({"id": rec["id"], "qn": qn})
 
     logs.append(f"✅ {created} records pushed")
+
+    # Upload images
+    if img_map and created_records and "Images" in field_map:
+        images_field_id = field_map["Images"]
+        ok = fail = 0
+        for rec in created_records:
+            imgs = img_map.get(rec["qn"], [])
+            for filename, img_bytes in imgs:
+                success = upload_attachment_direct(
+                    token, base_id, table_name,
+                    rec["id"], images_field_id,
+                    filename, img_bytes)
+                if success:
+                    ok += 1
+                else:
+                    fail += 1
+        if ok or fail:
+            logs.append(f"🖼 Images: {ok} uploaded · {fail} failed")
+    elif img_map:
+        logs.append("⚠ Images field not found in table — re-sync to create it")
+
     return created, logs, generate_view_instructions(table_name)
 
 # ── Nova classification ───────────────────────────────────────────────────
@@ -1997,10 +2101,24 @@ if "nova_classified" in st.session_state:
         st.session_state["do_nova_sync"] = False
         _tbl   = st.session_state.get("nova_sync_table", "Questions")
         _items = list(all_nova)  # includes parents (preambles)
+
+        # Re-crop any boxes that lost image data after session restore
+        _sync_pdf = get_pdf()
+        if _sync_pdf:
+            _store = boxes()
+            for _pn in _store:
+                for _b in _store[_pn]:
+                    if not _b.get("data"):
+                        try:
+                            _b["data"] = crop_from_rel(_sync_pdf, _b["page"], _b["rel"])
+                        except Exception:
+                            pass
+                set_page_boxes(_pn, _store[_pn])
         with st.status("Syncing to Airtable…", expanded=True) as _status:
             try:
                 _n, _logs, _script = push_nova_to_airtable(
-                    AT_TOKEN, AT_BASE, _tbl, _items, pname)
+                    AT_TOKEN, AT_BASE, _tbl, _items, pname,
+                    boxes_list=all_boxes())
                 for line in _logs:
                     st.write(line)
                 _status.update(
