@@ -853,43 +853,28 @@ def get_table_field_map(token: str, base_id: str,
     return {}
 
 
-def generate_view_script(table_name: str) -> str:
-    """
-    Generate an Airtable Scripting extension snippet that creates
-    all Nova views in every table in the base.
-    """
-    view_names = list(NOVA_VIEW_NAMES.values())
-    views_js   = json.dumps(view_names, indent=4)
-    # Build the filter instructions comment
-    filter_lines = "\n".join(
-        f"//   {v}  →  Nova Type  is  \"{k}\""
-        for k, v in NOVA_VIEW_NAMES.items()
-    )
-    return f"""\
-// ── Nova Views Setup ─────────────────────────────────────────────
-// Paste into the Airtable Scripting extension, then click Run.
-// Creates all Nova question-type views in every table in the base.
-//
-// After running, manually add a filter to each view:
-//   Open view → Filter → Add condition → Nova Type → is → [value]
-{filter_lines}
-// ────────────────────────────────────────────────────────────────
-const VIEW_NAMES = {views_js};
-
-for (const table of base.tables) {{
-    output.text(`\\n📋 ${{table.name}}`);
-    const existing = new Set(table.views.map(v => v.name));
-    for (const name of VIEW_NAMES) {{
-        if (existing.has(name)) {{
-            output.text(`  ↩  ${{name}} (already exists)`);
-        }} else {{
-            await table.createViewAsync(name);
-            output.text(`  ✓  ${{name}}`);
-        }}
-    }}
-}}
-output.text('\\n✅ Done.');
-"""
+def generate_view_instructions(table_name: str) -> str:
+    """Return plain-text instructions for manually creating views in Airtable."""
+    lines = [
+        f"Table: {table_name}",
+        "",
+        "Neither the Airtable REST API nor the Scripting extension",
+        "can create views programmatically — views must be made manually.",
+        "",
+        "Steps (takes ~90 seconds):",
+        "  1. Open the table in Airtable",
+        "  2. Views panel → '+ Create new view' → Grid",
+        "  3. Create these 7 views, one at a time:",
+    ]
+    for nova_type, view_name in NOVA_VIEW_NAMES.items():
+        lines.append(f"       • {view_name}")
+    lines += [
+        "",
+        "  4. For each view, click Filter → Add condition:",
+    ]
+    for nova_type, view_name in NOVA_VIEW_NAMES.items():
+        lines.append(f"       • {view_name}  →  Nova Type  is  \"{nova_type}\"")
+    return "\n".join(lines)
 
 
 def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
@@ -974,9 +959,9 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                             paper_name: str = "") -> tuple[int, list[str], str]:
     """
     Ensure the Nova Questions table exists, push records.
-    Returns (records_created, log_lines, airtable_view_script).
-    Views cannot be created via the REST API — caller should show
-    the returned script to the user to run in the Scripting extension.
+    Returns (records_created, log_lines, manual_view_instructions).
+    Views cannot be created via any Airtable API — caller shows
+    the returned instructions to the user.
     """
     logs: list[str] = []
 
@@ -1001,7 +986,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
 
     if not payload:
         logs.append("No records to push.")
-        return 0, logs, generate_view_script(table_name)
+        return 0, logs, generate_view_instructions(table_name)
 
     url     = f"{AT_API}/{base_id}/{requests.utils.quote(table_name, safe='')}"
     created = 0
@@ -1014,7 +999,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
             created += len(resp.json().get("records", []))
 
     logs.append(f"✅ {created} records pushed")
-    return created, logs, generate_view_script(table_name)
+    return created, logs, generate_view_instructions(table_name)
 
 # ── Nova classification ───────────────────────────────────────────────────
 NOVA_TYPE_LABELS = {
@@ -2297,15 +2282,13 @@ if "nova_classified" in st.session_state:
         else:
             nova_tbl_name = st.text_input(
                 "Nova table name",
-                value=f"{pname or 'Nova'} – Nova Questions",
+                value="Nova Questions",
                 key="nova_sync_table",
-                help="One table is created with all fields. Six views are created inside it, one per question type.",
+                help="All papers sync into this one shared table. The Paper Name field tells them apart.",
             )
             st.caption(
-                "Creates **1 table** + **6 views** (Simple, Multiple Choice, "
-                "Multiple Answer, Fraction, Fill in the Blank, Essay). "
-                "Each view shows only its relevant columns. "
-                "Add `Nova Type = [type]` as a filter in each view to finish."
+                "All papers are appended to **one shared table**. "
+                "Set up the 7 views once and they work for every paper you sync."
             )
             if st.button("🚀 Sync Nova records to Airtable", type="primary",
                          key="nova_sync_btn"):
@@ -2338,22 +2321,20 @@ if "nova_classified" in st.session_state:
         st.markdown(f"[Open base in Airtable →](https://airtable.com/{AT_BASE})")
 
     if "nova_view_script" in st.session_state:
-        _done_tbl = st.session_state.get("nova_sync_table_done", "")
         st.divider()
-        st.markdown("**Step 2 — Create views in Airtable (30 seconds)**")
+        st.markdown("**One-time setup — Create views in Airtable (~90 seconds)**")
         st.caption(
-            "The Airtable REST API can't create views, but the built-in "
-            "**Scripting extension** can. Copy the script below, open your base, "
-            "add a Scripting extension, paste and click **Run**. "
-            "All 7 views appear instantly."
+            "Do this once. Views persist for every paper you sync after this. "
+            "Views panel → **+ Create new view** → **Grid**, then name it and add the filter."
         )
-        st.code(st.session_state["nova_view_script"], language="javascript")
-        st.info(
-            "After running the script, open each view → click **Filter** → "
-            "**Add condition** → `Nova Type` **is** `simple` "
-            "(use the matching type for each view).",
-            icon="ℹ️",
-        )
+        view_rows = []
+        for nova_type, view_name in NOVA_VIEW_NAMES.items():
+            view_rows.append({
+                "View name": view_name,
+                "Filter: Nova Type  is": nova_type,
+            })
+        import pandas as _pd
+        st.dataframe(_pd.DataFrame(view_rows), hide_index=True, use_container_width=True)
 
     st.divider()
 
