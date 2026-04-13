@@ -841,9 +841,17 @@ if st.button("Load PDF", disabled=not (paper_file and OPENAI_KEY)):
     st.session_state["exam_type"]  = detected_type
     st.session_state.pop("records", None)
     st.session_state["boxes"] = {}
+    st.session_state.pop("sync_log", None)
+    st.session_state.pop("_save_json", None)
+    st.session_state.pop("_debug_last_assign", None)
+    st.session_state["sel_page_idx"] = 0
     safe_name = re.sub(r"[^a-zA-Z0-9 _-]", "", detected_name).strip() or "Questions"
     st.session_state["paper_name_for_table"] = safe_name
-    st.session_state.pop("sync_log", None)
+    # Clear autosave so old paper doesn't restore on next restart
+    try:
+        AUTOSAVE_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
     st.success(
         f"Loaded — {len(st.session_state['pages'])} question pages found.  "
         f"Detected: **{detected_name}** · **{detected_type}**"
