@@ -685,11 +685,15 @@ def get_existing_fields(token, base_id, table) -> set[str]:
             return {f["name"] for f in t.get("fields", [])}
     return set()
 
-def upload_cloudinary(cloud: str, preset: str, img: dict) -> str | None:
-    pid  = img["name"].rsplit(".", 1)[0].replace(".", "_")
+def upload_cloudinary(cloud: str, preset: str, img: dict, paper_name: str = "") -> str | None:
+    # Include paper name in public_id so different papers never share cached images
+    base = img["name"].rsplit(".", 1)[0].replace(".", "_")
+    safe_paper = re.sub(r"[^a-zA-Z0-9_-]", "_", paper_name)[:40] if paper_name else "paper"
+    pid  = f"{safe_paper}_{base}"
     resp = requests.post(
         f"{CLOUDINARY_API}/{cloud}/image/upload",
-        data={"upload_preset": preset, "public_id": pid},
+        data={"upload_preset": preset, "public_id": pid, "overwrite": "true",
+              "invalidate": "true"},
         files={"file": (img["name"], img["data"], "image/png")},
         timeout=120,
     )
@@ -1382,8 +1386,9 @@ if "records" in st.session_state:
                 if ab and CLD_CLOUD and CLD_PRESET:
                     log(f"Uploading {len(ab)} visuals to Cloudinary…")
 
-                    def _upload(b):
-                        return b["name"], upload_cloudinary(CLD_CLOUD, CLD_PRESET, b)
+                    _paper = st.session_state.get("paper_name", "")
+                    def _upload(b, _p=_paper):
+                        return b["name"], upload_cloudinary(CLD_CLOUD, CLD_PRESET, b, _p)
 
                     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
                         for name, url in [f.result() for f in
