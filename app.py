@@ -788,6 +788,10 @@ NOVA_VIEW_VISIBLE: dict[str, list[str]] = {
         "AI Role Prompt", "ChatGPT Model", "Pass Marks", "Min Word Count",
         "Marking Method", "Is Sub-question", "Parent Question",
     ],
+    "multi_part": [
+        "Question Number", "Paper Name", "Nova Type", "Friendly Name",
+        "Body", "Marks",
+    ],
 }
 NOVA_VIEW_NAMES: dict[str, str] = {
     "simple":          "Simple Questions",
@@ -796,6 +800,7 @@ NOVA_VIEW_NAMES: dict[str, str] = {
     "fraction":        "Fraction",
     "fill_in_blank":   "Fill in the Blank",
     "essay":           "Essay (AI)",
+    "multi_part":      "Multi-part (Preambles)",
 }
 
 
@@ -870,14 +875,7 @@ def create_nova_views(token: str, base_id: str, table_id: str,
             logs.append(f"  ↩ '{view_name}' already exists — skipped")
             continue
 
-        visible_ids = [
-            field_map[n]
-            for n in NOVA_VIEW_VISIBLE.get(nova_type, _SHARED_COLS)
-            if n in field_map
-        ]
         payload: dict = {"name": view_name, "type": "grid"}
-        if visible_ids:
-            payload["visibleFieldIds"] = visible_ids
 
         r2 = requests.post(
             f"{AT_META}/bases/{base_id}/tables/{table_id}/views",
@@ -897,6 +895,21 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
     nt  = nd.get("novaType", "")
     rec = item.get("originalRecord") or {}
     pn  = rec.get("paperName") or paper_name
+
+    # Parent preamble records have no novaData — handle separately
+    if item.get("isParent"):
+        return {
+            "Question Number":  rec.get("questionNumber", ""),
+            "Paper Name":       pn,
+            "Nova Type":        "multi_part",
+            "Friendly Name":    f"{pn} Q{rec.get('questionNumber', '')}",
+            "Body":             rec.get("questionText", ""),
+            "Marks":            0,
+            "Difficulty":       1,
+            "Written Solution": "",
+            "Is Sub-question":  False,
+            "Parent Question":  "",
+        }
 
     fields: dict = {
         "Question Number":  rec.get("questionNumber", ""),
@@ -958,6 +971,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                             paper_name: str = "") -> tuple[int, list[str]]:
     """
     Ensure the Nova Questions table + per-type views exist, then push records.
+    Includes parent preamble records as Nova Type = multi_part.
     Returns (records_created, log_lines).
     """
     logs: list[str] = []
@@ -965,7 +979,6 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
     table_id = ensure_nova_table(token, base_id, table_name)
     logs.append(f"Table '{table_name}' ready")
 
-    # Retry field map — new tables need a moment
     field_map: dict[str, str] = {}
     for _ in range(3):
         field_map = get_table_field_map(token, base_id, table_id)
@@ -977,10 +990,10 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
     view_logs = create_nova_views(token, base_id, table_id, field_map)
     logs.extend(view_logs)
 
-    # Push records
+    # Push all items — including parent preamble records, skip errored ones
     payload = []
     for item in items:
-        if item.get("isParent") or item.get("error"):
+        if item.get("error"):
             continue
         raw      = nova_record_to_fields(item, paper_name)
         filtered = {k: v for k, v in raw.items() if k in field_map}
@@ -2304,7 +2317,7 @@ if "nova_classified" in st.session_state:
         st.session_state["do_nova_sync"] = False
         _tbl   = st.session_state.get("nova_sync_table",
                                        f"{pname or 'Nova'} – Nova Questions")
-        _items = [x for x in all_nova if not x.get("isParent")]
+        _items = list(all_nova)  # includes parents (preambles)
         with st.status("Syncing to Airtable…", expanded=True) as _status:
             try:
                 _n, _logs = push_nova_to_airtable(
