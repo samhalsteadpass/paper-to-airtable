@@ -708,7 +708,10 @@ def upload_cloudinary(cloud: str, preset: str, img: dict, paper_name: str = "") 
         files={"file": (img["name"], img["data"], "image/png")},
         timeout=120,
     )
-    return resp.json().get("secure_url") if resp.ok else None
+    if resp.ok:
+        return resp.json().get("secure_url")
+    # Return None but the caller will log the failure
+    return None
 
 def push_airtable(token, base_id, table, records) -> list[dict]:
     ensure_table(token, base_id, table)
@@ -764,7 +767,7 @@ with st.sidebar:
     st.markdown("**💾 Save / Load session**")
     st.caption("Save your progress to a file and reload it later — survives restarts.")
 
-    if st.button("💾 Save session", use_container_width=True):
+    if st.button("💾 Save session", width='stretch'):
         save_data = {
             "paper_name":            st.session_state.get("paper_name", ""),
             "exam_type":             st.session_state.get("exam_type", ""),
@@ -789,7 +792,7 @@ with st.sidebar:
             data=st.session_state["_save_json"].encode(),
             file_name=f"{pn}_session.json",
             mime="application/json",
-            use_container_width=True,
+            width='stretch',
         )
 
     uploaded_session = st.file_uploader("📂 Load session file", type="json",
@@ -1016,7 +1019,7 @@ if st.session_state.get("pages") or PDF_PATH.exists():
                 with img_col:
                     if b.get("data"):
                         st.image(b["data"], caption=f"Box {b['idx']} {cap}",
-                                 use_container_width=True)
+                                 width='stretch')
                     else:
                         st.caption(f"Box {b['idx']} {cap} *(no preview — will re-crop on sync)*")
                 with del_col:
@@ -1200,7 +1203,7 @@ if any(all_boxes()):
     } for b in ab]
 
     edited = st.data_editor(pd.DataFrame(rows),
-                             use_container_width=True,
+                             width='stretch',
                              num_rows="fixed", height=400)
 
     if st.button("Save assignments"):
@@ -1275,7 +1278,7 @@ if "records" in st.session_state:
         "Page":          r.get("pageNumber", 1),
     } for r in records])
 
-    edited_df = st.data_editor(df, use_container_width=True,
+    edited_df = st.data_editor(df, width='stretch',
                                 num_rows="dynamic", height=420)
 
     for i, row in edited_df.iterrows():
@@ -1304,7 +1307,7 @@ if "records" in st.session_state:
                     if b.get("data"):
                         st.image(b["data"],
                                  caption=f"{b['name']} → Q{qn or '?'}",
-                                 use_container_width=True)
+                                 width='stretch')
                     else:
                         st.caption(f"{b['name']} → Q{qn or '?'} *(no preview)*")
 
@@ -1362,14 +1365,20 @@ if "records" in st.session_state:
                 _sync_pdf = get_pdf()
                 if _sync_pdf:
                     _store = boxes()
+                    _recrop_ok = _recrop_fail = 0
                     for _pn in _store:
                         for _b in _store[_pn]:
                             if not _b.get("data"):
                                 try:
                                     _b["data"] = crop_from_rel(_sync_pdf, _b["page"], _b["rel"])
-                                except Exception:
-                                    pass
+                                    _recrop_ok += 1
+                                except Exception as _e:
+                                    _recrop_fail += 1
                         set_page_boxes(_pn, _store[_pn])
+                    if _recrop_ok or _recrop_fail:
+                        log(f"Re-cropped {_recrop_ok} boxes ({_recrop_fail} failed)")
+                else:
+                    log("⚠️ No PDF on disk — image crops may be missing. Re-upload the PDF and sync again.")
 
                 # Always re-read and re-merge records fresh so images are attached
                 _records  = st.session_state.get("records", [])
