@@ -522,6 +522,15 @@ def ai_assign(client: OpenAI, box: dict, records: list[dict],
         for r in cands
     )
     prompt  = AI_ASSIGN_PROMPT.format(candidates=cblock)
+    # Re-crop if data is missing (e.g. after session restore)
+    if not box.get("data") and pdf_bytes:
+        try:
+            box["data"] = crop_from_rel(pdf_bytes, box["page"], box["rel"])
+        except Exception:
+            pass
+    if not box.get("data"):
+        return {"questionNumber": "", "confidence": "low",
+                "notes": "Image data missing — redraw this box"}
     crop_img = Image.open(io.BytesIO(box["data"])).convert("RGB")
     content = [{"type": "input_text", "text": prompt}]
     # Send full page first so GPT can see layout context
@@ -686,6 +695,8 @@ def get_existing_fields(token, base_id, table) -> set[str]:
     return set()
 
 def upload_cloudinary(cloud: str, preset: str, img: dict, paper_name: str = "") -> str | None:
+    if not img.get("data"):
+        return None  # skip boxes with no image data
     # Include paper name in public_id so different papers never share cached images
     base = img["name"].rsplit(".", 1)[0].replace(".", "_")
     safe_paper = re.sub(r"[^a-zA-Z0-9_-]", "_", paper_name)[:40] if paper_name else "paper"
@@ -1003,8 +1014,11 @@ if st.session_state.get("pages") or PDF_PATH.exists():
                          else "unassigned")
                 img_col, del_col = st.columns([5, 1])
                 with img_col:
-                    st.image(b["data"], caption=f"Box {b['idx']} {cap}",
-                             use_container_width=True)
+                    if b.get("data"):
+                        st.image(b["data"], caption=f"Box {b['idx']} {cap}",
+                                 use_container_width=True)
+                    else:
+                        st.caption(f"Box {b['idx']} {cap} *(no preview — will re-crop on sync)*")
                 with del_col:
                     if st.button("🗑️", key=f"del_{sel_page}_{b['idx']}",
                                  help=f"Delete box {b['idx']}"):
@@ -1287,9 +1301,12 @@ if "records" in st.session_state:
             for i, b in enumerate(ab):
                 with cols[i % 4]:
                     qn = b.get("questionNumber", "")
-                    st.image(b["data"],
-                             caption=f"{b['name']} → Q{qn or '?'}",
-                             use_container_width=True)
+                    if b.get("data"):
+                        st.image(b["data"],
+                                 caption=f"{b['name']} → Q{qn or '?'}",
+                                 use_container_width=True)
+                    else:
+                        st.caption(f"{b['name']} → Q{qn or '?'} *(no preview)*")
 
 # ── 7. Export / Sync ───────────────────────────────────────────────────────
 if "records" in st.session_state:
