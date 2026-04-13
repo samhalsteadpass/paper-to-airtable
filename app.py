@@ -26,6 +26,7 @@ import re
 import base64
 import time
 import zipfile
+import pathlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -52,6 +53,57 @@ EXTRACT_DPI       = 300
 CANVAS_MAX_WIDTH  = 900
 
 AT_API         = "https://api.airtable.com/v0"
+
+# ── Auto-save helpers ─────────────────────────────────────────────────────
+AUTOSAVE_PATH = pathlib.Path("autosave.json")
+
+def autosave():
+    """Write session state to disk so it survives restarts."""
+    try:
+        save_data = {
+            "paper_name":           st.session_state.get("paper_name", ""),
+            "exam_type":            st.session_state.get("exam_type", ""),
+            "paper_name_for_table": st.session_state.get("paper_name_for_table", ""),
+            "pages":                st.session_state.get("pages", []),
+            "records":              st.session_state.get("records", []),
+            "boxes": {
+                str(pn): [
+                    {k: v for k, v in b.items() if k != "data"}
+                    for b in blist
+                ]
+                for pn, blist in st.session_state.get("boxes", {}).items()
+            },
+        }
+        AUTOSAVE_PATH.write_text(json.dumps(save_data, ensure_ascii=False))
+    except Exception:
+        pass  # never crash the app over autosave
+
+def autorestore():
+    """On startup, reload from disk if session state is empty."""
+    if "records" in st.session_state:
+        return  # already loaded
+    if not AUTOSAVE_PATH.exists():
+        return
+    try:
+        save_data = json.loads(AUTOSAVE_PATH.read_text())
+        if not save_data.get("records"):
+            return
+        st.session_state["paper_name"]           = save_data.get("paper_name", "")
+        st.session_state["exam_type"]            = save_data.get("exam_type", "")
+        st.session_state["paper_name_for_table"] = save_data.get("paper_name_for_table", "")
+        st.session_state["pages"]                = save_data.get("pages", [])
+        st.session_state["records"]              = save_data.get("records", [])
+        restored = {}
+        for pn_str, blist in save_data.get("boxes", {}).items():
+            restored[int(pn_str)] = [
+                {**b, "data": b"", "ai_qnum": b.get("ai_qnum", ""),
+                 "ai_conf": b.get("ai_conf", ""), "ai_notes": b.get("ai_notes", "")}
+                for b in blist
+            ]
+        st.session_state["boxes"] = restored
+        st.session_state["_autorestore_done"] = True
+    except Exception:
+        pass
 AT_META        = "https://api.airtable.com/v0/meta"
 CLOUDINARY_API = "https://api.cloudinary.com/v1_1"
 
@@ -652,6 +704,12 @@ def push_airtable(token, base_id, table, records) -> list[dict]:
 # Streamlit UI
 # ═════════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
+
+# Restore from disk on every fresh session start
+autorestore()
+if st.session_state.pop("_autorestore_done", False):
+    st.toast("♻️ Session restored from autosave", icon="💾")
+
 st.title("📄 Past Paper → Airtable")
 st.caption("Draw boxes to capture visuals · AI suggests question assignment · Sync to Airtable")
 
@@ -680,6 +738,62 @@ with st.sidebar:
     AT_TABLE    = st.text_input("Table name", value=default_table,
                                 help="Each paper gets its own table. Auto-set from paper name.")
     AUTO_ASSIGN = st.checkbox("Auto-assign high-confidence AI suggestions", value=True)
+    st.divider()
+    st.markdown("**💾 Save / Load session**")
+    st.caption("Save your progress to a file and reload it later — survives restarts.")
+
+    if st.button("💾 Save session", use_container_width=True):
+        save_data = {
+            "paper_name":            st.session_state.get("paper_name", ""),
+            "exam_type":             st.session_state.get("exam_type", ""),
+            "paper_name_for_table":  st.session_state.get("paper_name_for_table", ""),
+            "pages":                 st.session_state.get("pages", []),
+            "records":               st.session_state.get("records", []),
+            "boxes":                 {
+                str(pn): [
+                    {k: v for k, v in b.items() if k != "data"}
+                    for b in blist
+                ]
+                for pn, blist in st.session_state.get("boxes", {}).items()
+            },
+        }
+        st.session_state["_save_json"] = json.dumps(save_data, indent=2, ensure_ascii=False)
+        st.success("Session saved — download below.")
+
+    if "_save_json" in st.session_state:
+        pn = st.session_state.get("paper_name", "session") or "session"
+        st.download_button(
+            "⬇ Download session file",
+            data=st.session_state["_save_json"].encode(),
+            file_name=f"{pn}_session.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    uploaded_session = st.file_uploader("📂 Load session file", type="json",
+                                         key="session_upload")
+    if uploaded_session:
+        try:
+            save_data = json.loads(uploaded_session.read())
+            st.session_state["paper_name"]           = save_data.get("paper_name", "")
+            st.session_state["exam_type"]            = save_data.get("exam_type", "")
+            st.session_state["paper_name_for_table"] = save_data.get("paper_name_for_table", "")
+            st.session_state["pages"]                = save_data.get("pages", [])
+            st.session_state["records"]              = save_data.get("records", [])
+            # Restore boxes without image data (images re-cropped on demand)
+            restored_boxes = {}
+            for pn_str, blist in save_data.get("boxes", {}).items():
+                restored_boxes[int(pn_str)] = [
+                    {**b, "data": b"", "ai_qnum": b.get("ai_qnum",""),
+                     "ai_conf": b.get("ai_conf",""), "ai_notes": b.get("ai_notes","")}
+                    for b in blist
+                ]
+            st.session_state["boxes"] = restored_boxes
+            st.success(f"✅ Session loaded: {save_data.get('paper_name','')}")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to load session: {e}")
+
     st.divider()
     st.markdown("**Required Airtable fields**")
     for name, ftype in AT_FIELDS:
@@ -776,6 +890,7 @@ if "pdf" in st.session_state:
                 })
 
             st.session_state["records"] = records
+            autosave()
             status.update(label=f"✅ {len(records)} questions extracted",
                           state="complete")
 
@@ -942,7 +1057,9 @@ if "pdf" in st.session_state:
                             notes=st.session_state.get("notes_input", "").strip() or "manual",
                         )
 
-                        if mode == "AI suggest" and OPENAI_KEY and records:
+                        if mode == "AI suggest" and OPENAI_KEY and not records:
+                            st.warning("⚠️ No questions extracted yet — run Extract first for AI assignment. Box saved without assignment.")
+                        elif mode == "AI suggest" and OPENAI_KEY and records:
                             try:
                                 client = OpenAI(api_key=OPENAI_KEY)
                                 result = ai_assign(client, box, records, pdf_bytes=pdf)
@@ -963,6 +1080,7 @@ if "pdf" in st.session_state:
                             except Exception as e:
                                 st.warning(f"AI assignment failed: {e}")
 
+                        autosave()
                         st.session_state[ckey] = []
                         st.rerun()
                     else:
@@ -1055,6 +1173,7 @@ if any(all_boxes()):
                     b["ai_notes"]       = str(row["AI notes"]      or "")
                     b["notes"]          = str(row["Notes"]         or "manual")
             set_page_boxes(pn, store[pn])
+        autosave()
         st.success("Assignments saved.")
         st.rerun()
 
