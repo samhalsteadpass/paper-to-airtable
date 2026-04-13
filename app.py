@@ -844,8 +844,8 @@ def upload_attachment_direct(token: str, base_id: str, table_name: str,
     Upload image bytes directly to an Airtable attachment field.
     Returns (success, error_message).
     """
-    url = (f"https://api.airtable.com/v0/{base_id}/"
-           f"{requests.utils.quote(table_name, safe='')}/{record_id}/{field_id}")
+    url = (f"https://content.airtable.com/v0/{base_id}/"
+           f"{record_id}/{field_id}")
     resp = requests.post(
         url,
         headers={"Authorization": f"Bearer {token}",
