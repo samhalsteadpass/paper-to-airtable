@@ -56,6 +56,7 @@ AT_API         = "https://api.airtable.com/v0"
 
 # ── Auto-save helpers ─────────────────────────────────────────────────────
 AUTOSAVE_PATH = pathlib.Path("autosave.json")
+PDF_PATH      = pathlib.Path("current_paper.pdf")
 
 def autosave():
     """Write session state to disk so it survives restarts."""
@@ -77,6 +78,12 @@ def autosave():
         AUTOSAVE_PATH.write_text(json.dumps(save_data, ensure_ascii=False))
     except Exception:
         pass  # never crash the app over autosave
+
+def get_pdf() -> bytes | None:
+    """Get PDF bytes — from disk if available, else session state."""
+    if PDF_PATH.exists():
+        return PDF_PATH.read_bytes()
+    return st.session_state.get("pdf")
 
 def autorestore():
     """On startup, reload from disk if session state is empty."""
@@ -826,7 +833,9 @@ if st.button("Load PDF", disabled=not (paper_file and OPENAI_KEY)):
     with st.spinner("Reading cover page…"):
         detected_name, detected_type = read_cover_page(client, pdf)
 
-    st.session_state["pdf"]        = pdf
+    PDF_PATH.write_bytes(pdf)
+    st.session_state.pop("pdf", None)   # don't store PDF in session state
+    render_page_cached.clear()          # free cached page renders from old PDF
     st.session_state["pages"]      = get_question_pages(pdf)
     st.session_state["paper_name"] = detected_name
     st.session_state["exam_type"]  = detected_type
@@ -846,12 +855,12 @@ paper_name = st.session_state.get("paper_name", paper_name)
 exam_type  = st.session_state.get("exam_type",  exam_type)
 
 # ── 2. Extract ─────────────────────────────────────────────────────────────
-if "pdf" in st.session_state:
+if st.session_state.get("pages") or PDF_PATH.exists():
     st.subheader("2 · Extract questions + mark scheme")
 
     if st.button("✨ Extract", type="primary",
                  disabled=not (paper_name and exam_type and OPENAI_KEY)):
-        pdf      = st.session_state["pdf"]
+        pdf      = get_pdf()
         ms_bytes = ms_file.read() if ms_file else None
         client   = OpenAI(api_key=OPENAI_KEY)
 
@@ -895,13 +904,13 @@ if "pdf" in st.session_state:
                           state="complete")
 
 # ── 3. Capture ─────────────────────────────────────────────────────────────
-if "pdf" in st.session_state:
+if st.session_state.get("pages") or PDF_PATH.exists():
     st.subheader("3 · Capture visuals")
     st.caption("① Optional: type a crop label in the left panel  "
                "② Click two corners on the page image to draw a box  "
                "③ AI instantly suggests which question it belongs to")
 
-    pdf     = st.session_state["pdf"]
+    pdf     = get_pdf()
     pages   = st.session_state.get("pages", [])
     records = st.session_state.get("records", [])
 
@@ -1119,7 +1128,7 @@ if st.session_state.get("records") and any(all_boxes()):
                     if normalise_qnum(b.get("questionNumber", "")):
                         continue
                     try:
-                        r = ai_assign(client, b, records, pdf_bytes=st.session_state.get('pdf'))
+                        r = ai_assign(client, b, records, pdf_bytes=get_pdf())
                         b["ai_qnum"]  = r["questionNumber"]
                         b["ai_conf"]  = r["confidence"]
                         b["ai_notes"] = r["notes"]
