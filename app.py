@@ -112,24 +112,7 @@ def autorestore():
     except Exception:
         pass
 AT_META        = "https://api.airtable.com/v0/meta"
-CLOUDINARY_API = "https://api.cloudinary.com/v1_1"
 
-AT_FIELDS = [
-    ("Question Number",          "singleLineText"),
-    ("Question Text",            "multilineText"),
-    ("Mark Allocation",          "number"),
-    ("Topic",                    "singleLineText"),
-    ("Subtopic",                 "singleLineText"),
-    ("Mark Scheme Answer",       "multilineText"),
-    ("Image Description",        "multilineText"),
-    ("Has Images",               "checkbox"),
-    ("Images",                   "multipleAttachments"),
-    ("Paper Name",               "singleLineText"),
-    ("Exam Type",                "singleLineText"),
-    ("Page Number",              "number"),
-    ("Image Mapping Confidence", "singleLineText"),
-    ("Image Mapping Notes",      "multilineText"),
-]
 
 SKIP_PAGE_KEYWORDS = [
     "do not write on this page",
@@ -1203,79 +1186,6 @@ def draw_overlay(display: Image.Image, pb: list[dict],
 def at_headers(t):
     return {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
 
-def ensure_table(token, base_id, table):
-    try:
-        r = requests.get(f"{AT_META}/bases/{base_id}/tables",
-                         headers=at_headers(token), timeout=60)
-        if r.status_code == 401:
-            st.info("Skipping auto table creation (needs schema.bases:write).")
-            return
-        r.raise_for_status()
-        if table in [t["name"] for t in r.json().get("tables", [])]:
-            return
-        fields = []
-        for name, ftype in AT_FIELDS:
-            if ftype == "number":
-                fields.append({"name": name, "type": "number",
-                                "options": {"precision": 0}})
-            elif ftype == "checkbox":
-                fields.append({"name": name, "type": "checkbox",
-                               "options": {"icon": "check", "color": "greenBright"}})
-            elif ftype == "multipleAttachments":
-                fields.append({"name": name, "type": "multipleAttachments"})
-            else:
-                fields.append({"name": name, "type": ftype})
-        r2 = requests.post(f"{AT_META}/bases/{base_id}/tables",
-                           headers=at_headers(token),
-                           json={"name": table, "fields": fields}, timeout=60)
-        if not r2.ok:
-            st.warning(f"Could not auto-create table ({r2.status_code}).")
-    except Exception as e:
-        st.warning(f"Table check skipped: {e}")
-
-def get_existing_fields(token, base_id, table) -> set[str]:
-    resp = requests.get(f"{AT_META}/bases/{base_id}/tables",
-                        headers=at_headers(token), timeout=60)
-    resp.raise_for_status()
-    for t in resp.json().get("tables", []):
-        if t["name"] == table:
-            return {f["name"] for f in t.get("fields", [])}
-    return set()
-
-def upload_cloudinary(cloud: str, preset: str, img: dict, paper_name: str = "") -> str | None:
-    if not img.get("data"):
-        return None  # skip boxes with no image data
-    # Include paper name in public_id so different papers never share cached images
-    base = img["name"].rsplit(".", 1)[0].replace(".", "_")
-    safe_paper = re.sub(r"[^a-zA-Z0-9_-]", "_", paper_name)[:40] if paper_name else "paper"
-    pid  = f"{safe_paper}_{base}"
-    resp = requests.post(
-        f"{CLOUDINARY_API}/{cloud}/image/upload",
-        data={"upload_preset": preset, "public_id": pid},
-        files={"file": (img["name"], img["data"], "image/png")},
-        timeout=120,
-    )
-    if resp.ok:
-        return resp.json().get("secure_url")
-    # Embed error in return so caller can log it
-    try:
-        err = resp.json().get("error", {}).get("message", resp.text[:200])
-    except Exception:
-        err = resp.text[:200]
-    return f"ERROR:{err}"
-
-def push_airtable(token, base_id, table, records) -> list[dict]:
-    ensure_table(token, base_id, table)
-    url     = f"{AT_API}/{base_id}/{requests.utils.quote(table, safe='')}"
-    created = []
-    for batch in chunk_list(records, 10):
-        resp = requests.post(url, headers=at_headers(token),
-                             json={"records": batch}, timeout=60)
-        if not resp.ok:
-            raise RuntimeError(f"Airtable {resp.status_code}: {resp.text[:400]}")
-        created.extend(resp.json().get("records", []))
-    return created
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Streamlit UI
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1292,17 +1202,13 @@ st.caption("Draw boxes to capture visuals · AI suggests question assignment · 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
 AT_BASE    = get_secret("AIRTABLE_BASE_ID")
-CLD_CLOUD  = get_secret("CLOUDINARY_CLOUD_NAME")
-CLD_PRESET = get_secret("CLOUDINARY_UPLOAD_PRESET")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     for key, label, ph in [
-        ("OPENAI_API_KEY",           "OpenAI API key",           "sk-..."),
-        ("AIRTABLE_TOKEN",           "Airtable token",           "patXXX"),
-        ("AIRTABLE_BASE_ID",         "Airtable Base ID",         "appXXX"),
-        ("CLOUDINARY_CLOUD_NAME",    "Cloudinary cloud name",    "my-cloud"),
-        ("CLOUDINARY_UPLOAD_PRESET", "Cloudinary upload preset", "my-preset"),
+        ("OPENAI_API_KEY",  "OpenAI API key",  "sk-..."),
+        ("AIRTABLE_TOKEN",  "Airtable token",  "patXXX"),
+        ("AIRTABLE_BASE_ID","Airtable Base ID","appXXX"),
     ]:
         val = get_secret(key)
         if val:
@@ -1310,9 +1216,6 @@ with st.sidebar:
         else:
             locals()[key.lower()] = st.text_input(label, type="password", placeholder=ph)
 
-    default_table = st.session_state.get("paper_name_for_table", "Questions")
-    AT_TABLE    = st.text_input("Table name", value=default_table,
-                                help="Each paper gets its own table. Auto-set from paper name.")
     AUTO_ASSIGN = st.checkbox("Auto-assign high-confidence AI suggestions", value=True)
     st.divider()
     st.markdown("**💾 Save / Load session**")
@@ -1371,9 +1274,7 @@ with st.sidebar:
             st.error(f"Failed to load session: {e}")
 
     st.divider()
-    st.markdown("**Required Airtable fields**")
-    for name, ftype in AT_FIELDS:
-        st.markdown(f"- `{name}` — {ftype}")
+    st.caption("Secrets can also be set in `.streamlit/secrets.toml`.")
 
 # ── 1. Upload ──────────────────────────────────────────────────────────────
 st.subheader("1 · Upload PDFs")
@@ -1410,7 +1311,6 @@ if st.button("Load PDF", disabled=not (paper_file and OPENAI_KEY)):
     st.session_state["exam_type"]  = detected_type
     st.session_state.pop("records", None)
     st.session_state["boxes"] = {}
-    st.session_state.pop("sync_log", None)
     st.session_state.pop("_save_json", None)
     st.session_state["sel_page_idx"] = 0
     safe_name = re.sub(r"[^a-zA-Z0-9 _-]", "", detected_name).strip() or "Questions"
@@ -1899,26 +1799,26 @@ if "records" in st.session_state:
                     else:
                         st.caption(f"{b['name']} → Q{qn or '?'} *(no preview)*")
 
-# ── 7. Export / Sync ───────────────────────────────────────────────────────
+# ── Export ────────────────────────────────────────────────────────────────
 if "records" in st.session_state:
     records = st.session_state["records"]
     ab      = all_boxes()
 
-    st.subheader("7 · Export / Sync")
-    dl_col, sync_col = st.columns([1, 2])
-
-    with dl_col:
+    dl1, dl2 = st.columns(2)
+    with dl1:
         st.download_button(
             "⬇ Download JSON",
             data=json.dumps(records, indent=2, ensure_ascii=False).encode(),
             file_name=f"{paper_name or 'questions'}.json",
             mime="application/json",
         )
+    with dl2:
         if ab:
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w") as zf:
                 for b in ab:
-                    zf.writestr(b["name"], b["data"])
+                    if b.get("data"):
+                        zf.writestr(b["name"], b["data"])
             st.download_button(
                 "⬇ Download visuals (.zip)",
                 data=buf.getvalue(),
@@ -1926,218 +1826,15 @@ if "records" in st.session_state:
                 mime="application/zip",
             )
 
-    with sync_col:
-        if not (AT_TOKEN and AT_BASE):
-            st.warning("Add Airtable credentials to sync.")
-        elif not AT_TOKEN.startswith("pat"):
-            st.error("❌ Token should start with `pat`.")
-        elif not AT_BASE.startswith("app"):
-            st.error("❌ Base ID should start with `app`.")
-        else:
-            tp = AT_TOKEN[:8] + "..." + AT_TOKEN[-4:]
-            st.caption(f"Token: `{tp}` | Base: `{AT_BASE}` | Table: `{AT_TABLE}`")
-
-            if st.button("🚀 Sync to Airtable", type="primary"):
-                st.session_state["do_sync"] = True
-                st.session_state.pop("sync_log", None)
-                st.rerun()
-
-            if st.session_state.get("do_sync"):
-                st.session_state["do_sync"] = False
-                log_lines: list[str] = []
-
-                def log(m):
-                    log_lines.append(m)
-
-                # Re-crop all boxes from current PDF so we always have fresh image data
-                _sync_pdf = get_pdf()
-                if _sync_pdf:
-                    _store = boxes()
-                    _recrop_ok = _recrop_fail = 0
-                    for _pn in _store:
-                        for _b in _store[_pn]:
-                            if not _b.get("data"):
-                                try:
-                                    _b["data"] = crop_from_rel(_sync_pdf, _b["page"], _b["rel"])
-                                    _recrop_ok += 1
-                                except Exception as _e:
-                                    _recrop_fail += 1
-                        set_page_boxes(_pn, _store[_pn])
-                    if _recrop_ok or _recrop_fail:
-                        log(f"Re-cropped {_recrop_ok} boxes ({_recrop_fail} failed)")
-                else:
-                    log("⚠️ No PDF on disk — image crops may be missing. Re-upload the PDF and sync again.")
-
-                # Always re-read and re-merge records fresh so images are attached
-                _records  = st.session_state.get("records", [])
-                _ab       = all_boxes()
-                _q_imgs:  dict[str, list[str]] = {}
-                _q_notes: dict[str, list[str]] = {}
-                for _b in _ab:
-                    _qn = normalise_qnum(_b.get("questionNumber", ""))
-                    if not _qn:
-                        continue
-                    _q_imgs.setdefault(_qn, []).append(_b["name"])
-                    _ai_part = (f" | AI {_b['ai_qnum']} ({_b['ai_conf']})"
-                                if _b.get("ai_qnum") else "")
-                    _q_notes.setdefault(_qn, []).append(
-                        f"{_b['name']}: {_b.get('notes', '')}{_ai_part}")
-                def _bare(s):
-                    s = s.lstrip("Qq"); return s.lstrip("0") or s
-                def _is_child_of(c, p):
-                    cb = _bare(c); pb = _bare(p)
-                    if not cb.startswith(pb): return False
-                    rest = cb[len(pb):]
-                    return len(rest) > 0 and not rest[0].isdigit()
-
-                for _r in _records:
-                    _qn    = normalise_qnum(_r.get("questionNumber", ""))
-                    _imgs  = list(_q_imgs.get(_qn, []))
-                    _notes = list(_q_notes.get(_qn, []))
-                    for _pqn, _pimgs in _q_imgs.items():
-                        if _pqn != _qn and _is_child_of(_qn, _pqn):
-                            for _img in _pimgs:
-                                if _img not in _imgs: _imgs.append(_img)
-                            for _note in _q_notes.get(_pqn, []):
-                                _prop = f"{_note} [from Q{_pqn}]"
-                                if _prop not in _notes: _notes.append(_prop)
-                    _r["images"]                 = _imgs
-                    _r["hasImages"]              = bool(_imgs) or _r.get("hasImages", False)
-                    _r["imageMappingConfidence"] = (
-                        "manual+ai" if any("AI " in n for n in _notes)
-                        else "manual" if _imgs else "")
-                    _r["imageMappingNotes"]      = "\n".join(_notes)
-                records = _records
-                ab      = _ab
-                log(f"Syncing {len(records)} records with {len(ab)} visuals…")
-
-                img_url_map: dict[str, str] = {}
-                if ab and CLD_CLOUD and CLD_PRESET:
-                    log(f"Uploading {len(ab)} visuals to Cloudinary…")
-
-                    _paper = st.session_state.get("paper_name", "")
-                    def _upload(b, _p=_paper):
-                        return b["name"], upload_cloudinary(CLD_CLOUD, CLD_PRESET, b, _p)
-
-                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                        for name, url in [f.result() for f in
-                                           as_completed([ex.submit(_upload, b)
-                                                         for b in ab])]:
-                            if url and not str(url).startswith("ERROR:"):
-                                img_url_map[name] = url
-                                log(f"  ✅ {name}")
-                            elif url:
-                                log(f"  ❌ {name} failed: {url[6:]}")
-                            else:
-                                log(f"  ❌ {name} failed: no response")
-                elif ab:
-                    log("⚠️ Cloudinary not configured — images will not be attached.")
-
-                try:
-                    # Ensure table exists first, then fetch fields separately
-                    ensure_table(AT_TOKEN, AT_BASE, AT_TABLE)
-                    # Retry field fetch — newly created tables may need a moment
-                    existing = set()
-                    for _attempt in range(3):
-                        existing = get_existing_fields(AT_TOKEN, AT_BASE, AT_TABLE)
-                        if existing:
-                            break
-                        time.sleep(1)
-                    log(f"Table fields found: {len(existing)}")
-
-                    _pn   = st.session_state.get("paper_name", paper_name)
-                    _et   = st.session_state.get("exam_type",  exam_type)
-
-                    payload  = []
-                    for r in records:
-                        urls   = [img_url_map[n] for n in r.get("images", [])
-                                  if n in img_url_map]
-                        all_fields = {
-                            "Question Number":          r.get("originalQuestionNumber", r.get("questionNumber", "")),
-                            "Question Text":            r.get("questionText",            ""),
-                            "Mark Allocation":          clamp_int(r.get("markAllocation", 0)),
-                            "Topic":                    r.get("topic",                   ""),
-                            "Subtopic":                 r.get("subtopic",                ""),
-                            "Mark Scheme Answer":       r.get("markSchemeAnswer",        ""),
-                            "Image Description":        r.get("imageDescription",        ""),
-                            "Has Images":               bool(urls or r.get("hasImages",  False)),
-                            "Images":                   [{"url": u} for u in urls],
-                            "Paper Name":               r.get("paperName",    _pn),
-                            "Exam Type":                r.get("examType",     _et),
-                            "Page Number":              clamp_int(r.get("pageNumber", 1), 1),
-                            "Image Mapping Confidence": r.get("imageMappingConfidence",  ""),
-                            "Image Mapping Notes":      r.get("imageMappingNotes",       ""),
-                        }
-                        # Only filter if we actually got fields back
-                        if existing:
-                            all_fields = {k: v for k, v in all_fields.items() if k in existing}
-                        payload.append({"fields": all_fields})
-
-                    log(f"Pushing {len(payload)} records…")
-                    # Push directly — ensure_table already called above
-                    url = f"{AT_API}/{AT_BASE}/{requests.utils.quote(AT_TABLE, safe='')}"
-                    created = []
-                    for batch in chunk_list(payload, 10):
-                        resp = requests.post(url, headers=at_headers(AT_TOKEN),
-                                             json={"records": batch}, timeout=60)
-                        if not resp.ok:
-                            raise RuntimeError(f"Airtable {resp.status_code}: {resp.text[:400]}")
-                        created.extend(resp.json().get("records", []))
-                    log(f"✅ {len(created)} records synced!")
-                except Exception as e:
-                    log(f"❌ Sync failed: {e}")
-
-                st.session_state["sync_log"] = log_lines
-
-            if "sync_log" in st.session_state:
-                st.text("\n".join(st.session_state["sync_log"]))
-                st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
-
-# ── 8. Nova Question Formatter ─────────────────────────────────────────────
+# ── 7. Nova Question Formatter ─────────────────────────────────────────────
 st.divider()
-st.subheader("8 · Nova Question Formatter")
+st.subheader("7 · Nova Question Formatter")
 st.caption(
     "Classify extracted questions into Nova question types with all fields "
     "pre-filled and ready to copy into the platform."
 )
 
-# ── Source selection ───────────────────────────────────────────────────────
-src_col, btn_col = st.columns([2, 1])
-with src_col:
-    nova_source = st.radio(
-        "Source",
-        ["Use current session records", "Fetch fresh from Airtable"],
-        horizontal=True,
-        help="Use session records if you just ran Extract above. "
-             "Fetch from Airtable if you want to format a previously synced paper.",
-    )
-
-with btn_col:
-    if nova_source == "Fetch fresh from Airtable":
-        fetch_table = st.text_input(
-            "Table to fetch",
-            value=AT_TABLE,
-            key="nova_fetch_table",
-            label_visibility="collapsed",
-            placeholder="Table name",
-        )
-        if st.button("📥 Fetch from Airtable",
-                     disabled=not (AT_TOKEN and AT_BASE)):
-            try:
-                with st.spinner("Fetching…"):
-                    fetched = fetch_airtable_records(AT_TOKEN, AT_BASE, fetch_table)
-                st.session_state["nova_source_records"] = fetched
-                st.success(f"Fetched {len(fetched)} records from '{fetch_table}'")
-            except Exception as e:
-                st.error(f"Fetch failed: {e}")
-
-# Resolve which records to classify
-def _nova_source_records() -> list[dict]:
-    if nova_source == "Fetch fresh from Airtable":
-        return st.session_state.get("nova_source_records", [])
-    return st.session_state.get("records", [])
-
-_src = _nova_source_records()
+_src = st.session_state.get("records", [])
 if _src:
     st.caption(f"{len(_src)} records available for classification.")
 
@@ -2161,7 +1858,7 @@ with clear_col:
 
 if st.session_state.get("do_nova_classify"):
     st.session_state["do_nova_classify"] = False
-    src_records = _nova_source_records()
+    src_records = st.session_state.get("records", [])
     _pname      = st.session_state.get("paper_name", paper_name) or "Paper"
     client      = OpenAI(api_key=OPENAI_KEY)
 
@@ -2282,9 +1979,9 @@ if "nova_classified" in st.session_state:
         else:
             nova_tbl_name = st.text_input(
                 "Nova table name",
-                value="Nova Questions",
+                value="Questions",
                 key="nova_sync_table",
-                help="All papers sync into this one shared table. The Paper Name field tells them apart.",
+                help="All papers are appended to this one shared table. The Paper Name field tells them apart.",
             )
             st.caption(
                 "All papers are appended to **one shared table**. "
