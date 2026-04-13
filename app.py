@@ -966,6 +966,7 @@ if st.session_state.get("pages") or PDF_PATH.exists():
                 if st.button("◀ Prev", disabled=idx == 0):
                     st.session_state[f"clicks_{sel_page}"] = []
                     st.session_state["sel_page_idx"] = idx - 1
+                    st.session_state["_nav_ts"] = time.time()
                     st.rerun()
             with nav2:
                 st.markdown(
@@ -979,6 +980,7 @@ if st.session_state.get("pages") or PDF_PATH.exists():
                 if st.button("Next ▶", disabled=idx == len(pages) - 1):
                     st.session_state[f"clicks_{sel_page}"] = []
                     st.session_state["sel_page_idx"] = idx + 1
+                    st.session_state["_nav_ts"] = time.time()
                     st.rerun()
 
             # ── Go to page ────────────────────────────────────────────────
@@ -995,12 +997,12 @@ if st.session_state.get("pages") or PDF_PATH.exists():
                 )
             with goto_col2:
                 if st.button("Go", key="goto_page_btn"):
-                    # Find the closest page in the pages list
                     target = min(pages, key=lambda p: abs(p - int(goto_val)))
                     new_idx = pages.index(target)
                     if new_idx != idx:
                         st.session_state[f"clicks_{sel_page}"] = []
                         st.session_state["sel_page_idx"] = new_idx
+                        st.session_state["_nav_ts"] = time.time()
                         st.rerun()
 
             # ── Assignment mode ───────────────────────────────────────────
@@ -1091,7 +1093,7 @@ if st.session_state.get("pages") or PDF_PATH.exists():
 
             click = streamlit_image_coordinates(
                 overlay,
-                key=f"canvas_{sel_page}_{len(pb)}_{mode}_{manual_qnum}",
+                key=f"canvas_{idx}_{sel_page}_{len(pb)}_{mode}_{manual_qnum}_{st.session_state.get('_nav_ts', 0)}",
             )
 
             if click:
