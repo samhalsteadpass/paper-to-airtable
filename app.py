@@ -241,6 +241,81 @@ examType: one of GCSE, A-Level, AS-Level, IB HL, IB SL, or describe it briefly i
 If a field is not clearly visible, make your best guess from context.
 """
 
+NOVA_CLASSIFY_PROMPT = """You are formatting an exam question for an e-learning platform called Nova.
+
+Classify the question into the correct Nova type and extract all required fields.
+
+Question JSON:
+QUESTION_DATA_PLACEHOLDER
+
+NOVA TYPES — pick exactly one:
+- simple        Single number or short word answer. Auto-marked. Use for most calc questions.
+- multiple_choice  Has distinct options OR is a true/false / identification question.
+- multiple_answer  Requires exactly 2+ separate answer boxes (e.g. find x AND y).
+- fraction      Answer must be expressed as a fraction (numerator + denominator).
+- fill_in_blank Sentence with gaps filled from dropdowns.
+- essay         Long written response. AI-marked. Use for explain/describe/evaluate/justify/show working/prove.
+
+DECISION RULES (apply in order):
+1. If questionText contains explicit labeled options (A: / B: / (A) / (B) / i. / ii.) → multiple_choice
+2. If "explain", "describe", "evaluate", "justify", "show that", "prove", "give a reason", "discuss" → essay
+3. If answer is a fraction AND question says "as a fraction" / "simplest form" → fraction
+4. If question clearly asks for two distinct separate values → multiple_answer
+5. If it is a sentence completion / label-the-diagram question → fill_in_blank
+6. Everything else → simple
+
+Return ONLY raw JSON (no markdown fences, no explanation):
+{
+  "novaType": "simple",
+  "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
+  "body": "Full question text. Wrap ALL maths in [latex]...[/latex] tags.",
+  "writtenSolution": "Full worked solution from mark scheme. Leave empty string if none.",
+  "marks": 2,
+  "difficulty": 1,
+
+  "answerPrefix": "x =",
+  "answer": "5",
+  "answerUnit": "[latex]\\text{cm}[/latex]",
+
+  "style": "List",
+  "options": [
+    {"text": "12", "correct": false},
+    {"text": "15", "correct": true},
+    {"text": "18", "correct": false},
+    {"text": "21", "correct": false}
+  ],
+
+  "requireSpecificOrder": true,
+  "answers": [
+    {"prefix": "x =", "answer": "3", "suffix": ""},
+    {"prefix": "y =", "answer": "7", "suffix": ""}
+  ],
+
+  "answerLabel": "Answer =",
+  "numerator": "3",
+  "denominator": "4",
+
+  "preamble": "Preamble text shown before the blanked sentence.",
+  "blankContent": "A square has [blank] lines of symmetry.",
+  "blanks": [
+    {"options": ["2", "4", "1", "8"], "correct": "4", "marks": 1, "writtenSolution": "4"}
+  ],
+
+  "questionForAI": "Question text without any LaTeX formatting. Plain English only.",
+  "aiMarkingCriteria": "Expand the mark scheme into clear AI scoring instructions. End with: There are X possible marks, please score the answer out of X (maximum X marks).",
+  "markingCriteriaForStudent": "Mark scheme shown to the student after answering."
+}
+
+Important notes:
+- Only include the fields that belong to the chosen novaType (plus the shared fields: novaType, friendlyName, body, writtenSolution, marks, difficulty).
+- body must include the full question text with all maths in [latex][/latex] tags.
+- For multiple_choice always provide exactly 4 options with exactly 1 marked correct=true.
+- If the question text already contains options (A/B/C/D), parse them out of body into the options array.
+- marks should equal the markAllocation value from the question data.
+- If question references a diagram/image, add "(See diagram)" in the body.
+- For essay, aiMarkingCriteria should be an expanded, detailed version of the mark scheme written as instructions to an AI marker.
+"""
+
 def read_cover_page(client: OpenAI, pdf_bytes: bytes) -> tuple[str, str]:
     """Read the first page of a PDF and extract paper name and exam type."""
     page_png = render_page_cached(pdf_bytes, 1, dpi=RENDER_DPI)
@@ -649,6 +724,457 @@ def ai_assign(client: OpenAI, box: dict, records: list[dict],
         conf = "low"
 
     return {"questionNumber": qn, "confidence": conf, "notes": note or "—"}
+
+# ── Nova Airtable schema ──────────────────────────────────────────────────
+NOVA_TABLE_FIELDS = [
+    # Shared across all types
+    ("Question Number",        "singleLineText"),
+    ("Paper Name",             "singleLineText"),
+    ("Nova Type",              "singleLineText"),
+    ("Friendly Name",          "singleLineText"),
+    ("Body",                   "multilineText"),
+    ("Marks",                  "number"),
+    ("Difficulty",             "number"),
+    ("Written Solution",       "multilineText"),
+    ("Is Sub-question",        "checkbox"),
+    ("Parent Question",        "singleLineText"),
+    # Simple
+    ("Answer Prefix",          "singleLineText"),
+    ("Answer",                 "singleLineText"),
+    ("Answer Unit",            "singleLineText"),
+    # Multiple Choice
+    ("MC Style",               "singleLineText"),
+    ("MC Options",             "multilineText"),
+    # Multiple Answer
+    ("Require Specific Order", "checkbox"),
+    ("MA Answers",             "multilineText"),
+    # Fraction
+    ("Answer Label",           "singleLineText"),
+    ("Numerator",              "singleLineText"),
+    ("Denominator",            "singleLineText"),
+    # Fill in Blank
+    ("Preamble",               "multilineText"),
+    ("Blank Content",          "multilineText"),
+    ("Blanks",                 "multilineText"),
+    # Essay
+    ("Question for AI",        "multilineText"),
+    ("AI Marking Criteria",    "multilineText"),
+    ("Marking Criteria",       "multilineText"),
+    ("AI Role Prompt",         "multilineText"),
+    ("ChatGPT Model",          "singleLineText"),
+    ("Pass Marks",             "number"),
+    ("Min Word Count",         "number"),
+    ("Marking Method",         "singleLineText"),
+]
+
+# Fields visible in each type's view (plus always-on shared fields)
+_SHARED_COLS = ["Question Number", "Paper Name", "Nova Type",
+                "Friendly Name", "Body", "Marks", "Difficulty",
+                "Written Solution", "Is Sub-question", "Parent Question"]
+
+NOVA_VIEW_FIELDS: dict[str, list[str]] = {
+    "simple": _SHARED_COLS + ["Answer Prefix", "Answer", "Answer Unit"],
+    "multiple_choice": _SHARED_COLS + ["MC Style", "MC Options"],
+    "multiple_answer": _SHARED_COLS + ["Require Specific Order", "MA Answers"],
+    "fraction":        _SHARED_COLS + ["Answer Label", "Numerator", "Denominator"],
+    "fill_in_blank":   _SHARED_COLS + ["Preamble", "Blank Content", "Blanks"],
+    "essay": [
+        "Question Number", "Paper Name", "Nova Type", "Friendly Name",
+        "Body", "Question for AI", "AI Marking Criteria", "Marking Criteria",
+        "AI Role Prompt", "ChatGPT Model", "Pass Marks", "Min Word Count",
+        "Marking Method", "Is Sub-question", "Parent Question",
+    ],
+}
+
+NOVA_VIEW_NAMES: dict[str, str] = {
+    "simple":          "Simple Questions",
+    "multiple_choice": "Multiple Choice",
+    "multiple_answer": "Multiple Answer",
+    "fraction":        "Fraction",
+    "fill_in_blank":   "Fill in the Blank",
+    "essay":           "Essay (AI)",
+}
+
+
+def ensure_nova_questions_table(token: str, base_id: str,
+                                 table_name: str) -> str | None:
+    """Create the Nova Questions table if it doesn't exist. Returns table id."""
+    r = requests.get(f"{AT_META}/bases/{base_id}/tables",
+                     headers=at_headers(token), timeout=60)
+    if not r.ok:
+        return None
+    existing = {t["name"]: t["id"] for t in r.json().get("tables", [])}
+    if table_name in existing:
+        return existing[table_name]
+    # Build fields list
+    fields = []
+    for name, ftype in NOVA_TABLE_FIELDS:
+        if ftype == "number":
+            fields.append({"name": name, "type": "number",
+                            "options": {"precision": 0}})
+        elif ftype == "checkbox":
+            fields.append({"name": name, "type": "checkbox",
+                           "options": {"icon": "check", "color": "greenBright"}})
+        else:
+            fields.append({"name": name, "type": ftype})
+    r2 = requests.post(f"{AT_META}/bases/{base_id}/tables",
+                       headers=at_headers(token),
+                       json={"name": table_name, "fields": fields},
+                       timeout=60)
+    if not r2.ok:
+        raise RuntimeError(f"Could not create table: {r2.status_code} {r2.text[:300]}")
+    return r2.json()["id"]
+
+
+def get_table_field_map(token: str, base_id: str,
+                         table_id: str) -> dict[str, str]:
+    """Return {field_name: field_id} for every field in the table."""
+    r = requests.get(f"{AT_META}/bases/{base_id}/tables",
+                     headers=at_headers(token), timeout=60)
+    r.raise_for_status()
+    for t in r.json().get("tables", []):
+        if t["id"] == table_id:
+            return {f["name"]: f["id"] for f in t.get("fields", [])}
+    return {}
+
+
+def create_nova_views(token: str, base_id: str, table_id: str,
+                       field_map: dict[str, str]) -> dict[str, str]:
+    """
+    Create one grid view per Nova type.
+    Each view has only the relevant columns visible.
+    Returns {nova_type: view_id}.
+    """
+    # Fetch existing views so we can skip already-created ones
+    existing_resp = requests.get(
+        f"{AT_META}/bases/{base_id}/tables/{table_id}/views",
+        headers=at_headers(token), timeout=60)
+    existing_views: dict[str, str] = {}
+    if existing_resp.ok:
+        for v in existing_resp.json().get("views", []):
+            existing_views[v["name"]] = v["id"]
+
+    created: dict[str, str] = {}
+    for nova_type, view_name in NOVA_VIEW_NAMES.items():
+        if view_name in existing_views:
+            created[nova_type] = existing_views[view_name]
+            continue
+
+        visible_names  = NOVA_VIEW_FIELDS.get(nova_type, _SHARED_COLS)
+        visible_ids    = [field_map[n] for n in visible_names if n in field_map]
+
+        payload: dict = {"name": view_name, "type": "grid"}
+        if visible_ids:
+            payload["visibleFieldIds"] = visible_ids
+
+        r = requests.post(
+            f"{AT_META}/bases/{base_id}/tables/{table_id}/views",
+            headers=at_headers(token), json=payload, timeout=60)
+        if r.ok:
+            view_id = r.json()["id"]
+            created[nova_type] = view_id
+        else:
+            # non-fatal — continue without this view
+            pass
+
+    return created
+
+
+def nova_record_to_at_fields(item: dict, paper_name: str = "") -> dict:
+    """Convert a classified nova item into Airtable field dict."""
+    nd  = item.get("novaData") or {}
+    nt  = nd.get("novaType", "")
+    rec = item.get("originalRecord") or {}
+    pn  = rec.get("paperName") or paper_name
+
+    fields: dict = {
+        "Question Number":  rec.get("questionNumber", ""),
+        "Paper Name":       pn,
+        "Nova Type":        nt,
+        "Friendly Name":    nd.get("friendlyName", ""),
+        "Body":             nd.get("body", ""),
+        "Marks":            clamp_int(nd.get("marks", 0)),
+        "Difficulty":       clamp_int(nd.get("difficulty", 1), 1),
+        "Written Solution": nd.get("writtenSolution", ""),
+        "Is Sub-question":  bool(item.get("isSubQuestion", False)),
+        "Parent Question":  item.get("parentQuestion", ""),
+    }
+    if nt == "simple":
+        fields.update({
+            "Answer Prefix": nd.get("answerPrefix", ""),
+            "Answer":        nd.get("answer",       ""),
+            "Answer Unit":   nd.get("answerUnit",   ""),
+        })
+    elif nt == "multiple_choice":
+        fields.update({
+            "MC Style":   nd.get("style", "List"),
+            "MC Options": json.dumps(nd.get("options", []),
+                                     ensure_ascii=False),
+        })
+    elif nt == "multiple_answer":
+        fields.update({
+            "Require Specific Order": bool(nd.get("requireSpecificOrder", False)),
+            "MA Answers":             json.dumps(nd.get("answers", []),
+                                                  ensure_ascii=False),
+        })
+    elif nt == "fraction":
+        fields.update({
+            "Answer Label": nd.get("answerLabel", ""),
+            "Numerator":    nd.get("numerator",   ""),
+            "Denominator":  nd.get("denominator", ""),
+        })
+    elif nt == "fill_in_blank":
+        fields.update({
+            "Preamble":      nd.get("preamble",     ""),
+            "Blank Content": nd.get("blankContent", ""),
+            "Blanks":        json.dumps(nd.get("blanks", []),
+                                        ensure_ascii=False),
+        })
+    elif nt == "essay":
+        fields.update({
+            "Question for AI":     nd.get("questionForAI",            ""),
+            "AI Marking Criteria": nd.get("aiMarkingCriteria",        ""),
+            "Marking Criteria":    nd.get("markingCriteriaForStudent", ""),
+            "AI Role Prompt":      NOVA_AI_ROLE_PROMPT,
+            "ChatGPT Model":       "gpt-4.1",
+            "Pass Marks":          clamp_int(nd.get("marks", 0)),
+            "Min Word Count":      1,
+            "Marking Method":      "AI",
+        })
+    return fields
+
+
+def push_nova_to_airtable(token: str, base_id: str, table_name: str,
+                            items: list[dict],
+                            paper_name: str = "") -> tuple[int, list[str]]:
+    """
+    Ensure table + views exist, then push all classified records.
+    Returns (records_created, log_lines).
+    """
+    logs: list[str] = []
+
+    table_id = ensure_nova_questions_table(token, base_id, table_name)
+    if not table_id:
+        return 0, ["❌ Could not create/find table"]
+    logs.append(f"Table '{table_name}' ready (id: {table_id})")
+
+    field_map = get_table_field_map(token, base_id, table_id)
+    logs.append(f"Found {len(field_map)} fields")
+
+    # Create views — pass quietly if the API doesn't support it
+    try:
+        view_results = create_nova_views(token, base_id, table_id, field_map)
+        logs.append(f"Views created/confirmed: {len(view_results)}")
+        for nt, vid in view_results.items():
+            logs.append(f"  {NOVA_VIEW_NAMES.get(nt, nt)}: {vid}")
+    except Exception as e:
+        logs.append(f"⚠ View creation skipped: {e}")
+
+    # Push records in batches of 10
+    payload = []
+    for item in items:
+        if item.get("isParent") or item.get("error"):
+            continue
+        fields = nova_record_to_at_fields(item, paper_name)
+        # Only send fields that actually exist in the table
+        filtered = {k: v for k, v in fields.items() if k in field_map}
+        payload.append({"fields": filtered})
+
+    if not payload:
+        logs.append("No records to push.")
+        return 0, logs
+
+    url     = f"{AT_API}/{base_id}/{requests.utils.quote(table_name, safe='')}"
+    created = 0
+    for batch in chunk_list(payload, 10):
+        resp = requests.post(url, headers=at_headers(token),
+                             json={"records": batch}, timeout=60)
+        if not resp.ok:
+            logs.append(f"❌ Batch failed: {resp.status_code} {resp.text[:200]}")
+        else:
+            created += len(resp.json().get("records", []))
+    logs.append(f"✅ {created} records pushed to '{table_name}'")
+    return created, logs
+
+
+# ── Nova classification ───────────────────────────────────────────────────
+NOVA_TYPE_LABELS = {
+    "simple":          "Simple",
+    "multiple_choice": "Multiple Choice",
+    "multiple_answer": "Multiple Answer",
+    "fraction":        "Fraction",
+    "fill_in_blank":   "Fill in the Blank",
+    "essay":           "Essay (AI)",
+}
+NOVA_TYPE_COLORS = {
+    "simple":          "#27ae60",
+    "multiple_choice": "#2980b9",
+    "multiple_answer": "#8e44ad",
+    "fraction":        "#e67e22",
+    "fill_in_blank":   "#16a085",
+    "essay":           "#c0392b",
+}
+NOVA_AI_ROLE_PROMPT = (
+    "You are a fair, accurate, and constructive GCSE Maths and Science examiner. "
+    "Your feedback should be focused on key scientific concepts, assessment criteria, "
+    "and the learner's application of knowledge. Ensure your comments are clear, "
+    "specific, and help learners improve their understanding of scientific principles "
+    "while maintaining a professional and encouraging tone. Accept minor spelling "
+    "mistakes if the meaning is clear."
+)
+
+def classify_nova_question(client: OpenAI, record: dict,
+                            paper_name: str = "") -> dict:
+    """Use AI to classify one record into a Nova question type and extract fields."""
+    q_data = {
+        "questionNumber":   record.get("questionNumber",   ""),
+        "questionText":     record.get("questionText",     ""),
+        "markAllocation":   record.get("markAllocation",   0),
+        "markSchemeAnswer": record.get("markSchemeAnswer", ""),
+        "topic":            record.get("topic",            ""),
+        "subtopic":         record.get("subtopic",         ""),
+        "hasImages":        record.get("hasImages",        False),
+        "imageDescription": record.get("imageDescription", ""),
+    }
+    prompt = (NOVA_CLASSIFY_PROMPT
+              .replace("QUESTION_DATA_PLACEHOLDER", json.dumps(q_data, indent=2))
+              .replace("PAPER_NAME_PLACEHOLDER", paper_name)
+              .replace("QNUM_PLACEHOLDER", record.get("questionNumber", "")))
+    content = [{"type": "input_text", "text": prompt}]
+    raw     = call_gpt(client, content, TEXT_MODEL, max_tokens=1500)
+    result  = safe_json_loads(raw, {})
+    if not result.get("novaType"):
+        result["novaType"] = "simple"
+    return result
+
+def group_nova_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Split records into:
+      standalone  – questions with no parent/child relationship
+      groups      – list of {parent: record, children: [record, ...]}
+    """
+    def bare(s: str) -> str:
+        s = normalise_qnum(s).lstrip("Qq")
+        return s.lstrip("0") or s
+
+    def is_child_of(child_qn: str, parent_qn: str) -> bool:
+        cb, pb = bare(child_qn), bare(parent_qn)
+        if not cb.startswith(pb):
+            return False
+        rest = cb[len(pb):]
+        return len(rest) > 0 and not rest[0].isdigit()
+
+    all_qnums = [normalise_qnum(r.get("questionNumber", "")) for r in records]
+
+    parent_qnums: set[str] = set()
+    child_qnums:  set[str] = set()
+    for qn in all_qnums:
+        for other in all_qnums:
+            if other != qn and is_child_of(other, qn):
+                parent_qnums.add(qn)
+                child_qnums.add(other)
+
+    groups: list[dict] = []
+    for r in records:
+        qn = normalise_qnum(r.get("questionNumber", ""))
+        if qn in parent_qnums:
+            children = [cr for cr in records
+                        if normalise_qnum(cr.get("questionNumber", "")) in child_qnums
+                        and is_child_of(
+                            normalise_qnum(cr.get("questionNumber", "")), qn)]
+            groups.append({"parent": r, "children": children})
+
+    standalone = [r for r in records
+                  if normalise_qnum(r.get("questionNumber", "")) not in parent_qnums
+                  and normalise_qnum(r.get("questionNumber", "")) not in child_qnums]
+
+    return standalone, groups
+
+def fetch_airtable_records(token: str, base_id: str,
+                            table: str) -> list[dict]:
+    """Fetch all records from an Airtable table."""
+    url     = f"{AT_API}/{base_id}/{requests.utils.quote(table, safe='')}"
+    headers = at_headers(token)
+    records = []
+    offset  = None
+    while True:
+        params: dict = {"pageSize": 100}
+        if offset:
+            params["offset"] = offset
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        for rec in data.get("records", []):
+            f = rec.get("fields", {})
+            records.append({
+                "questionNumber":   normalise_qnum(f.get("Question Number",   "")),
+                "originalQuestionNumber": str(f.get("Question Number",  "") or ""),
+                "questionText":     str(f.get("Question Text",      "") or ""),
+                "markAllocation":   clamp_int(f.get("Mark Allocation",  0)),
+                "topic":            str(f.get("Topic",              "") or ""),
+                "subtopic":         str(f.get("Subtopic",           "") or ""),
+                "markSchemeAnswer": str(f.get("Mark Scheme Answer", "") or ""),
+                "imageDescription": str(f.get("Image Description",  "") or ""),
+                "hasImages":        bool(f.get("Has Images",        False)),
+                "pageNumber":       clamp_int(f.get("Page Number",   1), 1),
+                "paperName":        str(f.get("Paper Name",         "") or ""),
+                "examType":         str(f.get("Exam Type",          "") or ""),
+            })
+        offset = data.get("offset")
+        if not offset:
+            break
+    return records
+
+def nova_records_to_csv(nova_classified: list[dict]) -> str:
+    """Export all classified records to a flat CSV string."""
+    rows = []
+    for item in nova_classified:
+        nd  = item.get("novaData", {}) or {}
+        nt  = nd.get("novaType", item.get("novaType", ""))
+        row = {
+            "Question Number":     item.get("questionNumber", ""),
+            "Nova Type":           nt,
+            "Friendly Name":       nd.get("friendlyName", ""),
+            "Body":                nd.get("body", ""),
+            "Marks":               nd.get("marks", ""),
+            "Difficulty":          nd.get("difficulty", 1),
+            "Written Solution":    nd.get("writtenSolution", ""),
+            # Simple
+            "Answer Prefix":       nd.get("answerPrefix", ""),
+            "Answer":              nd.get("answer", ""),
+            "Answer Unit":         nd.get("answerUnit", ""),
+            # MC
+            "MC Style":            nd.get("style", ""),
+            "MC Options":          json.dumps(nd.get("options", [])) if nd.get("options") else "",
+            # Multiple answer
+            "Require Specific Order": str(nd.get("requireSpecificOrder", "")),
+            "MA Answers":          json.dumps(nd.get("answers", [])) if nd.get("answers") else "",
+            # Fraction
+            "Answer Label":        nd.get("answerLabel", ""),
+            "Numerator":           nd.get("numerator", ""),
+            "Denominator":         nd.get("denominator", ""),
+            # Fill in blank
+            "Preamble":            nd.get("preamble", ""),
+            "Blank Content":       nd.get("blankContent", ""),
+            "Blanks":              json.dumps(nd.get("blanks", [])) if nd.get("blanks") else "",
+            # Essay
+            "Question for AI":     nd.get("questionForAI", ""),
+            "AI Marking Criteria": nd.get("aiMarkingCriteria", ""),
+            "Marking Criteria":    nd.get("markingCriteriaForStudent", ""),
+            "AI Role Prompt":      NOVA_AI_ROLE_PROMPT if nt == "essay" else "",
+            "ChatGPT Model":       "gpt-4.1" if nt == "essay" else "",
+            "Min Word Count":      "1" if nt == "essay" else "",
+            "Marking Method":      "AI" if nt == "essay" else "",
+        }
+        rows.append(row)
+    if not rows:
+        return ""
+    buf = io.StringIO()
+    import csv
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
 
 # ── Drawing overlay ───────────────────────────────────────────────────────
 def draw_overlay(display: Image.Image, pb: list[dict],
@@ -1562,3 +2088,578 @@ if "records" in st.session_state:
             if "sync_log" in st.session_state:
                 st.text("\n".join(st.session_state["sync_log"]))
                 st.markdown(f"[Open in Airtable →](https://airtable.com/{AT_BASE})")
+
+# ── 8. Nova Question Formatter ─────────────────────────────────────────────
+st.divider()
+st.subheader("8 · Nova Question Formatter")
+st.caption(
+    "Classify extracted questions into Nova question types with all fields "
+    "pre-filled and ready to copy into the platform."
+)
+
+# ── Source selection ───────────────────────────────────────────────────────
+src_col, btn_col = st.columns([2, 1])
+with src_col:
+    nova_source = st.radio(
+        "Source",
+        ["Use current session records", "Fetch fresh from Airtable"],
+        horizontal=True,
+        help="Use session records if you just ran Extract above. "
+             "Fetch from Airtable if you want to format a previously synced paper.",
+    )
+
+with btn_col:
+    if nova_source == "Fetch fresh from Airtable":
+        fetch_table = st.text_input(
+            "Table to fetch",
+            value=AT_TABLE,
+            key="nova_fetch_table",
+            label_visibility="collapsed",
+            placeholder="Table name",
+        )
+        if st.button("📥 Fetch from Airtable",
+                     disabled=not (AT_TOKEN and AT_BASE)):
+            try:
+                with st.spinner("Fetching…"):
+                    fetched = fetch_airtable_records(AT_TOKEN, AT_BASE, fetch_table)
+                st.session_state["nova_source_records"] = fetched
+                st.success(f"Fetched {len(fetched)} records from '{fetch_table}'")
+            except Exception as e:
+                st.error(f"Fetch failed: {e}")
+
+# Resolve which records to classify
+def _nova_source_records() -> list[dict]:
+    if nova_source == "Fetch fresh from Airtable":
+        return st.session_state.get("nova_source_records", [])
+    return st.session_state.get("records", [])
+
+_src = _nova_source_records()
+if _src:
+    st.caption(f"{len(_src)} records available for classification.")
+
+# ── Classify button ────────────────────────────────────────────────────────
+classify_col, clear_col = st.columns([3, 1])
+with classify_col:
+    if st.button(
+        "🤖 Classify all with AI",
+        type="primary",
+        disabled=not (OPENAI_KEY and _src),
+    ):
+        st.session_state["do_nova_classify"] = True
+        st.session_state.pop("nova_classified", None)
+        st.rerun()
+
+with clear_col:
+    if st.button("🗑 Clear results",
+                 disabled="nova_classified" not in st.session_state):
+        st.session_state.pop("nova_classified", None)
+        st.rerun()
+
+if st.session_state.get("do_nova_classify"):
+    st.session_state["do_nova_classify"] = False
+    src_records = _nova_source_records()
+    _pname      = st.session_state.get("paper_name", paper_name) or "Paper"
+    client      = OpenAI(api_key=OPENAI_KEY)
+
+    # Only classify questions that need answering (skip parent preamble rows)
+    standalone, groups = group_nova_records(src_records)
+    to_classify = list(standalone)
+    for g in groups:
+        to_classify.extend(g["children"])
+
+    nova_out: list[dict] = []
+    errors:   list[str]  = []
+
+    progress_bar = st.progress(0, text="Classifying questions…")
+    total = len(to_classify)
+
+    def _classify_one(r):
+        try:
+            nd = classify_nova_question(client, r, _pname)
+            return {"questionNumber": r["questionNumber"],
+                    "originalRecord": r,
+                    "novaData": nd,
+                    "error": None}
+        except Exception as e:
+            return {"questionNumber": r["questionNumber"],
+                    "originalRecord": r,
+                    "novaData": {},
+                    "error": str(e)}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(_classify_one, r): i
+                   for i, r in enumerate(to_classify)}
+        done = 0
+        for fut in as_completed(futures):
+            nova_out.append(fut.result())
+            done += 1
+            progress_bar.progress(done / max(total, 1),
+                                   text=f"Classified {done}/{total}…")
+
+    progress_bar.empty()
+
+    # Attach parent records so the UI can build multi-part groups
+    parent_items = []
+    for g in groups:
+        parent_items.append({
+            "questionNumber": g["parent"]["questionNumber"],
+            "originalRecord": g["parent"],
+            "novaData": None,  # parents have no nova classification
+            "isParent": True,
+            "childQnums": [
+                normalise_qnum(c.get("questionNumber", ""))
+                for c in g["children"]
+            ],
+            "error": None,
+        })
+
+    # Mark non-parent items
+    for item in nova_out:
+        item.setdefault("isParent", False)
+        item.setdefault("childQnums", [])
+
+    # Merge parents back in so display can find them
+    all_nova = parent_items + nova_out
+    # Sort by original record order
+    qnum_order = {normalise_qnum(r.get("questionNumber", "")): i
+                  for i, r in enumerate(src_records)}
+    all_nova.sort(key=lambda x: qnum_order.get(
+        normalise_qnum(x.get("questionNumber", "")), 9999))
+
+    st.session_state["nova_classified"] = all_nova
+    st.session_state["nova_paper_name"] = _pname
+    n_ok  = sum(1 for x in nova_out if not x["error"])
+    n_err = sum(1 for x in nova_out if x["error"])
+    st.success(f"✅ {n_ok} classified · {n_err} errors · {len(parent_items)} multi-part groups")
+    st.rerun()
+
+# ── Display classified records ─────────────────────────────────────────────
+if "nova_classified" in st.session_state:
+    all_nova  = st.session_state["nova_classified"]
+    pname     = st.session_state.get("nova_paper_name", "")
+
+    # ── Filters ────────────────────────────────────────────────────────────
+    all_types = sorted({
+        (x.get("novaData") or {}).get("novaType", "")
+        for x in all_nova
+        if not x.get("isParent") and (x.get("novaData") or {}).get("novaType")
+    })
+    fcol1, fcol2 = st.columns([2, 3])
+    with fcol1:
+        type_filter = st.selectbox(
+            "Filter by type",
+            ["All types"] + [NOVA_TYPE_LABELS.get(t, t) for t in all_types],
+            key="nova_type_filter",
+        )
+    with fcol2:
+        search_q = st.text_input(
+            "Search question number / text",
+            key="nova_search",
+            placeholder="e.g. 7a  or  area",
+            label_visibility="collapsed",
+        )
+
+    # ── Download CSV ───────────────────────────────────────────────────────
+    non_parent = [x for x in all_nova if not x.get("isParent")]
+    csv_data   = nova_records_to_csv(non_parent)
+
+    dl_col, sync_col = st.columns([1, 2])
+    with dl_col:
+        st.download_button(
+            "⬇ Download all as CSV",
+            data=csv_data.encode(),
+            file_name=f"{pname or 'nova'}_questions.csv",
+            mime="text/csv",
+        )
+
+    with sync_col:
+        if not (AT_TOKEN and AT_BASE):
+            st.warning("Add Airtable credentials in the sidebar to sync.")
+        else:
+            nova_tbl_name = st.text_input(
+                "Nova table name",
+                value=f"{pname or 'Nova'} – Nova Questions",
+                key="nova_sync_table",
+                help="A new table will be created in your existing Airtable base.",
+            )
+            if st.button("🚀 Sync Nova records to Airtable", type="primary",
+                         key="nova_sync_btn"):
+                st.session_state["do_nova_sync"] = True
+                st.session_state.pop("nova_sync_log", None)
+                st.rerun()
+
+    if st.session_state.get("do_nova_sync"):
+        st.session_state["do_nova_sync"] = False
+        _nova_tbl = st.session_state.get("nova_sync_table",
+                                          f"{pname or 'Nova'} – Nova Questions")
+        _items    = [x for x in all_nova if not x.get("isParent")]
+        with st.status("Syncing to Airtable…", expanded=True) as _status:
+            try:
+                _n, _logs = push_nova_to_airtable(
+                    AT_TOKEN, AT_BASE, _nova_tbl, _items, pname)
+                for line in _logs:
+                    st.write(line)
+                # Print filter formulas the user needs to add manually
+                st.write("─" * 40)
+                st.write("**Add these filters to each view in Airtable:**")
+                for nt, vname in NOVA_VIEW_NAMES.items():
+                    st.write(f"  • **{vname}** → Filter: `Nova Type` = `{nt}`")
+                _status.update(
+                    label=f"✅ {_n} records synced to '{_nova_tbl}'",
+                    state="complete")
+                st.session_state["nova_sync_log"] = _logs
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
+                _status.update(label="❌ Sync failed", state="error")
+
+    if "nova_sync_log" in st.session_state:
+        st.markdown(f"[Open base in Airtable →](https://airtable.com/{AT_BASE})")
+
+    st.divider()
+
+    # ── Helper: render one field row ────────────────────────────────────────
+    def _field(label: str, value: str, multiline: bool = False,
+               height: int = 100, hint: str = "", key: str = ""):
+        st.caption(f"**{label}**" + (f"  ·  *{hint}*" if hint else ""))
+        if multiline:
+            st.text_area("", value=str(value or ""), height=height,
+                         key=key, label_visibility="collapsed")
+        else:
+            st.text_input("", value=str(value or ""), key=key,
+                          label_visibility="collapsed")
+
+    # ── Helper: render type-specific fields ─────────────────────────────────
+    def _render_nova_fields(nd: dict, qn: str):
+        nt = nd.get("novaType", "simple")
+
+        # Shared fields
+        col_a, col_b = st.columns(2)
+        with col_a:
+            _field("Friendly Name / Question",
+                   nd.get("friendlyName", ""),
+                   hint="Name shown in Nova — same for both fields",
+                   key=f"fn_{qn}")
+        with col_b:
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                _field("Marks", str(nd.get("marks", "")), key=f"marks_{qn}")
+            with mc2:
+                _field("Difficulty", str(nd.get("difficulty", 1)), key=f"diff_{qn}")
+
+        _field("Body", nd.get("body", ""), multiline=True, height=120,
+               hint="Question text shown on the course. Maths in [latex]...[/latex]",
+               key=f"body_{qn}")
+
+        if nt == "simple":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                _field("Answer Prefix",
+                       nd.get("answerPrefix", ""),
+                       hint="Shown before the answer box",
+                       key=f"apfx_{qn}")
+            with col2:
+                _field("Answer",
+                       nd.get("answer", ""),
+                       hint="Exact answer (not in latex)",
+                       key=f"ans_{qn}")
+            with col3:
+                _field("Answer Unit",
+                       nd.get("answerUnit", ""),
+                       hint="Shown after the answer box",
+                       key=f"aunit_{qn}")
+
+        elif nt == "multiple_choice":
+            _field("Style", nd.get("style", "List"),
+                   hint="List or Grid",
+                   key=f"mcstyle_{qn}")
+            st.caption("**Options**  ·  *Mark the correct answer with ✓*")
+            opts = nd.get("options") or []
+            for oi, opt in enumerate(opts):
+                oc1, oc2, oc3 = st.columns([3, 1, 1])
+                with oc1:
+                    st.text_input("",
+                                  value=str(opt.get("text", "")),
+                                  key=f"mcopt_{qn}_{oi}",
+                                  label_visibility="collapsed")
+                with oc2:
+                    correct_str = "✓ Correct" if opt.get("correct") else ""
+                    st.text_input("", value=correct_str,
+                                  key=f"mccorr_{qn}_{oi}",
+                                  label_visibility="collapsed",
+                                  disabled=True)
+                with oc3:
+                    st.write("")  # spacer
+
+        elif nt == "multiple_answer":
+            _field("Require Specific Order",
+                   "Yes" if nd.get("requireSpecificOrder") else "No",
+                   hint="Tick if order matters",
+                   key=f"maord_{qn}")
+            st.caption("**Answer Boxes**")
+            answers = nd.get("answers") or []
+            for ai, ans in enumerate(answers):
+                ac1, ac2, ac3 = st.columns(3)
+                with ac1:
+                    _field(f"Box {ai+1} Prefix",
+                           ans.get("prefix", ""),
+                           key=f"mapfx_{qn}_{ai}")
+                with ac2:
+                    _field(f"Box {ai+1} Answer",
+                           ans.get("answer", ""),
+                           key=f"maans_{qn}_{ai}")
+                with ac3:
+                    _field(f"Box {ai+1} Suffix",
+                           ans.get("suffix", ""),
+                           key=f"masfx_{qn}_{ai}")
+
+        elif nt == "fraction":
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                _field("Answer Label", nd.get("answerLabel", ""),
+                       hint="Shown before fraction", key=f"flabel_{qn}")
+            with fc2:
+                _field("Numerator (top)", nd.get("numerator", ""),
+                       key=f"fnum_{qn}")
+            with fc3:
+                _field("Denominator (bottom)", nd.get("denominator", ""),
+                       key=f"fden_{qn}")
+            st.info("💡 Remember to state in the question body that the answer must be in its simplest form.", icon="ℹ️")
+
+        elif nt == "fill_in_blank":
+            _field("Body / Preamble",
+                   nd.get("preamble", nd.get("body", "")),
+                   multiline=True, height=80,
+                   hint="Text shown before the sentence with blanks",
+                   key=f"fibpre_{qn}")
+            _field("Blank Question Content",
+                   nd.get("blankContent", ""),
+                   multiline=True, height=80,
+                   hint="Use [blank] where each dropdown goes",
+                   key=f"fibcont_{qn}")
+            st.caption("**Blanks**  ·  *For each [blank] in the content above*")
+            blanks = nd.get("blanks") or []
+            for bi, blank in enumerate(blanks):
+                st.caption(f"Blank {bi+1}")
+                bc1, bc2, bc3 = st.columns([2, 2, 1])
+                with bc1:
+                    opts_str = " | ".join(blank.get("options") or [])
+                    _field("Options (pipe-separated)",
+                           opts_str,
+                           key=f"fibopt_{qn}_{bi}")
+                with bc2:
+                    _field("Correct Answer",
+                           blank.get("correct", ""),
+                           key=f"fibcorr_{qn}_{bi}")
+                with bc3:
+                    _field("Marks",
+                           str(blank.get("marks", 1)),
+                           key=f"fibmarks_{qn}_{bi}")
+
+        elif nt == "essay":
+            _field("Question for AI",
+                   nd.get("questionForAI", ""),
+                   multiline=True, height=80,
+                   hint="Plain English, no LaTeX — this goes to the AI",
+                   key=f"essqai_{qn}")
+            _field("ChatGPT Model", "gpt-4.1",
+                   hint="Use gpt-4.1; fall back to 'default' if unavailable",
+                   key=f"essgpt_{qn}")
+            _field("AI Role Prompt",
+                   NOVA_AI_ROLE_PROMPT,
+                   multiline=True, height=80,
+                   key=f"essrole_{qn}")
+            _field("AI Marking Criteria",
+                   nd.get("aiMarkingCriteria", ""),
+                   multiline=True, height=150,
+                   hint="Ends with 'There are X possible marks…'",
+                   key=f"essaic_{qn}")
+            _field("Marking Criteria (shown to student)",
+                   nd.get("markingCriteriaForStudent",
+                          nd.get("writtenSolution", "")),
+                   multiline=True, height=100,
+                   key=f"essstuc_{qn}")
+            pc1, pc2, pc3 = st.columns(3)
+            with pc1:
+                _field("Pass Marks",
+                       str(nd.get("marks", "")),
+                       hint="Same as Marks",
+                       key=f"esspass_{qn}")
+            with pc2:
+                _field("Min Word Count", "1", key=f"esswc_{qn}")
+            with pc3:
+                _field("Marking Method", "AI", key=f"essmm_{qn}")
+
+        # Written solution (all types except essay which shows it above differently)
+        if nt != "essay":
+            _field("Written Solution",
+                   nd.get("writtenSolution", ""),
+                   multiline=True, height=100,
+                   hint="Mark scheme / worked answer shown after submission",
+                   key=f"ws_{qn}")
+
+    # ── Helper: re-classify single record ──────────────────────────────────
+    def _reclassify_button(item: dict, key: str):
+        if st.button("🔄 Re-classify", key=f"reclassify_{key}",
+                     help="Re-run AI classification for this question only"):
+            _c = OpenAI(api_key=OPENAI_KEY)
+            _p = st.session_state.get("nova_paper_name", "")
+            try:
+                nd = classify_nova_question(_c, item["originalRecord"], _p)
+                item["novaData"] = nd
+                item["error"]    = None
+            except Exception as e:
+                item["error"] = str(e)
+            st.session_state["nova_classified"] = all_nova
+            st.rerun()
+
+    # ── Build display order (multi-part groups first, then standalone) ──────
+    # Index by question number
+    nova_by_qn   = {normalise_qnum(x["questionNumber"]): x for x in all_nova}
+    parent_items_disp = [x for x in all_nova if x.get("isParent")]
+    shown_qnums: set[str] = set()
+    display_order: list[dict] = []  # each item: {"type": "group"|"standalone", "data": ...}
+
+    for pi in parent_items_disp:
+        grp_children = [
+            nova_by_qn[cqn]
+            for cqn in pi.get("childQnums", [])
+            if cqn in nova_by_qn
+        ]
+        display_order.append({
+            "dtype":    "group",
+            "parent":   pi,
+            "children": grp_children,
+        })
+        shown_qnums.add(normalise_qnum(pi["questionNumber"]))
+        for c in grp_children:
+            shown_qnums.add(normalise_qnum(c["questionNumber"]))
+
+    for item in all_nova:
+        qn = normalise_qnum(item["questionNumber"])
+        if qn not in shown_qnums and not item.get("isParent"):
+            display_order.append({"dtype": "standalone", "item": item})
+            shown_qnums.add(qn)
+
+    # ── Apply filters ────────────────────────────────────────────────────────
+    def _type_of(item: dict) -> str:
+        return (item.get("novaData") or {}).get("novaType", "")
+
+    def _matches_filter(item: dict) -> bool:
+        if type_filter != "All types":
+            label = NOVA_TYPE_LABELS.get(_type_of(item), _type_of(item))
+            if label != type_filter:
+                return False
+        if search_q:
+            sq = search_q.lower()
+            qn = item.get("questionNumber", "").lower()
+            qt = (item.get("originalRecord") or {}).get("questionText", "").lower()
+            if sq not in qn and sq not in qt:
+                return False
+        return True
+
+    def _group_matches(grp: dict) -> bool:
+        if type_filter != "All types":
+            if not any(_matches_filter(c) for c in grp["children"]):
+                return False
+        if search_q:
+            if not any(_matches_filter(c) for c in grp["children"]):
+                parent_qt = (grp["parent"].get("originalRecord") or {}).get(
+                    "questionText", "").lower()
+                if search_q.lower() not in parent_qt:
+                    return False
+        return True
+
+    # ── Render ─────────────────────────────────────────────────────────────
+    rendered = 0
+    for entry in display_order:
+
+        if entry["dtype"] == "standalone":
+            item = entry["item"]
+            if not _matches_filter(item):
+                continue
+            nd = item.get("novaData") or {}
+            nt = nd.get("novaType", "?")
+            color = NOVA_TYPE_COLORS.get(nt, "#7f8c8d")
+            label = NOVA_TYPE_LABELS.get(nt, nt)
+            qn    = item.get("questionNumber", "?")
+            header = (
+                f"<span style='background:{color};color:#fff;padding:2px 8px;"
+                f"border-radius:4px;font-size:0.75em;font-weight:600;"
+                f"margin-right:8px'>{label}</span>"
+                f"<strong>Q{qn}</strong>"
+            )
+            if item.get("error"):
+                header += f"  <span style='color:#e74c3c;font-size:0.8em'>⚠ {item['error'][:60]}</span>"
+            with st.expander(f"Q{qn} · {label}", expanded=False):
+                st.markdown(header, unsafe_allow_html=True)
+                st.caption(
+                    f"*Original:* {(item.get('originalRecord') or {}).get('questionText', '')[:120]}")
+                if item.get("error"):
+                    st.error(f"Classification error: {item['error']}")
+                    _reclassify_button(item, qn)
+                else:
+                    _render_nova_fields(nd, qn)
+                    _reclassify_button(item, qn)
+            rendered += 1
+
+        else:  # group (multi-part)
+            grp = entry
+            if not _group_matches(grp):
+                continue
+            parent = grp["parent"]
+            children = grp["children"]
+            pqn    = parent.get("questionNumber", "?")
+            ptext  = (parent.get("originalRecord") or {}).get("questionText", "")
+            child_types = [
+                NOVA_TYPE_LABELS.get(_type_of(c), "?")
+                for c in children if not c.get("isParent")
+            ]
+            summary = ", ".join(dict.fromkeys(child_types)) or "sub-questions"
+            with st.expander(
+                f"Q{pqn} · Multi-part  ({len(children)} sub-questions: {summary})",
+                expanded=False,
+            ):
+                st.markdown(
+                    f"<span style='background:#2c3e50;color:#fff;padding:2px 8px;"
+                    f"border-radius:4px;font-size:0.75em;font-weight:600'>"
+                    f"Multi-part</span>  <strong>Q{pqn}</strong>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("**Shared preamble** *(paste into the Multi-part container in Nova)*")
+                st.text_area(
+                    "",
+                    value=ptext,
+                    height=100,
+                    key=f"mp_preamble_{pqn}",
+                    label_visibility="collapsed",
+                )
+                st.caption(
+                    "In Nova: create a Multi-part question, paste the preamble above, "
+                    "then attach each sub-question below."
+                )
+                st.divider()
+
+                for child in children:
+                    nd  = child.get("novaData") or {}
+                    nt  = nd.get("novaType", "?")
+                    cqn = child.get("questionNumber", "?")
+                    color = NOVA_TYPE_COLORS.get(nt, "#7f8c8d")
+                    label = NOVA_TYPE_LABELS.get(nt, nt)
+                    st.markdown(
+                        f"<span style='background:{color};color:#fff;padding:2px 6px;"
+                        f"border-radius:4px;font-size:0.72em;font-weight:600;"
+                        f"margin-right:6px'>{label}</span>"
+                        f"<strong>Sub-question Q{cqn}</strong>",
+                        unsafe_allow_html=True,
+                    )
+                    if child.get("error"):
+                        st.error(f"Classification error: {child['error']}")
+                        _reclassify_button(child, cqn)
+                    else:
+                        _render_nova_fields(nd, cqn)
+                        _reclassify_button(child, cqn)
+                    st.divider()
+            rendered += 1
+
+    if rendered == 0:
+        st.info("No questions match the current filter.")
