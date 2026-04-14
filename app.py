@@ -1026,7 +1026,7 @@ def nova_record_to_fields(item: dict, paper_name: str = "",
     # Parent preamble records have no novaData — handle separately
     if item.get("isParent"):
         return {
-            "Question Number":  rec.get("questionNumber", ""),
+            "Question Number":  rec.get("originalQuestionNumber", rec.get("questionNumber", "")),
             "Paper Name":       pn,
             "Exam Board":       _meta("examBoard",   "exam_board"),
             "Subject":          _meta("subject",     "subject"),
@@ -1044,7 +1044,7 @@ def nova_record_to_fields(item: dict, paper_name: str = "",
         }
 
     fields: dict = {
-        "Question Number":  rec.get("questionNumber", ""),
+        "Question Number":  rec.get("originalQuestionNumber", rec.get("questionNumber", "")),
         "Paper Name":       pn,
         "Exam Board":       _meta("examBoard",   "exam_board"),
         "Subject":          _meta("subject",     "subject"),
@@ -1101,7 +1101,9 @@ def nova_record_to_fields(item: dict, paper_name: str = "",
             "Question for AI":     nd.get("questionForAI",             ""),
             "AI Marking Criteria": nd.get("aiMarkingCriteria",         ""),
             "Marking Criteria":    nd.get("markingCriteriaForStudent",  ""),
-            "AI Role Prompt":      NOVA_AI_ROLE_PROMPT,
+            "AI Role Prompt":      nova_ai_role_prompt(
+                                       rec.get("subject", "") or m.get("subject", ""),
+                                       rec.get("level",   "") or m.get("level",   "")),
             "ChatGPT Model":       "gpt-4.1",
             "Pass Marks":          clamp_int(nd.get("marks", 0)),
             "Min Word Count":      1,
@@ -1212,14 +1214,22 @@ NOVA_TYPE_COLORS = {
     "fill_in_blank":   "#16a085",
     "essay":           "#c0392b",
 }
-NOVA_AI_ROLE_PROMPT = (
-    "You are a fair, accurate, and constructive GCSE Maths and Science examiner. "
-    "Your feedback should be focused on key scientific concepts, assessment criteria, "
-    "and the learner's application of knowledge. Ensure your comments are clear, "
-    "specific, and help learners improve their understanding of scientific principles "
-    "while maintaining a professional and encouraging tone. Accept minor spelling "
-    "mistakes if the meaning is clear."
-)
+def nova_ai_role_prompt(subject: str = "", level: str = "") -> str:
+    """Generate a role prompt tailored to the subject and level."""
+    subj  = subject.strip() or "this subject"
+    lvl   = level.strip()   or "exam"
+    combo = f"{lvl} {subj}".strip()
+    return (
+        f"You are a fair, accurate, and constructive {combo} examiner. "
+        f"Your feedback should be focused on key {subj} concepts, assessment criteria, "
+        f"and the learner's application of knowledge. Ensure your comments are clear, "
+        f"specific, and help learners improve their understanding of {subj} "
+        f"while maintaining a professional and encouraging tone. "
+        f"Accept minor spelling mistakes if the meaning is clear."
+    )
+
+# Keep a default for reference
+NOVA_AI_ROLE_PROMPT = nova_ai_role_prompt()
 
 def classify_nova_question(client: OpenAI, record: dict,
                             paper_name: str = "") -> dict:
@@ -1423,7 +1433,7 @@ def nova_records_to_csv(nova_classified: list[dict]) -> str:
             "Question for AI":     nd.get("questionForAI", ""),
             "AI Marking Criteria": nd.get("aiMarkingCriteria", ""),
             "Marking Criteria":    nd.get("markingCriteriaForStudent", ""),
-            "AI Role Prompt":      NOVA_AI_ROLE_PROMPT if nt == "essay" else "",
+            "AI Role Prompt":      nova_ai_role_prompt() if nt == "essay" else "",
             "ChatGPT Model":       "gpt-4.1" if nt == "essay" else "",
             "Min Word Count":      "1" if nt == "essay" else "",
             "Marking Method":      "AI" if nt == "essay" else "",
@@ -2498,7 +2508,9 @@ if "nova_classified" in st.session_state:
                    hint="Use gpt-4.1; fall back to 'default' if unavailable",
                    key=f"essgpt_{uid or qn}")
             _field("AI Role Prompt",
-                   NOVA_AI_ROLE_PROMPT,
+                   nova_ai_role_prompt(
+                       st.session_state.get("subject", ""),
+                       st.session_state.get("level",   "")),
                    multiline=True, height=80,
                    key=f"essrole_{uid or qn}")
             _field("AI Marking Criteria",
