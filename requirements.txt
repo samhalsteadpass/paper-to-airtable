@@ -1,7 +1,8 @@
 streamlit
 streamlit-image-coordinates
-PyMuPDF
-pandas
-pillow
-requests
 openai
+requests
+PyMuPDF
+Pillow
+pandas
+cloudinary
