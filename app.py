@@ -210,77 +210,115 @@ If a field is not clearly visible, make your best guess from context.
 
 NOVA_CLASSIFY_PROMPT = """You are formatting an exam question for an e-learning platform called Nova.
 
-Classify the question into the correct Nova type and extract all required fields.
+Classify the question and return a JSON object with ALL required fields for the chosen type.
 
 Question JSON:
 QUESTION_DATA_PLACEHOLDER
 
-NOVA TYPES — pick exactly one:
-- simple        Single number or short word answer. Auto-marked. Use for most calc questions.
-- multiple_choice  Has distinct options OR is a true/false / identification question.
-- multiple_answer  Requires exactly 2+ separate answer boxes (e.g. find x AND y).
-- fraction      Answer must be expressed as a fraction (numerator + denominator).
-- fill_in_blank Sentence with gaps filled from dropdowns.
-- essay         Long written response. AI-marked. Use for explain/describe/evaluate/justify/show working/prove.
+━━━ STEP 1: Pick exactly one Nova type ━━━
 
-DECISION RULES (apply in order):
-1. If questionText contains explicit labeled options (A: / B: / (A) / (B) / i. / ii.) → multiple_choice
-2. If "explain", "describe", "evaluate", "justify", "show that", "prove", "give a reason", "discuss" → essay
-3. If answer is a fraction AND question says "as a fraction" / "simplest form" → fraction
-4. If question clearly asks for two distinct separate values → multiple_answer
-5. If it is a sentence completion / label-the-diagram question → fill_in_blank
-6. Everything else → simple
+- simple          → single number or word answer, auto-marked. Use for most calculation questions.
+- multiple_choice → question has explicit A/B/C/D options OR is true/false.
+- multiple_answer → needs 2+ separate answer boxes (e.g. find x AND y).
+- fraction        → answer must be a fraction (question says "as a fraction" / "simplest form").
+- fill_in_blank   → sentence with dropdown gaps.
+- essay           → explain / describe / evaluate / justify / show working / prove / give a reason.
 
-Return ONLY raw JSON (no markdown fences, no explanation):
-{
+━━━ STEP 2: Return ONLY this JSON — fill in ALL fields ━━━
+
+For type = simple:
+{{
   "novaType": "simple",
   "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
-  "body": "Full question text. Wrap ALL maths in [latex]...[/latex] tags.",
-  "writtenSolution": "Full worked solution from mark scheme. Leave empty string if none.",
-  "marks": 2,
+  "body": "<full question text, maths in [latex]...[/latex]>",
+  "writtenSolution": "<full worked solution from mark scheme, or empty string>",
+  "marks": <integer>,
   "difficulty": 1,
+  "answerPrefix": "<text before answer box, e.g. 'x =' or empty string>",
+  "answer": "<exact answer, NOT in latex, e.g. '4' or '10^4' or 'blue'>",
+  "answerUnit": "<unit after answer box in [latex] if needed, or empty string>"
+}}
 
-  "answerPrefix": "x =",
-  "answer": "5",
-  "answerUnit": "[latex]\\text{cm}[/latex]",
-
+For type = multiple_choice:
+{{
+  "novaType": "multiple_choice",
+  "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
+  "body": "<full question text>",
+  "writtenSolution": "<correct answer explanation>",
+  "marks": <integer>,
+  "difficulty": 1,
   "style": "List",
   "options": [
-    {"text": "12", "correct": false},
-    {"text": "15", "correct": true},
-    {"text": "18", "correct": false},
-    {"text": "21", "correct": false}
-  ],
+    {{"text": "<option A>", "correct": false}},
+    {{"text": "<option B>", "correct": true}},
+    {{"text": "<option C>", "correct": false}},
+    {{"text": "<option D>", "correct": false}}
+  ]
+}}
 
-  "requireSpecificOrder": true,
+For type = multiple_answer:
+{{
+  "novaType": "multiple_answer",
+  "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
+  "body": "<full question text>",
+  "writtenSolution": "<worked solution>",
+  "marks": <integer>,
+  "difficulty": 1,
+  "requireSpecificOrder": false,
   "answers": [
-    {"prefix": "x =", "answer": "3", "suffix": ""},
-    {"prefix": "y =", "answer": "7", "suffix": ""}
-  ],
+    {{"prefix": "x =", "answer": "<value>", "suffix": ""}},
+    {{"prefix": "y =", "answer": "<value>", "suffix": ""}}
+  ]
+}}
 
-  "answerLabel": "Answer =",
-  "numerator": "3",
-  "denominator": "4",
+For type = fraction:
+{{
+  "novaType": "fraction",
+  "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
+  "body": "<full question text — must state answer in simplest form>",
+  "writtenSolution": "<worked solution>",
+  "marks": <integer>,
+  "difficulty": 1,
+  "answerLabel": "<text before fraction, e.g. 'Answer =' or empty string>",
+  "numerator": "<top number>",
+  "denominator": "<bottom number>"
+}}
 
-  "preamble": "Preamble text shown before the blanked sentence.",
-  "blankContent": "A square has [blank] lines of symmetry.",
+For type = fill_in_blank:
+{{
+  "novaType": "fill_in_blank",
+  "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
+  "body": "<preamble text shown before the sentence>",
+  "writtenSolution": "",
+  "marks": <integer>,
+  "difficulty": 1,
+  "preamble": "<same as body>",
+  "blankContent": "<sentence with [blank] where each dropdown goes>",
   "blanks": [
-    {"options": ["2", "4", "1", "8"], "correct": "4", "marks": 1, "writtenSolution": "4"}
-  ],
+    {{"options": ["opt1", "opt2", "opt3", "opt4"], "correct": "opt2", "marks": 1, "writtenSolution": "opt2"}}
+  ]
+}}
 
-  "questionForAI": "Question text without any LaTeX formatting. Plain English only.",
-  "aiMarkingCriteria": "Expand the mark scheme into clear AI scoring instructions. End with: There are X possible marks, please score the answer out of X (maximum X marks).",
-  "markingCriteriaForStudent": "Mark scheme shown to the student after answering."
-}
+For type = essay:
+{{
+  "novaType": "essay",
+  "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
+  "body": "<full question text>",
+  "writtenSolution": "<model answer shown to student>",
+  "marks": <integer>,
+  "difficulty": 1,
+  "questionForAI": "<question text in plain English, no LaTeX>",
+  "aiMarkingCriteria": "<detailed marking instructions for AI. End with: There are X possible marks, please score the answer out of X (maximum X marks)>",
+  "markingCriteriaForStudent": "<mark scheme shown to student after submission>"
+}}
 
-Important notes:
-- Only include the fields that belong to the chosen novaType (plus the shared fields: novaType, friendlyName, body, writtenSolution, marks, difficulty).
-- body must include the full question text with all maths in [latex][/latex] tags.
-- For multiple_choice always provide exactly 4 options with exactly 1 marked correct=true.
-- If the question text already contains options (A/B/C/D), parse them out of body into the options array.
-- marks should equal the markAllocation value from the question data.
-- If question references a diagram/image, add "(See diagram)" in the body.
-- For essay, aiMarkingCriteria should be an expanded, detailed version of the mark scheme written as instructions to an AI marker.
+━━━ Rules ━━━
+- Return ONLY the JSON object — no markdown fences, no explanation.
+- body must contain the FULL question text with all maths in [latex]...[/latex] tags.
+- marks must equal the markAllocation from the question data.
+- If question references a diagram/image, add "(See diagram)" in body.
+- answer (for simple) must NEVER be empty — write the actual answer.
+- For multiple_choice, always provide exactly 4 options with exactly 1 marked correct: true.
 """
 
 def read_cover_page(client: OpenAI, pdf_bytes: bytes) -> tuple[str, str]:
