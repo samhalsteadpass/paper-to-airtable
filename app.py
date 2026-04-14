@@ -2300,7 +2300,7 @@ if "nova_classified" in st.session_state:
                           label_visibility="collapsed")
 
     # ── Helper: render type-specific fields ─────────────────────────────────
-    def _render_nova_fields(nd: dict, qn: str):
+    def _render_nova_fields(nd: dict, qn: str, uid: str = ""):
         nt = nd.get("novaType", "simple")
 
         # Shared fields
@@ -2309,17 +2309,17 @@ if "nova_classified" in st.session_state:
             _field("Friendly Name / Question",
                    nd.get("friendlyName", ""),
                    hint="Name shown in Nova — same for both fields",
-                   key=f"fn_{qn}")
+                   key=f"fn_{uid or qn}")
         with col_b:
             mc1, mc2 = st.columns(2)
             with mc1:
-                _field("Marks", str(nd.get("marks", "")), key=f"marks_{qn}")
+                _field("Marks", str(nd.get("marks", "")), key=f"marks_{uid or qn}")
             with mc2:
-                _field("Difficulty", str(nd.get("difficulty", 1)), key=f"diff_{qn}")
+                _field("Difficulty", str(nd.get("difficulty", 1)), key=f"diff_{uid or qn}")
 
         _field("Body", nd.get("body", ""), multiline=True, height=120,
                hint="Question text shown on the course. Maths in [latex]...[/latex]",
-               key=f"body_{qn}")
+               key=f"body_{uid or qn}")
 
         if nt == "simple":
             col1, col2, col3 = st.columns(3)
@@ -2327,22 +2327,22 @@ if "nova_classified" in st.session_state:
                 _field("Answer Prefix",
                        nd.get("answerPrefix", ""),
                        hint="Shown before the answer box",
-                       key=f"apfx_{qn}")
+                       key=f"apfx_{uid or qn}")
             with col2:
                 _field("Answer",
                        nd.get("answer", ""),
                        hint="Exact answer (not in latex)",
-                       key=f"ans_{qn}")
+                       key=f"ans_{uid or qn}")
             with col3:
                 _field("Answer Unit",
                        nd.get("answerUnit", ""),
                        hint="Shown after the answer box",
-                       key=f"aunit_{qn}")
+                       key=f"aunit_{uid or qn}")
 
         elif nt == "multiple_choice":
             _field("Style", nd.get("style", "List"),
                    hint="List or Grid",
-                   key=f"mcstyle_{qn}")
+                   key=f"mcstyle_{uid or qn}")
             opts    = nd.get("options") or []
             correct = [o for o in opts if o.get("correct")]
             wrong   = [o for o in opts if not o.get("correct")]
@@ -2353,13 +2353,13 @@ if "nova_classified" in st.session_state:
                 display_label = f"Option {label} (correct)" if label == "A" else f"Option {label}"
                 _field(display_label,
                        str(opt.get("text", "") or ""),
-                       key=f"mcopt_{qn}_{i}")
+                       key=f"mcopt_{uid or qn}_{i}")
 
         elif nt == "multiple_answer":
             _field("Require Specific Order",
                    "Yes" if nd.get("requireSpecificOrder") else "No",
                    hint="Tick if order matters",
-                   key=f"maord_{qn}")
+                   key=f"maord_{uid or qn}")
             st.caption("**Answer Boxes**")
             answers = nd.get("answers") or []
             for ai, ans in enumerate(answers):
@@ -2367,27 +2367,27 @@ if "nova_classified" in st.session_state:
                 with ac1:
                     _field(f"Box {ai+1} Prefix",
                            ans.get("prefix", ""),
-                           key=f"mapfx_{qn}_{ai}")
+                           key=f"mapfx_{uid or qn}_{ai}")
                 with ac2:
                     _field(f"Box {ai+1} Answer",
                            ans.get("answer", ""),
-                           key=f"maans_{qn}_{ai}")
+                           key=f"maans_{uid or qn}_{ai}")
                 with ac3:
                     _field(f"Box {ai+1} Suffix",
                            ans.get("suffix", ""),
-                           key=f"masfx_{qn}_{ai}")
+                           key=f"masfx_{uid or qn}_{ai}")
 
         elif nt == "fraction":
             fc1, fc2, fc3 = st.columns(3)
             with fc1:
                 _field("Answer Label", nd.get("answerLabel", ""),
-                       hint="Shown before fraction", key=f"flabel_{qn}")
+                       hint="Shown before fraction", key=f"flabel_{uid or qn}")
             with fc2:
                 _field("Numerator (top)", nd.get("numerator", ""),
-                       key=f"fnum_{qn}")
+                       key=f"fnum_{uid or qn}")
             with fc3:
                 _field("Denominator (bottom)", nd.get("denominator", ""),
-                       key=f"fden_{qn}")
+                       key=f"fden_{uid or qn}")
             st.info("💡 Remember to state in the question body that the answer must be in its simplest form.", icon="ℹ️")
 
         elif nt == "fill_in_blank":
@@ -2395,12 +2395,12 @@ if "nova_classified" in st.session_state:
                    nd.get("preamble", nd.get("body", "")),
                    multiline=True, height=80,
                    hint="Text shown before the sentence with blanks",
-                   key=f"fibpre_{qn}")
+                   key=f"fibpre_{uid or qn}")
             _field("Blank Question Content",
                    nd.get("blankContent", ""),
                    multiline=True, height=80,
                    hint="Use [blank] where each dropdown goes",
-                   key=f"fibcont_{qn}")
+                   key=f"fibcont_{uid or qn}")
             st.caption("**Blanks**  ·  *For each [blank] in the content above*")
             blanks = nd.get("blanks") or []
             for bi, blank in enumerate(blanks):
@@ -2410,49 +2410,49 @@ if "nova_classified" in st.session_state:
                     opts_str = " | ".join(blank.get("options") or [])
                     _field("Options (pipe-separated)",
                            opts_str,
-                           key=f"fibopt_{qn}_{bi}")
+                           key=f"fibopt_{uid or qn}_{bi}")
                 with bc2:
                     _field("Correct Answer",
                            blank.get("correct", ""),
-                           key=f"fibcorr_{qn}_{bi}")
+                           key=f"fibcorr_{uid or qn}_{bi}")
                 with bc3:
                     _field("Marks",
                            str(blank.get("marks", 1)),
-                           key=f"fibmarks_{qn}_{bi}")
+                           key=f"fibmarks_{uid or qn}_{bi}")
 
         elif nt == "essay":
             _field("Question for AI",
                    nd.get("questionForAI", ""),
                    multiline=True, height=80,
                    hint="Plain English, no LaTeX — this goes to the AI",
-                   key=f"essqai_{qn}")
+                   key=f"essqai_{uid or qn}")
             _field("ChatGPT Model", "gpt-4.1",
                    hint="Use gpt-4.1; fall back to 'default' if unavailable",
-                   key=f"essgpt_{qn}")
+                   key=f"essgpt_{uid or qn}")
             _field("AI Role Prompt",
                    NOVA_AI_ROLE_PROMPT,
                    multiline=True, height=80,
-                   key=f"essrole_{qn}")
+                   key=f"essrole_{uid or qn}")
             _field("AI Marking Criteria",
                    nd.get("aiMarkingCriteria", ""),
                    multiline=True, height=150,
                    hint="Ends with 'There are X possible marks…'",
-                   key=f"essaic_{qn}")
+                   key=f"essaic_{uid or qn}")
             _field("Marking Criteria (shown to student)",
                    nd.get("markingCriteriaForStudent",
                           nd.get("writtenSolution", "")),
                    multiline=True, height=100,
-                   key=f"essstuc_{qn}")
+                   key=f"essstuc_{uid or qn}")
             pc1, pc2, pc3 = st.columns(3)
             with pc1:
                 _field("Pass Marks",
                        str(nd.get("marks", "")),
                        hint="Same as Marks",
-                       key=f"esspass_{qn}")
+                       key=f"esspass_{uid or qn}")
             with pc2:
-                _field("Min Word Count", "1", key=f"esswc_{qn}")
+                _field("Min Word Count", "1", key=f"esswc_{uid or qn}")
             with pc3:
-                _field("Marking Method", "AI", key=f"essmm_{qn}")
+                _field("Marking Method", "AI", key=f"essmm_{uid or qn}")
 
         # Written solution (all types except essay which shows it above differently)
         if nt != "essay":
@@ -2460,7 +2460,7 @@ if "nova_classified" in st.session_state:
                    nd.get("writtenSolution", ""),
                    multiline=True, height=100,
                    hint="Mark scheme / worked answer shown after submission",
-                   key=f"ws_{qn}")
+                   key=f"ws_{uid or qn}")
 
     # ── Helper: re-classify single record ──────────────────────────────────
     def _reclassify_button(item: dict, key: str):
@@ -2563,7 +2563,7 @@ if "nova_classified" in st.session_state:
                     st.error(f"Classification error: {item['error']}")
                     _reclassify_button(item, qn)
                 else:
-                    _render_nova_fields(nd, qn)
+                    _render_nova_fields(nd, qn, uid=f"s{rendered}")
                     _reclassify_button(item, qn)
             rendered += 1
 
@@ -2621,7 +2621,7 @@ if "nova_classified" in st.session_state:
                         st.error(f"Classification error: {child['error']}")
                         _reclassify_button(child, cqn)
                     else:
-                        _render_nova_fields(nd, cqn)
+                        _render_nova_fields(nd, cqn, uid=f"g{rendered}_{cqn}")
                         _reclassify_button(child, cqn)
                     st.divider()
             rendered += 1
