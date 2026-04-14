@@ -49,7 +49,7 @@ BASE_BACKOFF      = 2
 IMAGE_MAX_SIZE    = (1200, 1200)
 JPEG_QUALITY      = 70
 RENDER_DPI        = 150
-EXTRACT_DPI       = 300
+EXTRACT_DPI       = 150
 CANVAS_MAX_WIDTH  = 900
 
 AT_API         = "https://api.airtable.com/v0"
@@ -431,7 +431,7 @@ def call_gpt(client: OpenAI, content: list, model: str,
     return oai_text(run_with_retry(_call))
 
 # ── PDF helpers ───────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=10)
 def get_question_pages(pdf_bytes: bytes) -> list[int]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
@@ -445,7 +445,7 @@ def get_question_pages(pdf_bytes: bytes) -> list[int]:
     doc.close()
     return pages
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=50)
 def render_page_cached(pdf_bytes: bytes, page_num: int,
                         dpi: int = RENDER_DPI) -> bytes:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -1885,7 +1885,7 @@ if st.session_state.get("records") and any(all_boxes()):
                     if normalise_qnum(b.get("questionNumber", "")):
                         continue
                     try:
-                        r = ai_assign(client, b, records, pdf_bytes=get_pdf())
+                        r = ai_assign(client, b, records, pdf_bytes=_pdf)
                         b["ai_qnum"]  = r["questionNumber"]
                         b["ai_conf"]  = r["confidence"]
                         b["ai_notes"] = r["notes"]
@@ -2279,6 +2279,13 @@ if "nova_classified" in st.session_state:
                     label=f"✅ {_n} records pushed to '{_tbl}'",
                     state="complete")
                 st.session_state["nova_sync_log"] = _logs
+                # Free classification results from memory — no longer needed
+                st.session_state.pop("nova_classified", None)
+                st.session_state.pop("nova_paper_name", None)
+                # Free box image bytes — already uploaded to Cloudinary
+                for _pn in boxes():
+                    for _b in boxes()[_pn]:
+                        _b["data"] = b""
             except Exception as e:
                 st.error(f"Sync failed: {e}")
                 _status.update(label="❌ Sync failed", state="error")
