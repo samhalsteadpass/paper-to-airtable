@@ -227,7 +227,7 @@ QUESTION_DATA_PLACEHOLDER
 ━━━ STEP 2: Return ONLY this JSON — fill in ALL fields ━━━
 
 For type = simple:
-{{
+{
   "novaType": "simple",
   "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
   "body": "<full question text, maths in [latex]...[/latex]>",
@@ -237,10 +237,10 @@ For type = simple:
   "answerPrefix": "<text before answer box, e.g. 'x =' or empty string>",
   "answer": "<exact answer, NOT in latex, e.g. '4' or '10^4' or 'blue'>",
   "answerUnit": "<unit after answer box in [latex] if needed, or empty string>"
-}}
+}
 
 For type = multiple_choice:
-{{
+{
   "novaType": "multiple_choice",
   "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
   "body": "<full question text>",
@@ -249,15 +249,15 @@ For type = multiple_choice:
   "difficulty": 1,
   "style": "List",
   "options": [
-    {{"text": "<option A>", "correct": false}},
-    {{"text": "<option B>", "correct": true}},
-    {{"text": "<option C>", "correct": false}},
-    {{"text": "<option D>", "correct": false}}
+    {"text": "<option A>", "correct": false},
+    {"text": "<option B>", "correct": true},
+    {"text": "<option C>", "correct": false},
+    {"text": "<option D>", "correct": false}
   ]
-}}
+}
 
 For type = multiple_answer:
-{{
+{
   "novaType": "multiple_answer",
   "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
   "body": "<full question text>",
@@ -266,13 +266,13 @@ For type = multiple_answer:
   "difficulty": 1,
   "requireSpecificOrder": false,
   "answers": [
-    {{"prefix": "x =", "answer": "<value>", "suffix": ""}},
-    {{"prefix": "y =", "answer": "<value>", "suffix": ""}}
+    {"prefix": "x =", "answer": "<value>", "suffix": ""},
+    {"prefix": "y =", "answer": "<value>", "suffix": ""}
   ]
-}}
+}
 
 For type = fraction:
-{{
+{
   "novaType": "fraction",
   "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
   "body": "<full question text — must state answer in simplest form>",
@@ -282,10 +282,10 @@ For type = fraction:
   "answerLabel": "<text before fraction, e.g. 'Answer =' or empty string>",
   "numerator": "<top number>",
   "denominator": "<bottom number>"
-}}
+}
 
 For type = fill_in_blank:
-{{
+{
   "novaType": "fill_in_blank",
   "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
   "body": "<preamble text shown before the sentence>",
@@ -295,12 +295,12 @@ For type = fill_in_blank:
   "preamble": "<same as body>",
   "blankContent": "<sentence with [blank] where each dropdown goes>",
   "blanks": [
-    {{"options": ["opt1", "opt2", "opt3", "opt4"], "correct": "opt2", "marks": 1, "writtenSolution": "opt2"}}
+    {"options": ["opt1", "opt2", "opt3", "opt4"], "correct": "opt2", "marks": 1, "writtenSolution": "opt2"}
   ]
-}}
+}
 
 For type = essay:
-{{
+{
   "novaType": "essay",
   "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
   "body": "<full question text>",
@@ -310,7 +310,7 @@ For type = essay:
   "questionForAI": "<question text in plain English, no LaTeX>",
   "aiMarkingCriteria": "<detailed marking instructions for AI. End with: There are X possible marks, please score the answer out of X (maximum X marks)>",
   "markingCriteriaForStudent": "<mark scheme shown to student after submission>"
-}}
+}
 
 ━━━ Rules ━━━
 - Return ONLY the JSON object — no markdown fences, no explanation.
