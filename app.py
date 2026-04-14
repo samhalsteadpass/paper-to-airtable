@@ -1181,10 +1181,26 @@ def classify_nova_question(client: OpenAI, record: dict,
               .replace("PAPER_NAME_PLACEHOLDER", paper_name)
               .replace("QNUM_PLACEHOLDER", record.get("questionNumber", "")))
     content = [{"type": "input_text", "text": prompt}]
-    raw     = call_gpt(client, content, VISION_MODEL, max_tokens=3000)
-    result  = safe_json_loads(raw, {})
+
+    # Try up to 2 times — retry if result is missing critical fields
+    result = {}
+    for attempt in range(2):
+        raw    = call_gpt(client, content, VISION_MODEL, max_tokens=3000)
+        result = safe_json_loads(raw, {})
+        if result.get("novaType") and result.get("body"):
+            break  # got a good result
+
     if not result.get("novaType"):
         result["novaType"] = "simple"
+
+    # Fallback: if simple answer is empty, try to extract from writtenSolution
+    if result.get("novaType") == "simple" and not result.get("answer"):
+        ws = result.get("writtenSolution", "") or ""
+        # Look for a standalone number in the written solution
+        nums = re.findall(r'\b(\d+(?:\.\d+)?)\b', ws)
+        if nums:
+            result["answer"] = nums[-1]  # last number is usually the final answer
+
     return result
 
 def group_nova_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
