@@ -55,12 +55,44 @@ AT_API         = "https://api.airtable.com/v0"
 
 # ── Auto-save helpers ─────────────────────────────────────────────────────
 def autosave():
-    """No-op — session state is the only store. Manual save/load handles persistence."""
+    """No-op — manual save/load handles persistence."""
     pass
 
+
+
+
+def _get_pdf_path() -> str | None:
+    """Return the temp file path for this session's PDF, or None if not loaded."""
+    return st.session_state.get("_pdf_tmp_path")
+
+def _set_pdf(pdf_bytes: bytes) -> str:
+    """Write PDF bytes to a unique temp file. Returns the path."""
+    # Delete old temp file if it exists
+    old = st.session_state.get("_pdf_tmp_path")
+    if old:
+        try:
+            import os
+            os.unlink(old)
+        except Exception:
+            pass
+    # Write to a new unique temp file
+    tmp = _tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.write(pdf_bytes)
+    tmp.close()
+    st.session_state["_pdf_tmp_path"] = tmp.name
+    return tmp.name
+
 def get_pdf() -> bytes | None:
-    """Get PDF bytes from session state."""
-    return st.session_state.get("pdf")
+    """Read PDF bytes from the session's temp file."""
+    path = _get_pdf_path()
+    if path:
+        try:
+            import os
+            if os.path.exists(path):
+                return open(path, "rb").read()
+        except Exception:
+            pass
+    return None
 
 AT_META        = "https://api.airtable.com/v0/meta"
 
@@ -1387,7 +1419,7 @@ if st.button("Load PDF", disabled=not (paper_file and OPENAI_KEY)):
     with st.spinner("Reading cover page…"):
         detected_name, detected_type = read_cover_page(client, pdf)
 
-    st.session_state["pdf"]        = pdf
+    _set_pdf(pdf)
     render_page_cached.clear()
     st.session_state["pages"]      = get_question_pages(pdf)
     st.session_state["paper_name"] = detected_name
