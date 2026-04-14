@@ -1079,6 +1079,61 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
     return fields
 
 
+SINGLE_SELECT_FIELDS = {"Exam Board", "Subject", "Level", "Year", "Paper Number"}
+
+def ensure_select_options(token: str, base_id: str, table_id: str,
+                           field_map: dict[str, str],
+                           items: list[dict],
+                           paper_name: str = "") -> None:
+    """
+    Pre-register any new singleSelect option values before pushing records.
+    Airtable blocks new options unless they already exist on the field.
+    """
+    # Collect all values that will be written for each select field
+    needed: dict[str, set[str]] = {f: set() for f in SINGLE_SELECT_FIELDS}
+    for item in items:
+        rec = (item.get("originalRecord") or {})
+        needed["Exam Board"].add(str(rec.get("examBoard",   "") or "").strip())
+        needed["Subject"].add(   str(rec.get("subject",     "") or "").strip())
+        needed["Level"].add(     str(rec.get("level",       "") or "").strip())
+        needed["Year"].add(      str(rec.get("year",        "") or "").strip())
+        needed["Paper Number"].add(str(rec.get("paperNumber","") or "").strip())
+
+    for field_name, values in needed.items():
+        values.discard("")  # ignore empty
+        if not values or field_name not in field_map:
+            continue
+        field_id = field_map[field_name]
+
+        # Fetch current choices
+        r = requests.get(f"{AT_META}/bases/{base_id}/tables",
+                         headers=at_headers(token), timeout=60)
+        if not r.ok:
+            continue
+        existing_choices: set[str] = set()
+        for t in r.json().get("tables", []):
+            if t["id"] == table_id:
+                for f in t.get("fields", []):
+                    if f["id"] == field_id:
+                        existing_choices = {
+                            c["name"] for c in
+                            (f.get("options") or {}).get("choices", [])
+                        }
+
+        new_choices = values - existing_choices
+        if not new_choices:
+            continue
+
+        # PATCH field to add new choices (keep existing ones)
+        all_choices = [{"name": c} for c in sorted(existing_choices | new_choices)]
+        requests.patch(
+            f"{AT_META}/bases/{base_id}/tables/{table_id}/fields/{field_id}",
+            headers=at_headers(token),
+            json={"options": {"choices": all_choices}},
+            timeout=60,
+        )
+
+
 def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                             items: list[dict],
                             paper_name: str = "",
@@ -1105,6 +1160,10 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
 
     # Add any fields missing from an older table
     field_map = ensure_nova_fields(token, base_id, table_id, field_map)
+
+    # Pre-register singleSelect option values so Airtable accepts them
+    ensure_select_options(token, base_id, table_id, field_map, items, paper_name)
+    logs.append("Select options registered")
 
     # Upload images to Cloudinary first so we have URLs to embed in records
     img_url_map: dict[str, str] = {}  # filename → cloudinary URL
