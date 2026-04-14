@@ -26,6 +26,7 @@ import re
 import base64
 import time
 import zipfile
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -76,7 +77,7 @@ def _set_pdf(pdf_bytes: bytes) -> str:
         except Exception:
             pass
     # Write to a new unique temp file
-    tmp = _tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes)
     tmp.close()
     st.session_state["_pdf_tmp_path"] = tmp.name
