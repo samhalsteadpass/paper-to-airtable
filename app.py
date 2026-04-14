@@ -220,7 +220,7 @@ QUESTION_DATA_PLACEHOLDER
 - simple          → single number or word answer, auto-marked. Use for most calculation questions.
 - multiple_choice → question has explicit A/B/C/D options OR is true/false.
 - multiple_answer → needs 2+ separate answer boxes (e.g. find x AND y).
-- fraction        → answer must be a fraction (question says "as a fraction" / "simplest form").
+- fraction        → answer must be expressed as a fraction. Use when question says "as a fraction", "in its simplest form", "what fraction", or the answer is naturally a fraction/ratio. NEVER use simple for these.
 - fill_in_blank   → sentence with dropdown gaps.
 - essay           → explain / describe / evaluate / justify / show working / prove / give a reason.
 
@@ -319,6 +319,7 @@ For type = essay:
 - If question references a diagram/image, add "(See diagram)" in body.
 - answer (for simple) must NEVER be empty — write the actual answer.
 - For multiple_choice, always provide exactly 4 options with exactly 1 marked correct: true.
+- CRITICAL: If the question asks for a fraction OR uses the words "fraction", "simplest form", "lowest terms", or "what fraction" — you MUST use type fraction, never simple.
 """
 
 def read_cover_page(client: OpenAI, pdf_bytes: bytes) -> tuple[str, str]:
@@ -753,7 +754,11 @@ NOVA_ALL_FIELDS: list[tuple[str, str]] = [
     ("Answer Unit",            "singleLineText"),
     # Multiple Choice
     ("MC Style",               "singleLineText"),
-    ("MC Options",             "multilineText"),
+    ("MC Option A",            "singleLineText"),
+    ("MC Option B",            "singleLineText"),
+    ("MC Option C",            "singleLineText"),
+    ("MC Option D",            "singleLineText"),
+    ("MC Correct",             "singleLineText"),
     # Multiple Answer
     ("Require Specific Order", "checkbox"),
     ("MA Answers",             "multilineText"),
@@ -784,7 +789,7 @@ _SHARED_COLS = [
 ]
 NOVA_VIEW_VISIBLE: dict[str, list[str]] = {
     "simple":          _SHARED_COLS + ["Answer Prefix", "Answer", "Answer Unit"],
-    "multiple_choice": _SHARED_COLS + ["MC Style", "MC Options"],
+    "multiple_choice": _SHARED_COLS + ["MC Style", "MC Option A", "MC Option B", "MC Option C", "MC Option D", "MC Correct"],
     "multiple_answer": _SHARED_COLS + ["Require Specific Order", "MA Answers"],
     "fraction":        _SHARED_COLS + ["Answer Label", "Numerator", "Denominator"],
     "fill_in_blank":   _SHARED_COLS + ["Preamble", "Blank Content", "Blanks"],
@@ -1021,10 +1026,16 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
             "Answer Unit":   nd.get("answerUnit",   ""),
         })
     elif nt == "multiple_choice":
-        fields.update({
-            "MC Style":   nd.get("style", "List"),
-            "MC Options": json.dumps(nd.get("options", []), ensure_ascii=False),
-        })
+        opts = nd.get("options") or []
+        labels = ["A", "B", "C", "D"]
+        correct_letter = ""
+        for i, label in enumerate(labels):
+            opt = opts[i] if i < len(opts) else {}
+            fields[f"MC Option {label}"] = str(opt.get("text", "") or "")
+            if opt.get("correct"):
+                correct_letter = label
+        fields["MC Style"]   = nd.get("style", "List")
+        fields["MC Correct"] = correct_letter
     elif nt == "multiple_answer":
         fields.update({
             "Require Specific Order": bool(nd.get("requireSpecificOrder", False)),
@@ -1193,6 +1204,23 @@ def classify_nova_question(client: OpenAI, record: dict,
     if not result.get("novaType"):
         result["novaType"] = "simple"
 
+    # Safety override: force fraction type if question clearly asks for a fraction
+    question_text = record.get("questionText", "").lower()
+    fraction_keywords = ["as a fraction", "simplest form", "lowest terms",
+                         "what fraction", "give your answer as a fraction"]
+    if (result.get("novaType") == "simple"
+            and any(kw in question_text for kw in fraction_keywords)):
+        result["novaType"] = "fraction"
+        # Try to parse numerator/denominator from answer if it looks like a/b
+        ans = str(result.get("answer", "") or "")
+        if "/" in ans:
+            parts = ans.split("/", 1)
+            result["numerator"]   = parts[0].strip()
+            result["denominator"] = parts[1].strip()
+        result.pop("answer", None)
+        result.pop("answerPrefix", None)
+        result.pop("answerUnit", None)
+
     # Fallback: if simple answer is empty, try to extract from writtenSolution
     if result.get("novaType") == "simple" and not result.get("answer"):
         ws = result.get("writtenSolution", "") or ""
@@ -1301,7 +1329,11 @@ def nova_records_to_csv(nova_classified: list[dict]) -> str:
             "Answer Unit":         nd.get("answerUnit", ""),
             # MC
             "MC Style":            nd.get("style", ""),
-            "MC Options":          json.dumps(nd.get("options", [])) if nd.get("options") else "",
+            "MC Option A":         (nd.get("options") or [{}])[0].get("text", "") if nd.get("options") else "",
+            "MC Option B":         (nd.get("options") or [{},{}])[1].get("text", "") if nd.get("options") and len(nd.get("options", [])) > 1 else "",
+            "MC Option C":         (nd.get("options") or [{},{},{}])[2].get("text", "") if nd.get("options") and len(nd.get("options", [])) > 2 else "",
+            "MC Option D":         (nd.get("options") or [{},{},{},{}])[3].get("text", "") if nd.get("options") and len(nd.get("options", [])) > 3 else "",
+            "MC Correct":          next((["A","B","C","D"][i] for i, o in enumerate(nd.get("options") or []) if o.get("correct")), ""),
             # Multiple answer
             "Require Specific Order": str(nd.get("requireSpecificOrder", "")),
             "MA Answers":          json.dumps(nd.get("answers", [])) if nd.get("answers") else "",
@@ -2270,23 +2302,19 @@ if "nova_classified" in st.session_state:
             _field("Style", nd.get("style", "List"),
                    hint="List or Grid",
                    key=f"mcstyle_{qn}")
-            st.caption("**Options**  ·  *Mark the correct answer with ✓*")
             opts = nd.get("options") or []
-            for oi, opt in enumerate(opts):
-                oc1, oc2, oc3 = st.columns([3, 1, 1])
+            labels = ["A", "B", "C", "D"]
+            for i, label in enumerate(labels):
+                opt = opts[i] if i < len(opts) else {}
+                oc1, oc2 = st.columns([4, 1])
                 with oc1:
-                    st.text_input("",
-                                  value=str(opt.get("text", "")),
-                                  key=f"mcopt_{qn}_{oi}",
-                                  label_visibility="collapsed")
+                    _field(f"Option {label}",
+                           str(opt.get("text", "") or ""),
+                           key=f"mcopt_{qn}_{i}")
                 with oc2:
-                    correct_str = "✓ Correct" if opt.get("correct") else ""
-                    st.text_input("", value=correct_str,
-                                  key=f"mccorr_{qn}_{oi}",
-                                  label_visibility="collapsed",
-                                  disabled=True)
-                with oc3:
-                    st.write("")  # spacer
+                    if opt.get("correct"):
+                        st.markdown("<div style='padding-top:28px;color:#27ae60;font-weight:700'>✓ Correct</div>",
+                                    unsafe_allow_html=True)
 
         elif nt == "multiple_answer":
             _field("Require Specific Order",
