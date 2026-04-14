@@ -837,33 +837,26 @@ def ensure_nova_fields(token: str, base_id: str, table_id: str,
     return field_map
 
 
-def upload_attachment_direct(token: str, base_id: str, table_name: str,
-                              record_id: str, field_id: str,
-                              filename: str, image_bytes: bytes) -> tuple[bool, str]:
-    """
-    Upload image bytes directly to an Airtable attachment field.
-    Returns (success, error_message).
-    """
-    url = (f"https://content.airtable.com/v0/{base_id}/"
-           f"{record_id}/{field_id}")
+CLOUDINARY_API = "https://api.cloudinary.com/v1_1"
+
+
+def upload_cloudinary(cloud: str, preset: str,
+                      filename: str, image_bytes: bytes,
+                      paper_name: str = "") -> str | None:
+    """Upload image bytes to Cloudinary. Returns secure URL or None on failure."""
+    base       = filename.rsplit(".", 1)[0].replace(".", "_")
+    safe_paper = re.sub(r"[^a-zA-Z0-9_-]", "_", paper_name)[:40] if paper_name else "paper"
+    ts         = int(time.time())
+    pid        = f"{safe_paper}_{base}_{ts}"
     resp = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {token}",
-                 "Content-Type": "application/json"},
-        json={
-            "contentType": "image/png",
-            "file":        base64.b64encode(image_bytes).decode(),
-            "filename":    filename,
-        },
-        timeout=60,
+        f"{CLOUDINARY_API}/{cloud}/image/upload",
+        data={"upload_preset": preset, "public_id": pid},
+        files={"file": (filename, image_bytes, "image/png")},
+        timeout=120,
     )
     if resp.ok:
-        return True, ""
-    try:
-        err = resp.json().get("error", {}).get("message", resp.text[:200])
-    except Exception:
-        err = resp.text[:200]
-    return False, f"{resp.status_code}: {err}"
+        return resp.json().get("secure_url")
+    return None
 
 
 def build_qnum_image_map(boxes: list[dict]) -> dict[str, list[tuple[str, bytes]]]:
@@ -1046,9 +1039,11 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                             items: list[dict],
                             paper_name: str = "",
                             boxes_list: list[dict] | None = None,
+                            cld_cloud: str = "",
+                            cld_preset: str = "",
                             ) -> tuple[int, list[str], str]:
     """
-    Ensure the Questions table exists, push records, then upload images.
+    Ensure the Questions table exists, push records, upload images via Cloudinary.
     Returns (records_created, log_lines, manual_view_instructions).
     """
     logs: list[str] = []
@@ -1064,25 +1059,44 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
         time.sleep(1)
     logs.append(f"{len(field_map)} fields found")
 
-    # Add any fields that are missing from an older table
+    # Add any fields missing from an older table
     field_map = ensure_nova_fields(token, base_id, table_id, field_map)
-    logs.append(f"{len(field_map)} fields after update")
 
-    # Build image map if boxes provided
+    # Upload images to Cloudinary first so we have URLs to embed in records
+    img_url_map: dict[str, str] = {}  # filename → cloudinary URL
+    if boxes_list and cld_cloud and cld_preset:
+        logs.append(f"Uploading images to Cloudinary…")
+        for b in boxes_list:
+            if not b.get("data"):
+                continue
+            url = upload_cloudinary(cld_cloud, cld_preset,
+                                    b["name"], b["data"], paper_name)
+            if url:
+                img_url_map[b["name"]] = url
+        logs.append(f"  {len(img_url_map)} images uploaded")
+    elif boxes_list:
+        logs.append("⚠ Cloudinary not configured — images will not be attached")
+
+    # Build question → image URLs map
     img_map = build_qnum_image_map(boxes_list or [])
 
     payload = []
-    payload_qnums = []  # track question number per payload record
     for item in items:
         if item.get("error"):
             continue
-        raw     = nova_record_to_fields(item, paper_name)
-        filtered = {k: v for k, v in raw.items()
-                    if k in field_map and k != "Images"}  # images uploaded separately
-        payload.append({"fields": filtered})
-        payload_qnums.append(normalise_qnum(
+        raw      = nova_record_to_fields(item, paper_name)
+        filtered = {k: v for k, v in raw.items() if k in field_map}
+
+        # Attach image URLs for this question
+        qn   = normalise_qnum(
             (item.get("originalRecord") or {}).get("questionNumber",
-             item.get("questionNumber", ""))))
+             item.get("questionNumber", "")))
+        urls = [img_url_map[fn] for fn, _ in img_map.get(qn, [])
+                if fn in img_url_map]
+        if urls and "Images" in field_map:
+            filtered["Images"] = [{"url": u} for u in urls]
+
+        payload.append({"fields": filtered})
 
     if not payload:
         logs.append("No records to push.")
@@ -1090,50 +1104,15 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
 
     url     = f"{AT_API}/{base_id}/{requests.utils.quote(table_name, safe='')}"
     created = 0
-    created_records: list[dict] = []  # collect {id, questionNumber}
-
-    for i, batch in enumerate(chunk_list(payload, 10)):
+    for batch in chunk_list(payload, 10):
         resp = requests.post(url, headers=at_headers(token),
                              json={"records": batch}, timeout=60)
         if not resp.ok:
             logs.append(f"❌ Batch failed: {resp.status_code} {resp.text[:200]}")
         else:
-            batch_records = resp.json().get("records", [])
-            created += len(batch_records)
-            # Map each returned record ID to its question number
-            for j, rec in enumerate(batch_records):
-                global_idx = i * 10 + j
-                qn = payload_qnums[global_idx] if global_idx < len(payload_qnums) else ""
-                created_records.append({"id": rec["id"], "qn": qn})
+            created += len(resp.json().get("records", []))
 
     logs.append(f"✅ {created} records pushed")
-
-    # Upload images
-    if img_map and created_records and "Images" in field_map:
-        images_field_id = field_map["Images"]
-        ok = fail = 0
-        first_err = ""
-        for rec in created_records:
-            imgs = img_map.get(rec["qn"], [])
-            for filename, img_bytes in imgs:
-                success, err = upload_attachment_direct(
-                    token, base_id, table_name,
-                    rec["id"], images_field_id,
-                    filename, img_bytes)
-                if success:
-                    ok += 1
-                else:
-                    fail += 1
-                    if not first_err:
-                        first_err = err
-        if ok or fail:
-            msg = f"🖼 Images: {ok} uploaded · {fail} failed"
-            if first_err:
-                msg += f" (first error: {first_err})"
-            logs.append(msg)
-    elif img_map:
-        logs.append("⚠ Images field not found in table — re-sync to create it")
-
     return created, logs, generate_view_instructions(table_name)
 
 # ── Nova classification ───────────────────────────────────────────────────
@@ -1354,13 +1333,17 @@ st.caption("Draw boxes to capture visuals · AI suggests question assignment · 
 OPENAI_KEY = get_secret("OPENAI_API_KEY")
 AT_TOKEN   = get_secret("AIRTABLE_TOKEN")
 AT_BASE    = get_secret("AIRTABLE_BASE_ID")
+CLD_CLOUD  = get_secret("CLOUDINARY_CLOUD_NAME")
+CLD_PRESET = get_secret("CLOUDINARY_UPLOAD_PRESET")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     for key, label, ph in [
-        ("OPENAI_API_KEY",  "OpenAI API key",  "sk-..."),
-        ("AIRTABLE_TOKEN",  "Airtable token",  "patXXX"),
-        ("AIRTABLE_BASE_ID","Airtable Base ID","appXXX"),
+        ("OPENAI_API_KEY",           "OpenAI API key",           "sk-..."),
+        ("AIRTABLE_TOKEN",           "Airtable token",           "patXXX"),
+        ("AIRTABLE_BASE_ID",         "Airtable Base ID",         "appXXX"),
+        ("CLOUDINARY_CLOUD_NAME",    "Cloudinary cloud name",    "my-cloud"),
+        ("CLOUDINARY_UPLOAD_PRESET", "Cloudinary upload preset", "my-preset"),
     ]:
         val = get_secret(key)
         if val:
@@ -2166,7 +2149,9 @@ if "nova_classified" in st.session_state:
             try:
                 _n, _logs, _script = push_nova_to_airtable(
                     AT_TOKEN, AT_BASE, _tbl, _items, pname,
-                    boxes_list=all_boxes())
+                    boxes_list=all_boxes(),
+                    cld_cloud=CLD_CLOUD,
+                    cld_preset=CLD_PRESET)
                 for line in _logs:
                     st.write(line)
                 _status.update(
