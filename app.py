@@ -1143,7 +1143,7 @@ def classify_nova_question(client: OpenAI, record: dict,
               .replace("PAPER_NAME_PLACEHOLDER", paper_name)
               .replace("QNUM_PLACEHOLDER", record.get("questionNumber", "")))
     content = [{"type": "input_text", "text": prompt}]
-    raw     = call_gpt(client, content, TEXT_MODEL, max_tokens=1500)
+    raw     = call_gpt(client, content, VISION_MODEL, max_tokens=3000)
     result  = safe_json_loads(raw, {})
     if not result.get("novaType"):
         result["novaType"] = "simple"
