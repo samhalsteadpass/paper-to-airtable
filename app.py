@@ -751,11 +751,11 @@ NOVA_ALL_FIELDS: list[tuple[str, str]] = [
     # Shared
     ("Question Number",        "singleLineText"),
     ("Paper Name",             "singleLineText"),
-    ("Exam Board",             "singleSelect"),
-    ("Subject",                "singleSelect"),
-    ("Level",                  "singleSelect"),
-    ("Year",                   "singleSelect"),
-    ("Paper Number",           "singleSelect"),
+    ("Exam Board",             "singleLineText"),
+    ("Subject",                "singleLineText"),
+    ("Level",                  "singleLineText"),
+    ("Year",                   "singleLineText"),
+    ("Paper Number",           "singleLineText"),
     ("Nova Type",              "singleLineText"),
     ("Friendly Name",          "singleLineText"),
     ("Body",                   "multilineText"),
@@ -831,9 +831,6 @@ NOVA_VIEW_NAMES: dict[str, str] = {
 }
 
 
-def _single_select_payload(name: str) -> dict:
-    """Create a singleSelect field with no predefined choices — options added on write."""
-    return {"name": name, "type": "singleSelect", "options": {"choices": []}}
 
 def _build_fields_payload(fields: list[tuple[str, str]]) -> list[dict]:
     out = []
@@ -846,8 +843,6 @@ def _build_fields_payload(fields: list[tuple[str, str]]) -> list[dict]:
                         "options": {"icon": "check", "color": "greenBright"}})
         elif ftype == "multipleAttachments":
             out.append({"name": name, "type": "multipleAttachments"})
-        elif ftype == "singleSelect":
-            out.append(_single_select_payload(name))
         else:
             out.append({"name": name, "type": ftype})
     return out
@@ -872,8 +867,6 @@ def ensure_nova_fields(token: str, base_id: str, table_id: str,
                          "options": {"icon": "check", "color": "greenBright"}}
         elif ftype == "multipleAttachments":
             field_def = {"name": name, "type": "multipleAttachments"}
-        elif ftype == "singleSelect":
-            field_def = _single_select_payload(name)
         else:
             field_def = {"name": name, "type": ftype}
 
@@ -1079,62 +1072,7 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
     return fields
 
 
-SINGLE_SELECT_FIELDS = {"Exam Board", "Subject", "Level", "Year", "Paper Number"}
 
-def ensure_select_options(token: str, base_id: str, table_id: str,
-                           field_map: dict[str, str],
-                           items: list[dict],
-                           paper_name: str = "") -> None:
-    """
-    Pre-register singleSelect option values before pushing records.
-    Preserves existing choice IDs so Airtable doesn't reject the PATCH.
-    """
-    needed: dict[str, set[str]] = {f: set() for f in SINGLE_SELECT_FIELDS}
-    for item in items:
-        rec = (item.get("originalRecord") or {})
-        needed["Exam Board"].add(  str(rec.get("examBoard",    "") or "").strip())
-        needed["Subject"].add(     str(rec.get("subject",      "") or "").strip())
-        needed["Level"].add(       str(rec.get("level",        "") or "").strip())
-        needed["Year"].add(        str(rec.get("year",         "") or "").strip())
-        needed["Paper Number"].add(str(rec.get("paperNumber",  "") or "").strip())
-
-    # Fetch full table schema once
-    r = requests.get(f"{AT_META}/bases/{base_id}/tables",
-                     headers=at_headers(token), timeout=60)
-    if not r.ok:
-        return
-    table_fields: list[dict] = []
-    for t in r.json().get("tables", []):
-        if t["id"] == table_id:
-            table_fields = t.get("fields", [])
-            break
-
-    for field_name, values in needed.items():
-        values.discard("")
-        if not values or field_name not in field_map:
-            continue
-        field_id = field_map[field_name]
-
-        # Find existing choices WITH their IDs
-        existing: list[dict] = []
-        for f in table_fields:
-            if f["id"] == field_id:
-                existing = (f.get("options") or {}).get("choices", [])
-                break
-
-        existing_names = {c["name"] for c in existing}
-        new_values = values - existing_names
-        if not new_values:
-            continue
-
-        # Keep existing choices (with IDs) + append new ones (no ID needed)
-        all_choices = existing + [{"name": v} for v in sorted(new_values)]
-        requests.patch(
-            f"{AT_META}/bases/{base_id}/tables/{table_id}/fields/{field_id}",
-            headers=at_headers(token),
-            json={"options": {"choices": all_choices}},
-            timeout=60,
-        )
 
 
 def push_nova_to_airtable(token: str, base_id: str, table_name: str,
@@ -1165,9 +1103,6 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
     field_map = ensure_nova_fields(token, base_id, table_id, field_map)
 
     # Pre-register singleSelect option values so Airtable accepts them
-    ensure_select_options(token, base_id, table_id, field_map, items, paper_name)
-    logs.append("Select options registered")
-
     # Upload images to Cloudinary first so we have URLs to embed in records
     img_url_map: dict[str, str] = {}  # filename → cloudinary URL
     if boxes_list and cld_cloud and cld_preset:
