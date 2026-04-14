@@ -758,7 +758,6 @@ NOVA_ALL_FIELDS: list[tuple[str, str]] = [
     ("MC Option B",            "singleLineText"),
     ("MC Option C",            "singleLineText"),
     ("MC Option D",            "singleLineText"),
-    ("MC Correct",             "singleLineText"),
     # Multiple Answer
     ("Require Specific Order", "checkbox"),
     ("MA Answers",             "multilineText"),
@@ -789,7 +788,7 @@ _SHARED_COLS = [
 ]
 NOVA_VIEW_VISIBLE: dict[str, list[str]] = {
     "simple":          _SHARED_COLS + ["Answer Prefix", "Answer", "Answer Unit"],
-    "multiple_choice": _SHARED_COLS + ["MC Style", "MC Option A", "MC Option B", "MC Option C", "MC Option D", "MC Correct"],
+    "multiple_choice": _SHARED_COLS + ["MC Style", "MC Option A", "MC Option B", "MC Option C", "MC Option D"],
     "multiple_answer": _SHARED_COLS + ["Require Specific Order", "MA Answers"],
     "fraction":        _SHARED_COLS + ["Answer Label", "Numerator", "Denominator"],
     "fill_in_blank":   _SHARED_COLS + ["Preamble", "Blank Content", "Blanks"],
@@ -1026,16 +1025,15 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
             "Answer Unit":   nd.get("answerUnit",   ""),
         })
     elif nt == "multiple_choice":
-        opts = nd.get("options") or []
-        labels = ["A", "B", "C", "D"]
-        correct_letter = ""
+        opts    = nd.get("options") or []
+        correct = [o for o in opts if o.get("correct")]
+        wrong   = [o for o in opts if not o.get("correct")]
+        ordered = correct + wrong  # correct first → always Option A
+        labels  = ["A", "B", "C", "D"]
         for i, label in enumerate(labels):
-            opt = opts[i] if i < len(opts) else {}
+            opt = ordered[i] if i < len(ordered) else {}
             fields[f"MC Option {label}"] = str(opt.get("text", "") or "")
-            if opt.get("correct"):
-                correct_letter = label
-        fields["MC Style"]   = nd.get("style", "List")
-        fields["MC Correct"] = correct_letter
+        fields["MC Style"] = nd.get("style", "List")
     elif nt == "multiple_answer":
         fields.update({
             "Require Specific Order": bool(nd.get("requireSpecificOrder", False)),
@@ -1328,12 +1326,11 @@ def nova_records_to_csv(nova_classified: list[dict]) -> str:
             "Answer":              nd.get("answer", ""),
             "Answer Unit":         nd.get("answerUnit", ""),
             # MC
-            "MC Style":            nd.get("style", ""),
-            "MC Option A":         (nd.get("options") or [{}])[0].get("text", "") if nd.get("options") else "",
-            "MC Option B":         (nd.get("options") or [{},{}])[1].get("text", "") if nd.get("options") and len(nd.get("options", [])) > 1 else "",
-            "MC Option C":         (nd.get("options") or [{},{},{}])[2].get("text", "") if nd.get("options") and len(nd.get("options", [])) > 2 else "",
-            "MC Option D":         (nd.get("options") or [{},{},{},{}])[3].get("text", "") if nd.get("options") and len(nd.get("options", [])) > 3 else "",
-            "MC Correct":          next((["A","B","C","D"][i] for i, o in enumerate(nd.get("options") or []) if o.get("correct")), ""),
+            "MC Style":    nd.get("style", ""),
+            "MC Option A": next((o.get("text","") for o in (nd.get("options") or []) if o.get("correct")), ""),
+            "MC Option B": next((o.get("text","") for o in (nd.get("options") or []) if not o.get("correct")), ""),
+            "MC Option C": next((o.get("text","") for i,o in enumerate(nd.get("options") or []) if not o.get("correct") and i > 0), ""),
+            "MC Option D": next((o.get("text","") for i,o in enumerate(nd.get("options") or []) if not o.get("correct") and i > 1), ""),
             # Multiple answer
             "Require Specific Order": str(nd.get("requireSpecificOrder", "")),
             "MA Answers":          json.dumps(nd.get("answers", [])) if nd.get("answers") else "",
@@ -2302,17 +2299,20 @@ if "nova_classified" in st.session_state:
             _field("Style", nd.get("style", "List"),
                    hint="List or Grid",
                    key=f"mcstyle_{qn}")
-            opts = nd.get("options") or []
-            labels = ["A", "B", "C", "D"]
+            opts    = nd.get("options") or []
+            correct = [o for o in opts if o.get("correct")]
+            wrong   = [o for o in opts if not o.get("correct")]
+            ordered = correct + wrong
+            labels  = ["A", "B", "C", "D"]
             for i, label in enumerate(labels):
-                opt = opts[i] if i < len(opts) else {}
+                opt = ordered[i] if i < len(ordered) else {}
                 oc1, oc2 = st.columns([4, 1])
                 with oc1:
                     _field(f"Option {label}",
                            str(opt.get("text", "") or ""),
                            key=f"mcopt_{qn}_{i}")
                 with oc2:
-                    if opt.get("correct"):
+                    if label == "A":
                         st.markdown("<div style='padding-top:28px;color:#27ae60;font-weight:700'>✓ Correct</div>",
                                     unsafe_allow_html=True)
 
