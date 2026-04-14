@@ -225,12 +225,22 @@ QUESTION_DATA_PLACEHOLDER
 
 ━━━ STEP 1: Pick exactly one Nova type ━━━
 
-- simple          → single number or word answer, auto-marked. Use for most calculation questions.
+- simple          → ONE single unambiguous number or word. Auto-marked exactly.
 - multiple_choice → question has explicit A/B/C/D options OR is true/false.
-- multiple_answer → needs 2+ separate answer boxes (e.g. find x AND y).
-- fraction        → answer must be expressed as a fraction. Use when question says "as a fraction", "in its simplest form", "what fraction", or the answer is naturally a fraction/ratio. NEVER use simple for these.
+- multiple_answer → needs 2–4 separate answer boxes, each a single unambiguous value.
+- fraction        → answer must be expressed as a fraction. Use when question says "as a fraction", "in its simplest form", "what fraction", or the answer is naturally a fraction. NEVER use simple for these. Mixed numbers (e.g. 1½) must also be fraction type.
 - fill_in_blank   → sentence with dropdown gaps.
-- essay           → explain / describe / evaluate / justify / show working / prove / give a reason.
+- essay           → ANY question where the answer could be interpreted multiple ways, is an expression/formula (e.g. 6m+11, 3cd), is a list of values (e.g. 1,2,4,5), involves equivalent forms (e.g. 0.7 or 3/4 or 80%), requires showing working, or uses explain/describe/evaluate/justify/prove/give a reason.
+
+DECISION RULES — apply strictly:
+1. Explicit A/B/C/D options or true/false → multiple_choice
+2. "explain", "describe", "evaluate", "justify", "show that", "prove", "give a reason" → essay
+3. Answer is or could be expressed as a fraction / mixed number → fraction
+4. Answer is an algebraic expression, formula, or list of values → essay
+5. Answer has multiple equivalent valid forms (e.g. ÷6 or ×1/6) → essay
+6. Exactly 2–4 clearly separate numerical answers needed → multiple_answer
+7. Single unambiguous number or word → simple
+8. When in doubt → essay (AI marking is safer than wrong auto-marking)
 
 ━━━ STEP 2: Return ONLY this JSON — fill in ALL fields ━━━
 
@@ -242,9 +252,9 @@ For type = simple:
   "writtenSolution": "<full worked solution from mark scheme, or empty string>",
   "marks": <integer>,
   "difficulty": 1,
-  "answerPrefix": "<text before answer box, e.g. 'x =' or empty string>",
-  "answer": "<exact answer, NOT in latex, e.g. '4' or '10^4' or 'blue'>",
-  "answerUnit": "<unit after answer box in [latex] if needed, or empty string>"
+  "answerPrefix": "<text before answer box in [latex] if it contains maths, or empty string>",
+  "answer": "<single unambiguous number only — e.g. '48' or '10^4' or '-8'. NEVER a fraction, list, expression, or ambiguous value>",
+  "answerUnit": "<unit abbreviation in [latex]\\text{...} if needed, e.g. '[latex]\\text{cm}[/latex]' or '[latex]\\text{km}[/latex]', or empty string>"
 }
 
 For type = multiple_choice:
@@ -274,8 +284,8 @@ For type = multiple_answer:
   "difficulty": 1,
   "requireSpecificOrder": false,
   "answers": [
-    {"prefix": "x =", "answer": "<value>", "suffix": ""},
-    {"prefix": "y =", "answer": "<value>", "suffix": ""}
+    {"prefix": "[latex]x=[/latex]", "answer": "<value>", "suffix": ""},
+    {"prefix": "[latex]y=[/latex]", "answer": "<value>", "suffix": ""}
   ]
 }
 
@@ -325,8 +335,13 @@ For type = essay:
 - body must contain the FULL question text with all maths in [latex]...[/latex] tags.
 - marks must equal the markAllocation from the question data.
 - If question references a diagram/image, add "(See diagram)" in body.
-- answer (for simple) must NEVER be empty — write the actual answer.
+- answer (for simple) must be a SINGLE unambiguous number. If ambiguous → use essay.
+- answerPrefix and answerUnit must use [latex] tags if they contain any maths or symbols.
+- Units must be abbreviated: km not kilometers, cm not centimeters, m not meters, etc.
+- Fractions and mixed numbers MUST use fraction type, never simple.
+- Algebraic expressions, lists of values, or answers with multiple valid forms MUST use essay.
 - For multiple_choice, always provide exactly 4 options with exactly 1 marked correct: true.
+- For multiple_answer, prefix must use [latex] tags e.g. "[latex]x=[/latex]".
 - CRITICAL: If the question asks for a fraction OR uses the words "fraction", "simplest form", "lowest terms", or "what fraction" — you MUST use type fraction, never simple.
 """
 
@@ -777,7 +792,18 @@ NOVA_ALL_FIELDS: list[tuple[str, str]] = [
     ("MC Option D",            "singleLineText"),
     # Multiple Answer
     ("Require Specific Order", "checkbox"),
-    ("MA Answers",             "multilineText"),
+    ("MA Answer 1 Prefix",     "singleLineText"),
+    ("MA Answer 1",            "singleLineText"),
+    ("MA Answer 1 Suffix",     "singleLineText"),
+    ("MA Answer 2 Prefix",     "singleLineText"),
+    ("MA Answer 2",            "singleLineText"),
+    ("MA Answer 2 Suffix",     "singleLineText"),
+    ("MA Answer 3 Prefix",     "singleLineText"),
+    ("MA Answer 3",            "singleLineText"),
+    ("MA Answer 3 Suffix",     "singleLineText"),
+    ("MA Answer 4 Prefix",     "singleLineText"),
+    ("MA Answer 4",            "singleLineText"),
+    ("MA Answer 4 Suffix",     "singleLineText"),
     # Fraction
     ("Answer Label",           "singleLineText"),
     ("Numerator",              "singleLineText"),
@@ -806,7 +832,11 @@ _SHARED_COLS = [
 NOVA_VIEW_VISIBLE: dict[str, list[str]] = {
     "simple":          _SHARED_COLS + ["Answer Prefix", "Answer", "Answer Unit"],
     "multiple_choice": _SHARED_COLS + ["MC Style", "MC Option A", "MC Option B", "MC Option C", "MC Option D"],
-    "multiple_answer": _SHARED_COLS + ["Require Specific Order", "MA Answers"],
+    "multiple_answer": _SHARED_COLS + ["Require Specific Order",
+                        "MA Answer 1 Prefix", "MA Answer 1", "MA Answer 1 Suffix",
+                        "MA Answer 2 Prefix", "MA Answer 2", "MA Answer 2 Suffix",
+                        "MA Answer 3 Prefix", "MA Answer 3", "MA Answer 3 Suffix",
+                        "MA Answer 4 Prefix", "MA Answer 4", "MA Answer 4 Suffix"],
     "fraction":        _SHARED_COLS + ["Answer Label", "Numerator", "Denominator"],
     "fill_in_blank":   _SHARED_COLS + ["Preamble", "Blank Content", "Blanks"],
     "essay": [
@@ -1047,11 +1077,13 @@ def nova_record_to_fields(item: dict, paper_name: str = "",
             fields[f"MC Option {label}"] = str(opt.get("text", "") or "")
         fields["MC Style"] = nd.get("style", "List")
     elif nt == "multiple_answer":
-        fields.update({
-            "Require Specific Order": bool(nd.get("requireSpecificOrder", False)),
-            "MA Answers":             json.dumps(nd.get("answers", []),
-                                                  ensure_ascii=False),
-        })
+        answers = nd.get("answers") or []
+        fields["Require Specific Order"] = bool(nd.get("requireSpecificOrder", False))
+        for i in range(1, 5):
+            ans = answers[i-1] if i-1 < len(answers) else {}
+            fields[f"MA Answer {i} Prefix"] = str(ans.get("prefix", "") or "")
+            fields[f"MA Answer {i}"]        = str(ans.get("answer", "") or "")
+            fields[f"MA Answer {i} Suffix"] = str(ans.get("suffix", "") or "")
     elif nt == "fraction":
         fields.update({
             "Answer Label": nd.get("answerLabel", ""),
@@ -1226,7 +1258,6 @@ def classify_nova_question(client: OpenAI, record: dict,
     if (result.get("novaType") == "simple"
             and any(kw in question_text for kw in fraction_keywords)):
         result["novaType"] = "fraction"
-        # Try to parse numerator/denominator from answer if it looks like a/b
         ans = str(result.get("answer", "") or "")
         if "/" in ans:
             parts = ans.split("/", 1)
@@ -1236,13 +1267,31 @@ def classify_nova_question(client: OpenAI, record: dict,
         result.pop("answerPrefix", None)
         result.pop("answerUnit", None)
 
+    # Safety override: force essay if answer is ambiguous/expression/list
+    if result.get("novaType") == "simple":
+        ans = str(result.get("answer", "") or "")
+        is_expression = any(c in ans for c in ["+", "-", "×", "÷", "=", "or", ","])
+        has_multiple_forms = ans.count("/") > 0 or "%" in ans
+        is_list = "," in ans
+        is_fraction_answer = "/" in ans and not any(c.isalpha() for c in ans)
+        if is_expression or is_list:
+            result["novaType"] = "essay"
+            result.pop("answer", None)
+            result.pop("answerPrefix", None)
+            result.pop("answerUnit", None)
+        elif is_fraction_answer:
+            result["novaType"] = "fraction"
+            parts = ans.split("/", 1)
+            result["numerator"]   = parts[0].strip()
+            result["denominator"] = parts[1].strip()
+            result.pop("answer", None)
+
     # Fallback: if simple answer is empty, try to extract from writtenSolution
     if result.get("novaType") == "simple" and not result.get("answer"):
         ws = result.get("writtenSolution", "") or ""
-        # Look for a standalone number in the written solution
         nums = re.findall(r'\b(\d+(?:\.\d+)?)\b', ws)
         if nums:
-            result["answer"] = nums[-1]  # last number is usually the final answer
+            result["answer"] = nums[-1]
 
     return result
 
@@ -1350,7 +1399,18 @@ def nova_records_to_csv(nova_classified: list[dict]) -> str:
             "MC Option D": next((o.get("text","") for i,o in enumerate(nd.get("options") or []) if not o.get("correct") and i > 1), ""),
             # Multiple answer
             "Require Specific Order": str(nd.get("requireSpecificOrder", "")),
-            "MA Answers":          json.dumps(nd.get("answers", [])) if nd.get("answers") else "",
+            "MA Answer 1 Prefix": (nd.get("answers") or [{}])[0].get("prefix","") if nd.get("answers") else "",
+            "MA Answer 1":        (nd.get("answers") or [{}])[0].get("answer","") if nd.get("answers") else "",
+            "MA Answer 1 Suffix": (nd.get("answers") or [{}])[0].get("suffix","") if nd.get("answers") else "",
+            "MA Answer 2 Prefix": (nd.get("answers") or [{},{}])[1].get("prefix","") if nd.get("answers") and len(nd.get("answers",[])) > 1 else "",
+            "MA Answer 2":        (nd.get("answers") or [{},{}])[1].get("answer","") if nd.get("answers") and len(nd.get("answers",[])) > 1 else "",
+            "MA Answer 2 Suffix": (nd.get("answers") or [{},{}])[1].get("suffix","") if nd.get("answers") and len(nd.get("answers",[])) > 1 else "",
+            "MA Answer 3 Prefix": (nd.get("answers") or [{},{},{}])[2].get("prefix","") if nd.get("answers") and len(nd.get("answers",[])) > 2 else "",
+            "MA Answer 3":        (nd.get("answers") or [{},{},{}])[2].get("answer","") if nd.get("answers") and len(nd.get("answers",[])) > 2 else "",
+            "MA Answer 3 Suffix": (nd.get("answers") or [{},{},{}])[2].get("suffix","") if nd.get("answers") and len(nd.get("answers",[])) > 2 else "",
+            "MA Answer 4 Prefix": (nd.get("answers") or [{},{},{},{}])[3].get("prefix","") if nd.get("answers") and len(nd.get("answers",[])) > 3 else "",
+            "MA Answer 4":        (nd.get("answers") or [{},{},{},{}])[3].get("answer","") if nd.get("answers") and len(nd.get("answers",[])) > 3 else "",
+            "MA Answer 4 Suffix": (nd.get("answers") or [{},{},{},{}])[3].get("suffix","") if nd.get("answers") and len(nd.get("answers",[])) > 3 else "",
             # Fraction
             "Answer Label":        nd.get("answerLabel", ""),
             "Numerator":           nd.get("numerator", ""),
@@ -2369,20 +2429,21 @@ if "nova_classified" in st.session_state:
                    key=f"maord_{uid or qn}")
             st.caption("**Answer Boxes**")
             answers = nd.get("answers") or []
-            for ai, ans in enumerate(answers):
+            for i in range(1, 5):
+                ans = answers[i-1] if i-1 < len(answers) else {}
+                if not ans and i > 2:
+                    continue  # skip empty optional boxes
                 ac1, ac2, ac3 = st.columns(3)
                 with ac1:
-                    _field(f"Box {ai+1} Prefix",
-                           ans.get("prefix", ""),
-                           key=f"mapfx_{uid or qn}_{ai}")
+                    _field(f"Box {i} Prefix", str(ans.get("prefix","") or ""),
+                           hint="e.g. [latex]x=[/latex]",
+                           key=f"mapfx_{uid or qn}_{i}")
                 with ac2:
-                    _field(f"Box {ai+1} Answer",
-                           ans.get("answer", ""),
-                           key=f"maans_{uid or qn}_{ai}")
+                    _field(f"Box {i} Answer", str(ans.get("answer","") or ""),
+                           key=f"maans_{uid or qn}_{i}")
                 with ac3:
-                    _field(f"Box {ai+1} Suffix",
-                           ans.get("suffix", ""),
-                           key=f"masfx_{uid or qn}_{ai}")
+                    _field(f"Box {i} Suffix", str(ans.get("suffix","") or ""),
+                           key=f"masfx_{uid or qn}_{i}")
 
         elif nt == "fraction":
             fc1, fc2, fc3 = st.columns(3)
