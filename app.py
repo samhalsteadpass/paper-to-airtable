@@ -1086,46 +1086,49 @@ def ensure_select_options(token: str, base_id: str, table_id: str,
                            items: list[dict],
                            paper_name: str = "") -> None:
     """
-    Pre-register any new singleSelect option values before pushing records.
-    Airtable blocks new options unless they already exist on the field.
+    Pre-register singleSelect option values before pushing records.
+    Preserves existing choice IDs so Airtable doesn't reject the PATCH.
     """
-    # Collect all values that will be written for each select field
     needed: dict[str, set[str]] = {f: set() for f in SINGLE_SELECT_FIELDS}
     for item in items:
         rec = (item.get("originalRecord") or {})
-        needed["Exam Board"].add(str(rec.get("examBoard",   "") or "").strip())
-        needed["Subject"].add(   str(rec.get("subject",     "") or "").strip())
-        needed["Level"].add(     str(rec.get("level",       "") or "").strip())
-        needed["Year"].add(      str(rec.get("year",        "") or "").strip())
-        needed["Paper Number"].add(str(rec.get("paperNumber","") or "").strip())
+        needed["Exam Board"].add(  str(rec.get("examBoard",    "") or "").strip())
+        needed["Subject"].add(     str(rec.get("subject",      "") or "").strip())
+        needed["Level"].add(       str(rec.get("level",        "") or "").strip())
+        needed["Year"].add(        str(rec.get("year",         "") or "").strip())
+        needed["Paper Number"].add(str(rec.get("paperNumber",  "") or "").strip())
+
+    # Fetch full table schema once
+    r = requests.get(f"{AT_META}/bases/{base_id}/tables",
+                     headers=at_headers(token), timeout=60)
+    if not r.ok:
+        return
+    table_fields: list[dict] = []
+    for t in r.json().get("tables", []):
+        if t["id"] == table_id:
+            table_fields = t.get("fields", [])
+            break
 
     for field_name, values in needed.items():
-        values.discard("")  # ignore empty
+        values.discard("")
         if not values or field_name not in field_map:
             continue
         field_id = field_map[field_name]
 
-        # Fetch current choices
-        r = requests.get(f"{AT_META}/bases/{base_id}/tables",
-                         headers=at_headers(token), timeout=60)
-        if not r.ok:
-            continue
-        existing_choices: set[str] = set()
-        for t in r.json().get("tables", []):
-            if t["id"] == table_id:
-                for f in t.get("fields", []):
-                    if f["id"] == field_id:
-                        existing_choices = {
-                            c["name"] for c in
-                            (f.get("options") or {}).get("choices", [])
-                        }
+        # Find existing choices WITH their IDs
+        existing: list[dict] = []
+        for f in table_fields:
+            if f["id"] == field_id:
+                existing = (f.get("options") or {}).get("choices", [])
+                break
 
-        new_choices = values - existing_choices
-        if not new_choices:
+        existing_names = {c["name"] for c in existing}
+        new_values = values - existing_names
+        if not new_values:
             continue
 
-        # PATCH field to add new choices (keep existing ones)
-        all_choices = [{"name": c} for c in sorted(existing_choices | new_choices)]
+        # Keep existing choices (with IDs) + append new ones (no ID needed)
+        all_choices = existing + [{"name": v} for v in sorted(new_values)]
         requests.patch(
             f"{AT_META}/bases/{base_id}/tables/{table_id}/fields/{field_id}",
             headers=at_headers(token),
