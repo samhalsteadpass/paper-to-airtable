@@ -195,16 +195,24 @@ Rules:
 """
 
 
-COVER_PROMPT = """Look at this exam paper cover page and extract the paper name and exam type.
+COVER_PROMPT = """Look at this exam paper cover page and extract the following fields.
 
 Return ONLY raw JSON:
 {
   "paperName": "AQA Mathematics Paper 1 (Non-Calculator) 2023",
-  "examType": "GCSE"
+  "examBoard": "AQA",
+  "subject": "Mathematics",
+  "level": "GCSE",
+  "year": "2024",
+  "paperNumber": "1"
 }
 
-paperName: include the exam board, subject, paper number/name, and year if visible.
-examType: one of GCSE, A-Level, AS-Level, IB HL, IB SL, or describe it briefly if none of these fit.
+paperName: full name including board, subject, paper number/name, and year.
+examBoard: e.g. AQA, Edexcel, OCR, WJEC, Cambridge, IB. Leave empty if unclear.
+subject: e.g. Mathematics, Physics, English Literature.
+level: one of GCSE, A-Level, AS-Level, IB HL, IB SL, or describe briefly if none fit.
+year: 4-digit year visible on the paper. Leave empty if not visible.
+paperNumber: the paper number (e.g. 1, 2, 3) or name (e.g. "Non-Calculator"). Leave empty if not applicable.
 If a field is not clearly visible, make your best guess from context.
 """
 
@@ -322,8 +330,8 @@ For type = essay:
 - CRITICAL: If the question asks for a fraction OR uses the words "fraction", "simplest form", "lowest terms", or "what fraction" — you MUST use type fraction, never simple.
 """
 
-def read_cover_page(client: OpenAI, pdf_bytes: bytes) -> tuple[str, str]:
-    """Read the first page of a PDF and extract paper name and exam type."""
+def read_cover_page(client: OpenAI, pdf_bytes: bytes) -> dict:
+    """Read the first page of a PDF and extract paper metadata."""
     page_png = render_page_cached(pdf_bytes, 1, dpi=RENDER_DPI)
     page_pil = Image.open(io.BytesIO(page_png)).convert("RGB")
     content  = [
@@ -332,11 +340,15 @@ def read_cover_page(client: OpenAI, pdf_bytes: bytes) -> tuple[str, str]:
          "image_url": f"data:image/jpeg;base64,{encode_pil(page_pil)}"},
     ]
     parsed = safe_json_loads(
-        call_gpt(client, content, VISION_MODEL, max_tokens=200), {})
-    return (
-        str(parsed.get("paperName", "") or "").strip(),
-        str(parsed.get("examType",  "") or "").strip(),
-    )
+        call_gpt(client, content, VISION_MODEL, max_tokens=300), {})
+    return {
+        "paperName":   str(parsed.get("paperName",   "") or "").strip(),
+        "examBoard":   str(parsed.get("examBoard",   "") or "").strip(),
+        "subject":     str(parsed.get("subject",     "") or "").strip(),
+        "level":       str(parsed.get("level",       "") or "").strip(),
+        "year":        str(parsed.get("year",        "") or "").strip(),
+        "paperNumber": str(parsed.get("paperNumber", "") or "").strip(),
+    }
 
 # ── Secrets ───────────────────────────────────────────────────────────────
 def get_secret(key: str, fallback: str = "") -> str:
@@ -739,6 +751,11 @@ NOVA_ALL_FIELDS: list[tuple[str, str]] = [
     # Shared
     ("Question Number",        "singleLineText"),
     ("Paper Name",             "singleLineText"),
+    ("Exam Board",             "singleLineText"),
+    ("Subject",                "singleLineText"),
+    ("Level",                  "singleLineText"),
+    ("Year",                   "singleLineText"),
+    ("Paper Number",           "singleLineText"),
     ("Nova Type",              "singleLineText"),
     ("Friendly Name",          "singleLineText"),
     ("Body",                   "multilineText"),
@@ -996,6 +1013,11 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
         return {
             "Question Number":  rec.get("questionNumber", ""),
             "Paper Name":       pn,
+            "Exam Board":       rec.get("examBoard",    ""),
+            "Subject":          rec.get("subject",      ""),
+            "Level":            rec.get("level",        ""),
+            "Year":             rec.get("year",         ""),
+            "Paper Number":     rec.get("paperNumber",  ""),
             "Nova Type":        "multi_part",
             "Friendly Name":    f"{pn} Q{rec.get('questionNumber', '')}",
             "Body":             rec.get("questionText", ""),
@@ -1009,6 +1031,11 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
     fields: dict = {
         "Question Number":  rec.get("questionNumber", ""),
         "Paper Name":       pn,
+        "Exam Board":       rec.get("examBoard",    ""),
+        "Subject":          rec.get("subject",      ""),
+        "Level":            rec.get("level",        ""),
+        "Year":             rec.get("year",         ""),
+        "Paper Number":     rec.get("paperNumber",  ""),
         "Nova Type":        nt,
         "Friendly Name":    nd.get("friendlyName", ""),
         "Body":             nd.get("body", ""),
@@ -1424,7 +1451,11 @@ with st.sidebar:
     if st.button("💾 Save session", width='stretch'):
         save_data = {
             "paper_name":            st.session_state.get("paper_name", ""),
-            "exam_type":             st.session_state.get("exam_type", ""),
+            "exam_board":            st.session_state.get("exam_board", ""),
+            "subject":               st.session_state.get("subject", ""),
+            "level":                 st.session_state.get("level", ""),
+            "year":                  st.session_state.get("year", ""),
+            "paper_number":          st.session_state.get("paper_number", ""),
             "paper_name_for_table":  st.session_state.get("paper_name_for_table", ""),
             "pages":                 st.session_state.get("pages", []),
             "records":               st.session_state.get("records", []),
@@ -1455,7 +1486,11 @@ with st.sidebar:
         try:
             save_data = json.loads(uploaded_session.read())
             st.session_state["paper_name"]           = save_data.get("paper_name", "")
-            st.session_state["exam_type"]            = save_data.get("exam_type", "")
+            st.session_state["exam_board"]           = save_data.get("exam_board", "")
+            st.session_state["subject"]              = save_data.get("subject", "")
+            st.session_state["level"]                = save_data.get("level", "")
+            st.session_state["year"]                 = save_data.get("year", "")
+            st.session_state["paper_number"]         = save_data.get("paper_number", "")
             st.session_state["paper_name_for_table"] = save_data.get("paper_name_for_table", "")
             st.session_state["pages"]                = save_data.get("pages", [])
             st.session_state["records"]              = save_data.get("records", [])
@@ -1486,11 +1521,28 @@ with c1:
         value=st.session_state.get("paper_name", ""),
         placeholder="Auto-filled from cover page",
     )
-    exam_type = st.text_input(
-        "Exam type",
-        value=st.session_state.get("exam_type", ""),
-        placeholder="Auto-filled from cover page",
-    )
+    col_board, col_subj = st.columns(2)
+    with col_board:
+        exam_board = st.text_input("Exam board",
+            value=st.session_state.get("exam_board", ""),
+            placeholder="e.g. AQA")
+    with col_subj:
+        subject = st.text_input("Subject",
+            value=st.session_state.get("subject", ""),
+            placeholder="e.g. Mathematics")
+    col_lvl, col_yr, col_pn = st.columns(3)
+    with col_lvl:
+        level = st.text_input("Level",
+            value=st.session_state.get("level", ""),
+            placeholder="e.g. GCSE")
+    with col_yr:
+        year = st.text_input("Year",
+            value=st.session_state.get("year", ""),
+            placeholder="e.g. 2024")
+    with col_pn:
+        paper_number = st.text_input("Paper number",
+            value=st.session_state.get("paper_number", ""),
+            placeholder="e.g. 1")
 with c2:
     st.markdown("&nbsp;", unsafe_allow_html=True)
     ms_file = st.file_uploader("Mark scheme PDF (optional)", type="pdf")
@@ -1501,35 +1553,44 @@ if st.button("Load PDF", disabled=not (paper_file and OPENAI_KEY)):
     client = OpenAI(api_key=OPENAI_KEY)
 
     with st.spinner("Reading cover page…"):
-        detected_name, detected_type = read_cover_page(client, pdf)
+        detected = read_cover_page(client, pdf)
 
     _set_pdf(pdf)
     render_page_cached.clear()
-    st.session_state["pages"]      = get_question_pages(pdf)
-    st.session_state["paper_name"] = detected_name
-    st.session_state["exam_type"]  = detected_type
+    st.session_state["pages"]        = get_question_pages(pdf)
+    st.session_state["paper_name"]   = detected["paperName"]
+    st.session_state["exam_type"]    = detected["level"]
+    st.session_state["exam_board"]   = detected["examBoard"]
+    st.session_state["subject"]      = detected["subject"]
+    st.session_state["level"]        = detected["level"]
+    st.session_state["year"]         = detected["year"]
+    st.session_state["paper_number"] = detected["paperNumber"]
     st.session_state.pop("records", None)
     st.session_state["boxes"] = {}
     st.session_state.pop("_save_json", None)
     st.session_state["sel_page_idx"] = 0
-    safe_name = re.sub(r"[^a-zA-Z0-9 _-]", "", detected_name).strip() or "Questions"
+    safe_name = re.sub(r"[^a-zA-Z0-9 _-]", "", detected["paperName"]).strip() or "Questions"
     st.session_state["paper_name_for_table"] = safe_name
     st.success(
         f"Loaded — {len(st.session_state['pages'])} question pages found.  "
-        f"Detected: **{detected_name}** · **{detected_type}**"
+        f"Detected: **{detected['paperName']}** · **{detected['level']}**"
     )
     st.rerun()
 
-# Keep paper_name / exam_type in sync with what user may have edited
-paper_name = st.session_state.get("paper_name", paper_name)
-exam_type  = st.session_state.get("exam_type",  exam_type)
+# Keep paper metadata in sync with what user may have edited
+paper_name   = st.session_state.get("paper_name",   paper_name)
+exam_board   = st.session_state.get("exam_board",   exam_board)
+subject      = st.session_state.get("subject",      subject)
+level        = st.session_state.get("level",        level)
+year         = st.session_state.get("year",         year)
+paper_number = st.session_state.get("paper_number", paper_number)
 
 # ── 2. Extract ─────────────────────────────────────────────────────────────
 if st.session_state.get("pages"):
     st.subheader("2 · Extract questions + mark scheme")
 
     if st.button("✨ Extract", type="primary",
-                 disabled=not (paper_name and exam_type and OPENAI_KEY)):
+                 disabled=not (paper_name and OPENAI_KEY)):
         pdf      = get_pdf()
         ms_bytes = ms_file.read() if ms_file else None
         client   = OpenAI(api_key=OPENAI_KEY)
@@ -1562,7 +1623,11 @@ if st.session_state.get("pages"):
                     "hasImages":                bool(q.get("hasImages",   False)),
                     "pageNumber":               clamp_int(q.get("pageNumber", 1), 1),
                     "paperName":                paper_name,
-                    "examType":                 exam_type,
+                    "examBoard":                exam_board,
+                    "subject":                  subject,
+                    "level":                    level,
+                    "year":                     year,
+                    "paperNumber":              paper_number,
                     "imageMappingConfidence":   "",
                     "imageMappingNotes":        "",
                     "images":                   [],
