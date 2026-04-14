@@ -751,11 +751,11 @@ NOVA_ALL_FIELDS: list[tuple[str, str]] = [
     # Shared
     ("Question Number",        "singleLineText"),
     ("Paper Name",             "singleLineText"),
-    ("Exam Board",             "singleLineText"),
-    ("Subject",                "singleLineText"),
-    ("Level",                  "singleLineText"),
-    ("Year",                   "singleLineText"),
-    ("Paper Number",           "singleLineText"),
+    ("Exam Board",             "singleSelect"),
+    ("Subject",                "singleSelect"),
+    ("Level",                  "singleSelect"),
+    ("Year",                   "singleSelect"),
+    ("Paper Number",           "singleSelect"),
     ("Nova Type",              "singleLineText"),
     ("Friendly Name",          "singleLineText"),
     ("Body",                   "multilineText"),
@@ -831,6 +831,10 @@ NOVA_VIEW_NAMES: dict[str, str] = {
 }
 
 
+def _single_select_payload(name: str) -> dict:
+    """Create a singleSelect field with no predefined choices — options added on write."""
+    return {"name": name, "type": "singleSelect", "options": {"choices": []}}
+
 def _build_fields_payload(fields: list[tuple[str, str]]) -> list[dict]:
     out = []
     for name, ftype in fields:
@@ -842,6 +846,8 @@ def _build_fields_payload(fields: list[tuple[str, str]]) -> list[dict]:
                         "options": {"icon": "check", "color": "greenBright"}})
         elif ftype == "multipleAttachments":
             out.append({"name": name, "type": "multipleAttachments"})
+        elif ftype == "singleSelect":
+            out.append(_single_select_payload(name))
         else:
             out.append({"name": name, "type": ftype})
     return out
@@ -866,6 +872,8 @@ def ensure_nova_fields(token: str, base_id: str, table_id: str,
                          "options": {"icon": "check", "color": "greenBright"}}
         elif ftype == "multipleAttachments":
             field_def = {"name": name, "type": "multipleAttachments"}
+        elif ftype == "singleSelect":
+            field_def = _single_select_payload(name)
         else:
             field_def = {"name": name, "type": ftype}
 
@@ -977,28 +985,6 @@ def get_table_field_map(token: str, base_id: str,
     return {}
 
 
-def generate_view_instructions(table_name: str) -> str:
-    """Return plain-text instructions for manually creating views in Airtable."""
-    lines = [
-        f"Table: {table_name}",
-        "",
-        "Neither the Airtable REST API nor the Scripting extension",
-        "can create views programmatically — views must be made manually.",
-        "",
-        "Steps (takes ~90 seconds):",
-        "  1. Open the table in Airtable",
-        "  2. Views panel → '+ Create new view' → Grid",
-        "  3. Create these 7 views, one at a time:",
-    ]
-    for nova_type, view_name in NOVA_VIEW_NAMES.items():
-        lines.append(f"       • {view_name}")
-    lines += [
-        "",
-        "  4. For each view, click Filter → Add condition:",
-    ]
-    for nova_type, view_name in NOVA_VIEW_NAMES.items():
-        lines.append(f"       • {view_name}  →  Nova Type  is  \"{nova_type}\"")
-    return "\n".join(lines)
 
 
 def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
@@ -1099,7 +1085,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                             boxes_list: list[dict] | None = None,
                             cld_cloud: str = "",
                             cld_preset: str = "",
-                            ) -> tuple[int, list[str], str]:
+                            ) -> tuple[int, list[str]]:
     """
     Ensure the Questions table exists, push records, upload images via Cloudinary.
     Returns (records_created, log_lines, manual_view_instructions).
@@ -1158,7 +1144,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
 
     if not payload:
         logs.append("No records to push.")
-        return 0, logs, generate_view_instructions(table_name)
+        return 0, logs
 
     url     = f"{AT_API}/{base_id}/{requests.utils.quote(table_name, safe='')}"
     created = 0
@@ -1171,7 +1157,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
             created += len(resp.json().get("records", []))
 
     logs.append(f"✅ {created} records pushed")
-    return created, logs, generate_view_instructions(table_name)
+    return created, logs
 
 # ── Nova classification ───────────────────────────────────────────────────
 NOVA_TYPE_LABELS = {
@@ -2238,7 +2224,7 @@ if "nova_classified" in st.session_state:
         else:
             nova_tbl_name = st.text_input(
                 "Nova table name",
-                value="Questions",
+                value="Nova Questions",
                 key="nova_sync_table",
                 help="All papers are appended to this one shared table. The Paper Name field tells them apart.",
             )
@@ -2254,7 +2240,7 @@ if "nova_classified" in st.session_state:
 
     if st.session_state.get("do_nova_sync"):
         st.session_state["do_nova_sync"] = False
-        _tbl   = st.session_state.get("nova_sync_table", "Questions")
+        _tbl   = st.session_state.get("nova_sync_table", "Nova Questions")
         _items = list(all_nova)  # includes parents (preambles)
 
         # Re-crop any boxes that lost image data after session restore
@@ -2271,7 +2257,7 @@ if "nova_classified" in st.session_state:
                 set_page_boxes(_pn, _store[_pn])
         with st.status("Syncing to Airtable…", expanded=True) as _status:
             try:
-                _n, _logs, _script = push_nova_to_airtable(
+                _n, _logs = push_nova_to_airtable(
                     AT_TOKEN, AT_BASE, _tbl, _items, pname,
                     boxes_list=all_boxes(),
                     cld_cloud=CLD_CLOUD,
@@ -2281,31 +2267,13 @@ if "nova_classified" in st.session_state:
                 _status.update(
                     label=f"✅ {_n} records pushed to '{_tbl}'",
                     state="complete")
-                st.session_state["nova_sync_log"]    = _logs
-                st.session_state["nova_view_script"] = _script
-                st.session_state["nova_sync_table_done"] = _tbl
+                st.session_state["nova_sync_log"] = _logs
             except Exception as e:
                 st.error(f"Sync failed: {e}")
                 _status.update(label="❌ Sync failed", state="error")
 
     if "nova_sync_log" in st.session_state:
         st.markdown(f"[Open base in Airtable →](https://airtable.com/{AT_BASE})")
-
-    if "nova_view_script" in st.session_state:
-        st.divider()
-        st.markdown("**One-time setup — Create views in Airtable (~90 seconds)**")
-        st.caption(
-            "Do this once. Views persist for every paper you sync after this. "
-            "Views panel → **+ Create new view** → **Grid**, then name it and add the filter."
-        )
-        view_rows = []
-        for nova_type, view_name in NOVA_VIEW_NAMES.items():
-            view_rows.append({
-                "View name": view_name,
-                "Filter: Nova Type  is": nova_type,
-            })
-        import pandas as _pd
-        st.dataframe(_pd.DataFrame(view_rows), hide_index=True, use_container_width=True)
 
     st.divider()
 
@@ -2371,15 +2339,10 @@ if "nova_classified" in st.session_state:
             labels  = ["A", "B", "C", "D"]
             for i, label in enumerate(labels):
                 opt = ordered[i] if i < len(ordered) else {}
-                oc1, oc2 = st.columns([4, 1])
-                with oc1:
-                    _field(f"Option {label}",
-                           str(opt.get("text", "") or ""),
-                           key=f"mcopt_{qn}_{i}")
-                with oc2:
-                    if label == "A":
-                        st.markdown("<div style='padding-top:28px;color:#27ae60;font-weight:700'>✓ Correct</div>",
-                                    unsafe_allow_html=True)
+                display_label = f"Option {label} (correct)" if label == "A" else f"Option {label}"
+                _field(display_label,
+                       str(opt.get("text", "") or ""),
+                       key=f"mcopt_{qn}_{i}")
 
         elif nt == "multiple_answer":
             _field("Require Specific Order",
