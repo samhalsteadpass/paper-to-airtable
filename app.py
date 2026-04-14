@@ -26,7 +26,6 @@ import re
 import base64
 import time
 import zipfile
-import pathlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -55,62 +54,14 @@ CANVAS_MAX_WIDTH  = 900
 AT_API         = "https://api.airtable.com/v0"
 
 # ── Auto-save helpers ─────────────────────────────────────────────────────
-AUTOSAVE_PATH = pathlib.Path("autosave.json")
-PDF_PATH      = pathlib.Path("current_paper.pdf")
-
 def autosave():
-    """Write session state to disk so it survives restarts."""
-    try:
-        save_data = {
-            "paper_name":           st.session_state.get("paper_name", ""),
-            "exam_type":            st.session_state.get("exam_type", ""),
-            "paper_name_for_table": st.session_state.get("paper_name_for_table", ""),
-            "pages":                st.session_state.get("pages", []),
-            "records":              st.session_state.get("records", []),
-            "boxes": {
-                str(pn): [
-                    {k: v for k, v in b.items() if k != "data"}
-                    for b in blist
-                ]
-                for pn, blist in st.session_state.get("boxes", {}).items()
-            },
-        }
-        AUTOSAVE_PATH.write_text(json.dumps(save_data, ensure_ascii=False))
-    except Exception:
-        pass  # never crash the app over autosave
+    """No-op — session state is the only store. Manual save/load handles persistence."""
+    pass
 
 def get_pdf() -> bytes | None:
-    """Get PDF bytes — from disk if available, else session state."""
-    if PDF_PATH.exists():
-        return PDF_PATH.read_bytes()
+    """Get PDF bytes from session state."""
     return st.session_state.get("pdf")
 
-def autorestore():
-    """On startup, reload from disk if session state is empty."""
-    if "records" in st.session_state:
-        return  # already loaded
-    if not AUTOSAVE_PATH.exists():
-        return
-    try:
-        save_data = json.loads(AUTOSAVE_PATH.read_text())
-        if not save_data.get("records"):
-            return
-        st.session_state["paper_name"]           = save_data.get("paper_name", "")
-        st.session_state["exam_type"]            = save_data.get("exam_type", "")
-        st.session_state["paper_name_for_table"] = save_data.get("paper_name_for_table", "")
-        st.session_state["pages"]                = save_data.get("pages", [])
-        st.session_state["records"]              = save_data.get("records", [])
-        restored = {}
-        for pn_str, blist in save_data.get("boxes", {}).items():
-            restored[int(pn_str)] = [
-                {**b, "data": b"", "ai_qnum": b.get("ai_qnum", ""),
-                 "ai_conf": b.get("ai_conf", ""), "ai_notes": b.get("ai_notes", "")}
-                for b in blist
-            ]
-        st.session_state["boxes"] = restored
-        st.session_state["_autorestore_done"] = True
-    except Exception:
-        pass
 AT_META        = "https://api.airtable.com/v0/meta"
 
 
@@ -1323,9 +1274,7 @@ def at_headers(t):
 st.set_page_config(page_title="Past Paper → Airtable", page_icon="📄", layout="wide")
 
 # Restore from disk on every fresh session start
-autorestore()
-if st.session_state.pop("_autorestore_done", False):
-    st.toast("♻️ Session restored from autosave", icon="💾")
+
 
 st.title("📄 Past Paper → Airtable")
 st.caption("Draw boxes to capture visuals · AI suggests question assignment · Sync to Airtable")
@@ -1438,9 +1387,8 @@ if st.button("Load PDF", disabled=not (paper_file and OPENAI_KEY)):
     with st.spinner("Reading cover page…"):
         detected_name, detected_type = read_cover_page(client, pdf)
 
-    PDF_PATH.write_bytes(pdf)
-    st.session_state.pop("pdf", None)   # don't store PDF in session state
-    render_page_cached.clear()          # free cached page renders from old PDF
+    st.session_state["pdf"]        = pdf
+    render_page_cached.clear()
     st.session_state["pages"]      = get_question_pages(pdf)
     st.session_state["paper_name"] = detected_name
     st.session_state["exam_type"]  = detected_type
@@ -1450,11 +1398,6 @@ if st.button("Load PDF", disabled=not (paper_file and OPENAI_KEY)):
     st.session_state["sel_page_idx"] = 0
     safe_name = re.sub(r"[^a-zA-Z0-9 _-]", "", detected_name).strip() or "Questions"
     st.session_state["paper_name_for_table"] = safe_name
-    # Clear autosave so old paper doesn't restore on next restart
-    try:
-        AUTOSAVE_PATH.unlink(missing_ok=True)
-    except Exception:
-        pass
     st.success(
         f"Loaded — {len(st.session_state['pages'])} question pages found.  "
         f"Detected: **{detected_name}** · **{detected_type}**"
@@ -1466,7 +1409,7 @@ paper_name = st.session_state.get("paper_name", paper_name)
 exam_type  = st.session_state.get("exam_type",  exam_type)
 
 # ── 2. Extract ─────────────────────────────────────────────────────────────
-if st.session_state.get("pages") or PDF_PATH.exists():
+if st.session_state.get("pages"):
     st.subheader("2 · Extract questions + mark scheme")
 
     if st.button("✨ Extract", type="primary",
@@ -1515,7 +1458,7 @@ if st.session_state.get("pages") or PDF_PATH.exists():
                           state="complete")
 
 # ── 3. Capture ─────────────────────────────────────────────────────────────
-if st.session_state.get("pages") or PDF_PATH.exists():
+if st.session_state.get("pages"):
     st.subheader("3 · Capture visuals")
     st.caption("① Optional: type a crop label in the left panel  "
                "② Click two corners on the page image to draw a box  "
