@@ -980,23 +980,29 @@ def get_table_field_map(token: str, base_id: str,
 
 
 
-def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
+def nova_record_to_fields(item: dict, paper_name: str = "",
+                           meta: dict | None = None) -> dict:
     """Flatten a classified nova item into a full Airtable field dict."""
-    nd  = item.get("novaData") or {}
-    nt  = nd.get("novaType", "")
-    rec = item.get("originalRecord") or {}
-    pn  = rec.get("paperName") or paper_name
+    nd   = item.get("novaData") or {}
+    nt   = nd.get("novaType", "")
+    rec  = item.get("originalRecord") or {}
+    pn   = rec.get("paperName") or paper_name
+    m    = meta or {}
+
+    # Helper: prefer record value, fall back to meta, then empty string
+    def _meta(rec_key: str, meta_key: str) -> str:
+        return str(rec.get(rec_key) or m.get(meta_key) or "").strip()
 
     # Parent preamble records have no novaData — handle separately
     if item.get("isParent"):
         return {
             "Question Number":  rec.get("questionNumber", ""),
             "Paper Name":       pn,
-            "Exam Board":       rec.get("examBoard",    ""),
-            "Subject":          rec.get("subject",      ""),
-            "Level":            rec.get("level",        ""),
-            "Year":             rec.get("year",         ""),
-            "Paper Number":     rec.get("paperNumber",  ""),
+            "Exam Board":       _meta("examBoard",   "exam_board"),
+            "Subject":          _meta("subject",     "subject"),
+            "Level":            _meta("level",       "level"),
+            "Year":             _meta("year",        "year"),
+            "Paper Number":     _meta("paperNumber", "paper_number"),
             "Nova Type":        "multi_part",
             "Friendly Name":    f"{pn} Q{rec.get('questionNumber', '')}",
             "Body":             rec.get("questionText", ""),
@@ -1010,11 +1016,11 @@ def nova_record_to_fields(item: dict, paper_name: str = "") -> dict:
     fields: dict = {
         "Question Number":  rec.get("questionNumber", ""),
         "Paper Name":       pn,
-        "Exam Board":       rec.get("examBoard",    ""),
-        "Subject":          rec.get("subject",      ""),
-        "Level":            rec.get("level",        ""),
-        "Year":             rec.get("year",         ""),
-        "Paper Number":     rec.get("paperNumber",  ""),
+        "Exam Board":       _meta("examBoard",   "exam_board"),
+        "Subject":          _meta("subject",     "subject"),
+        "Level":            _meta("level",       "level"),
+        "Year":             _meta("year",        "year"),
+        "Paper Number":     _meta("paperNumber", "paper_number"),
         "Nova Type":        nt,
         "Friendly Name":    nd.get("friendlyName", ""),
         "Body":             nd.get("body", ""),
@@ -1081,6 +1087,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
                             boxes_list: list[dict] | None = None,
                             cld_cloud: str = "",
                             cld_preset: str = "",
+                            meta: dict | None = None,
                             ) -> tuple[int, list[str]]:
     """
     Ensure the Questions table exists, push records, upload images via Cloudinary.
@@ -1125,7 +1132,7 @@ def push_nova_to_airtable(token: str, base_id: str, table_name: str,
     for item in items:
         if item.get("error"):
             continue
-        raw      = nova_record_to_fields(item, paper_name)
+        raw      = nova_record_to_fields(item, paper_name, meta=meta)
         filtered = {k: v for k, v in raw.items() if k in field_map}
 
         # Attach image URLs for this question
@@ -2258,7 +2265,14 @@ if "nova_classified" in st.session_state:
                     AT_TOKEN, AT_BASE, _tbl, _items, pname,
                     boxes_list=all_boxes(),
                     cld_cloud=CLD_CLOUD,
-                    cld_preset=CLD_PRESET)
+                    cld_preset=CLD_PRESET,
+                    meta={
+                        "exam_board":   st.session_state.get("exam_board",   ""),
+                        "subject":      st.session_state.get("subject",      ""),
+                        "level":        st.session_state.get("level",        ""),
+                        "year":         st.session_state.get("year",         ""),
+                        "paper_number": st.session_state.get("paper_number", ""),
+                    })
                 for line in _logs:
                     st.write(line)
                 _status.update(
