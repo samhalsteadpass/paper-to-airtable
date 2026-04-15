@@ -151,7 +151,7 @@ Rules:
 - A parent row is ONLY valid when: (1) there are 2+ answerable sub-parts AND
   (2) there is shared text/diagram that ALL sub-parts refer back to.
 - NEVER invent a preamble that is not printed in the paper.
-- markAllocation must be an integer (0 if missing or preamble-only).
+- questionNumber must be copied EXACTLY as printed on the paper — preserve leading zeros, dots, and spacing. e.g. "01.1" not "1.1", "02.3a" not "2.3a".
 - pageNumber = page number within this chunk only.
 """
 
@@ -400,6 +400,9 @@ def safe_json_loads(raw: str, default: Any):
 
 def normalise_qnum(v: Any) -> str:
     s = str(v or "").strip()
+    # Preserve AQA-style dot-separated numbers (e.g. 01.1, 02.3a) as-is
+    if re.match(r'^\d{2}\.\d', s):
+        return s.replace(" ", "")
     s = s.replace(" ", "").replace("(", "").replace(")", "").replace(".", "")
     return s
 
