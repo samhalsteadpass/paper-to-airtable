@@ -231,16 +231,18 @@ QUESTION_DATA_PLACEHOLDER
 - fraction        → answer must be expressed as a fraction. Use when question says "as a fraction", "in its simplest form", "what fraction", or the answer is naturally a fraction. NEVER use simple for these. Mixed numbers (e.g. 1½) must also be fraction type.
 - fill_in_blank   → sentence with dropdown gaps.
 - essay           → ANY question where the answer could be interpreted multiple ways, is an expression/formula (e.g. 6m+11, 3cd), is a list of values (e.g. 1,2,4,5), involves equivalent forms (e.g. 0.7 or 3/4 or 80%), requires showing working, or uses explain/describe/evaluate/justify/prove/give a reason.
+- physical        → question requires physical interaction with the paper that CANNOT be done digitally: drawing, sketching, circling, annotating a diagram, completing a graph by hand, drawing arrows, labelling with lines, or any task where the student must mark on the paper itself.
 
 DECISION RULES — apply strictly:
 1. Explicit A/B/C/D options or true/false → multiple_choice
-2. "explain", "describe", "evaluate", "justify", "show that", "prove", "give a reason" → essay
-3. Answer is or could be expressed as a fraction / mixed number → fraction
-4. Answer is an algebraic expression, formula, or list of values → essay
-5. Answer has multiple equivalent valid forms (e.g. ÷6 or ×1/6) → essay
-6. Exactly 2–4 clearly separate numerical answers needed → multiple_answer
-7. Single unambiguous number or word → simple
-8. When in doubt → essay (AI marking is safer than wrong auto-marking)
+2. Requires drawing, circling, annotating, sketching, or marking on the paper → physical
+3. "explain", "describe", "evaluate", "justify", "show that", "prove", "give a reason" → essay
+4. Answer is or could be expressed as a fraction / mixed number → fraction
+5. Answer is an algebraic expression, formula, or list of values → essay
+6. Answer has multiple equivalent valid forms (e.g. ÷6 or ×1/6) → essay
+7. Exactly 2–4 clearly separate numerical answers needed → multiple_answer
+8. Single unambiguous number or word → simple
+9. When in doubt → essay (AI marking is safer than wrong auto-marking)
 
 ━━━ STEP 2: Return ONLY this JSON — fill in ALL fields ━━━
 
@@ -328,6 +330,16 @@ For type = essay:
   "questionForAI": "<question text in plain English, no LaTeX>",
   "aiMarkingCriteria": "<detailed marking instructions for AI. End with: There are X possible marks, please score the answer out of X (maximum X marks)>",
   "markingCriteriaForStudent": "<mark scheme shown to student after submission>"
+}
+
+For type = physical:
+{
+  "novaType": "physical",
+  "friendlyName": "PAPER_NAME_PLACEHOLDER Q QNUM_PLACEHOLDER",
+  "body": "<full question text>",
+  "writtenSolution": "<describe what the correct answer looks like, e.g. 'Circle should be drawn around the ester bond'>",
+  "marks": <integer>,
+  "difficulty": 1
 }
 
 ━━━ Rules ━━━
@@ -849,6 +861,10 @@ NOVA_VIEW_VISIBLE: dict[str, list[str]] = {
         "Question Number", "Paper Name", "Nova Type", "Friendly Name",
         "Body", "Marks",
     ],
+    "physical": [
+        "Question Number", "Paper Name", "Nova Type", "Friendly Name",
+        "Body", "Marks",
+    ],
 }
 NOVA_VIEW_NAMES: dict[str, str] = {
     "simple":          "Simple Questions",
@@ -858,6 +874,7 @@ NOVA_VIEW_NAMES: dict[str, str] = {
     "fill_in_blank":   "Fill in the Blank",
     "essay":           "Essay (AI)",
     "multi_part":      "Multi-part (Preambles)",
+    "physical":        "Physical / Cannot Complete",
 }
 
 
@@ -1205,6 +1222,7 @@ NOVA_TYPE_LABELS = {
     "fraction":        "Fraction",
     "fill_in_blank":   "Fill in the Blank",
     "essay":           "Essay (AI)",
+    "physical":        "Physical / Cannot Complete",
 }
 NOVA_TYPE_COLORS = {
     "simple":          "#27ae60",
@@ -1213,6 +1231,7 @@ NOVA_TYPE_COLORS = {
     "fraction":        "#e67e22",
     "fill_in_blank":   "#16a085",
     "essay":           "#c0392b",
+    "physical":        "#95a5a6",
 }
 def nova_ai_role_prompt(subject: str = "", level: str = "") -> str:
     """Generate a role prompt tailored to the subject and level."""
@@ -2535,11 +2554,18 @@ if "nova_classified" in st.session_state:
                 _field("Marking Method", "AI", key=f"essmm_{uid or qn}")
 
         # Written solution (all types except essay which shows it above differently)
-        if nt != "essay":
+        if nt not in ("essay", "physical"):
             _field("Written Solution",
                    nd.get("writtenSolution", ""),
                    multiline=True, height=100,
                    hint="Mark scheme / worked answer shown after submission",
+                   key=f"ws_{uid or qn}")
+        elif nt == "physical":
+            st.info("⚠️ This question requires physical interaction with the paper and cannot be completed digitally.", icon="✏️")
+            _field("Written Solution",
+                   nd.get("writtenSolution", ""),
+                   multiline=True, height=80,
+                   hint="Describe what the correct answer looks like",
                    key=f"ws_{uid or qn}")
 
     # ── Helper: re-classify single record ──────────────────────────────────
