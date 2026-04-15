@@ -1334,7 +1334,21 @@ def group_nova_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
         s = normalise_qnum(s).lstrip("Qq")
         return s.lstrip("0") or s
 
+    def is_aqa_style(qn: str) -> bool:
+        """Detect AQA-style numbers like 01.1, 02.3 — dot-separated in original."""
+        orig = str(qn or "").strip()
+        return bool(re.match(r'^\d{2}\.\d+', orig))
+
     def is_child_of(child_qn: str, parent_qn: str) -> bool:
+        # Never group AQA-style dot-numbered questions
+        child_orig = next((r.get("originalQuestionNumber","") or r.get("questionNumber","")
+                           for r in records
+                           if normalise_qnum(r.get("questionNumber","")) == child_qn), "")
+        parent_orig = next((r.get("originalQuestionNumber","") or r.get("questionNumber","")
+                            for r in records
+                            if normalise_qnum(r.get("questionNumber","")) == parent_qn), "")
+        if is_aqa_style(child_orig) or is_aqa_style(parent_orig):
+            return False
         cb, pb = bare(child_qn), bare(parent_qn)
         if not cb.startswith(pb):
             return False
