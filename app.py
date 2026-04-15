@@ -1734,6 +1734,29 @@ if st.session_state.get("pages"):
                     "images":                   [],
                 })
 
+            # Filter out false preamble-only rows:
+            # A row with 0 marks whose question number is a prefix of other rows
+            # (e.g. "03" when "03.1", "03.2" etc. also exist) is a spurious parent.
+            def _is_false_preamble(r: dict, all_records: list[dict]) -> bool:
+                if clamp_int(r.get("markAllocation", 0)) != 0:
+                    return False
+                qn = normalise_qnum(r.get("questionNumber", ""))
+                if not qn:
+                    return False
+                # Check if any other record's number starts with this one
+                # (indicating it was incorrectly split as a parent)
+                for other in all_records:
+                    oqn = normalise_qnum(other.get("questionNumber", ""))
+                    if oqn != qn and oqn.startswith(qn):
+                        return True
+                return False
+
+            before = len(records)
+            records = [r for r in records if not _is_false_preamble(r, records)]
+            filtered = before - len(records)
+            if filtered:
+                st.write(f"   Removed {filtered} false preamble row(s)")
+
             st.session_state["records"] = records
             autosave()
             status.update(label=f"✅ {len(records)} questions extracted",
