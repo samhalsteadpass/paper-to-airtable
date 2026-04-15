@@ -150,6 +150,11 @@ Rules:
   Work out the shaded area.") is ONE question — extract as a single row.
 - A parent row is ONLY valid when: (1) there are 2+ answerable sub-parts AND
   (2) there is shared text/diagram that ALL sub-parts refer back to.
+- For AQA-style dot-numbered questions (e.g. 01.1, 01.2, 03.3): NEVER create a
+  parent row. Each question like "03.3" is fully standalone — any figure, image,
+  or context printed before it belongs IN that question's questionText, not as a
+  separate parent. Even if "Figure 2 is an image of..." appears above "03.3",
+  include it in 03.3's questionText directly.
 - NEVER invent a preamble that is not printed in the paper.
 - questionNumber must be copied EXACTLY as printed on the paper — preserve leading zeros, dots, and spacing. e.g. "01.1" not "1.1", "02.3a" not "2.3a".
 - pageNumber = page number within this chunk only.
