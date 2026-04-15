@@ -2245,6 +2245,26 @@ if st.session_state.get("do_nova_classify"):
     _pname      = st.session_state.get("paper_name", paper_name) or "Paper"
     client      = OpenAI(api_key=OPENAI_KEY)
 
+    # Remove any false preamble-only rows that slipped through extraction
+    def _is_false_preamble(r, all_r):
+        if clamp_int(r.get("markAllocation", 0)) != 0:
+            return False
+        qn = normalise_qnum(r.get("questionNumber", ""))
+        if not qn:
+            return False
+        for other in all_r:
+            oqn = normalise_qnum(other.get("questionNumber", ""))
+            if oqn != qn and oqn.startswith(qn):
+                return True
+        return False
+
+    filtered = [r for r in src_records if not _is_false_preamble(r, src_records)]
+    if len(filtered) < len(src_records):
+        removed = [r.get("questionNumber","") for r in src_records if _is_false_preamble(r, src_records)]
+        st.info(f"Skipping {len(src_records)-len(filtered)} false preamble row(s): {removed}")
+        src_records = filtered
+        st.session_state["records"] = filtered
+
     # Only classify questions that need answering (skip parent preamble rows)
     standalone, groups = group_nova_records(src_records)
     to_classify = list(standalone)
