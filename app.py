@@ -2670,10 +2670,11 @@ if "nova_classified" in st.session_state:
             _field("Style", nd.get("style", "List"),
                    hint="List or Grid",
                    key=f"mcstyle_{uid or qn}")
-            opts    = nd.get("options") or []
-            correct = [o for o in opts if o.get("correct")]
-            wrong   = [o for o in opts if not o.get("correct")]
-            ordered = correct + wrong
+            raw_opts = nd.get("options") or []
+            opts     = [o if isinstance(o, dict) else {} for o in raw_opts] if isinstance(raw_opts, list) else []
+            correct  = [o for o in opts if o.get("correct")]
+            wrong    = [o for o in opts if not o.get("correct")]
+            ordered  = correct + wrong
             labels  = ["A", "B", "C", "D"]
             for i, label in enumerate(labels):
                 opt = ordered[i] if i < len(ordered) else {}
@@ -2688,7 +2689,8 @@ if "nova_classified" in st.session_state:
                    hint="Tick if order matters",
                    key=f"maord_{uid or qn}")
             st.caption("**Answer Boxes**")
-            answers = nd.get("answers") or []
+            raw_ans = nd.get("answers") or []
+            answers = [a if isinstance(a, dict) else {} for a in raw_ans] if isinstance(raw_ans, list) else []
             for i in range(1, 5):
                 ans = answers[i-1] if i-1 < len(answers) else {}
                 if not ans and i > 2:
