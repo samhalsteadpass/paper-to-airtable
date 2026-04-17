@@ -1092,10 +1092,11 @@ def nova_record_to_fields(item: dict, paper_name: str = "",
             "Answer Unit":   nd.get("answerUnit",   ""),
         })
     elif nt == "multiple_choice":
-        opts    = nd.get("options") or []
-        correct = [o for o in opts if o.get("correct")]
-        wrong   = [o for o in opts if not o.get("correct")]
-        ordered = correct + wrong  # correct first → always Option A
+        raw_opts = nd.get("options") or []
+        opts     = [o if isinstance(o, dict) else {} for o in raw_opts] if isinstance(raw_opts, list) else []
+        correct  = [o for o in opts if o.get("correct")]
+        wrong    = [o for o in opts if not o.get("correct")]
+        ordered  = correct + wrong  # correct first → always Option A
         labels  = ["A", "B", "C", "D"]
         for i, label in enumerate(labels):
             opt = ordered[i] if i < len(ordered) else {}
@@ -1527,6 +1528,13 @@ def nova_records_to_csv(nova_classified: list[dict]) -> str:
         if not isinstance(raw, list):
             return []
         return [a if isinstance(a, dict) else {} for a in raw]
+
+    def _safe_options(nd: dict) -> list[dict]:
+        """Return options as a list of dicts, handling malformed data."""
+        raw = nd.get("options") or []
+        if not isinstance(raw, list):
+            return []
+        return [o if isinstance(o, dict) else {} for o in raw]
     rows = []
     for item in nova_classified:
         nd  = item.get("novaData", {}) or {}
@@ -1545,10 +1553,10 @@ def nova_records_to_csv(nova_classified: list[dict]) -> str:
             "Answer Unit":         nd.get("answerUnit", ""),
             # MC
             "MC Style":    nd.get("style", ""),
-            "MC Option A": next((o.get("text","") for o in (nd.get("options") or []) if o.get("correct")), ""),
-            "MC Option B": next((o.get("text","") for o in (nd.get("options") or []) if not o.get("correct")), ""),
-            "MC Option C": next((o.get("text","") for i,o in enumerate(nd.get("options") or []) if not o.get("correct") and i > 0), ""),
-            "MC Option D": next((o.get("text","") for i,o in enumerate(nd.get("options") or []) if not o.get("correct") and i > 1), ""),
+            "MC Option A": next((o.get("text","") for o in _safe_options(nd) if o.get("correct")), ""),
+            "MC Option B": next((o.get("text","") for o in _safe_options(nd) if not o.get("correct")), ""),
+            "MC Option C": next((o.get("text","") for i,o in enumerate(_safe_options(nd)) if not o.get("correct") and i > 0), ""),
+            "MC Option D": next((o.get("text","") for i,o in enumerate(_safe_options(nd)) if not o.get("correct") and i > 1), ""),
             # Multiple answer
             "Require Specific Order": str(nd.get("requireSpecificOrder", "")),
             "MA Answer 1 Prefix": _safe_answers(nd)[0].get("prefix","") if len(_safe_answers(nd)) > 0 else "",
