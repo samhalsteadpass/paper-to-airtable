@@ -1258,6 +1258,99 @@ def nova_ai_role_prompt(subject: str = "", level: str = "") -> str:
 # Keep a default for reference
 NOVA_AI_ROLE_PROMPT = nova_ai_role_prompt()
 
+NOVA_TWEAK_PROMPT = """You are adapting an exam question for an e-learning platform called Nova.
+
+You will receive a classified Nova question. Your job depends on its type:
+
+━━━ If novaType = "physical" ━━━
+Convert it into a digitally-answerable question. The image stays — only the question changes.
+- "Draw a circle around X" → "Which of the following best describes X?" (multiple_choice)
+- "Label the diagram" / "Identify the structure labelled A" → simple or multiple_choice
+- "Complete the graph" → essay asking them to describe what the graph would show
+- Choose the most appropriate Nova type for the converted question.
+
+━━━ For all other types ━━━
+Slightly vary the question so it tests the same concept but with different wording or numbers:
+- Swap specific numbers for similar ones (e.g. 48 → 36, 3 pounds → 4 pounds)
+- Rephrase the question slightly (synonym words, different sentence structure)
+- Keep the SAME novaType, same difficulty, same topic
+- If the question references an image/diagram, only change the text — never change what the image shows
+- The answer must change to match any number changes
+
+Current classified question:
+NOVA_DATA_PLACEHOLDER
+
+Return ONLY the same JSON structure as the input — same fields, same novaType (unless converting from physical), all fields filled in.
+No markdown fences, no explanation.
+"""
+
+
+def tweak_nova_question(client: OpenAI, item: dict,
+                         paper_name: str = "") -> dict:
+    """Tweak a classified nova item — rephrase/renumber, or convert physical to digital."""
+    nd  = item.get("novaData") or {}
+    rec = item.get("originalRecord") or {}
+
+    tweak_data = {
+        "novaType":     nd.get("novaType", ""),
+        "friendlyName": nd.get("friendlyName", ""),
+        "body":         nd.get("body", ""),
+        "marks":        nd.get("marks", rec.get("markAllocation", 0)),
+        "difficulty":   nd.get("difficulty", 1),
+        "writtenSolution": nd.get("writtenSolution", ""),
+        "markSchemeAnswer": rec.get("markSchemeAnswer", ""),
+        "hasImage":     rec.get("hasImages", False),
+        "imageDescription": rec.get("imageDescription", ""),
+        # type-specific fields
+        "answer":       nd.get("answer", ""),
+        "answerPrefix": nd.get("answerPrefix", ""),
+        "answerUnit":   nd.get("answerUnit", ""),
+        "options":      nd.get("options", []),
+        "answers":      nd.get("answers", []),
+        "numerator":    nd.get("numerator", ""),
+        "denominator":  nd.get("denominator", ""),
+        "questionForAI": nd.get("questionForAI", ""),
+        "aiMarkingCriteria": nd.get("aiMarkingCriteria", ""),
+        "markingCriteriaForStudent": nd.get("markingCriteriaForStudent", ""),
+        "requireSpecificOrder": nd.get("requireSpecificOrder", False),
+        "style":        nd.get("style", ""),
+        "preamble":     nd.get("preamble", ""),
+        "blankContent": nd.get("blankContent", ""),
+        "blanks":       nd.get("blanks", []),
+    }
+
+    prompt = (NOVA_TWEAK_PROMPT
+              .replace("NOVA_DATA_PLACEHOLDER", json.dumps(tweak_data, indent=2)))
+    content = [{"type": "input_text", "text": prompt}]
+
+    for attempt in range(2):
+        raw    = call_gpt(client, content, VISION_MODEL, max_tokens=3000)
+        result = safe_json_loads(raw, {})
+        if result.get("novaType") and result.get("body"):
+            break
+
+    if not result.get("novaType"):
+        return nd  # return original if tweak failed
+
+    # Apply same safety overrides as classify
+    question_text = result.get("body", "").lower()
+    fraction_keywords = ["as a fraction", "simplest form", "lowest terms", "what fraction"]
+    if result.get("novaType") == "simple" and any(kw in question_text for kw in fraction_keywords):
+        result["novaType"] = "fraction"
+
+    if result.get("novaType") == "simple":
+        ans = str(result.get("answer", "") or "")
+        if any(c in ans for c in ["+", "-", "×", "÷", "or", ","]):
+            result["novaType"] = "essay"
+        elif "/" in ans and not any(c.isalpha() for c in ans):
+            result["novaType"] = "fraction"
+            parts = ans.split("/", 1)
+            result["numerator"]   = parts[0].strip()
+            result["denominator"] = parts[1].strip()
+            result.pop("answer", None)
+
+    return result
+
 def classify_nova_question(client: OpenAI, record: dict,
                             paper_name: str = "") -> dict:
     """Use AI to classify one record into a Nova question type and extract fields."""
@@ -2222,7 +2315,7 @@ if _src:
     st.caption(f"{len(_src)} records available for classification.")
 
 # ── Classify button ────────────────────────────────────────────────────────
-classify_col, clear_col = st.columns([3, 1])
+classify_col, tweak_col, clear_col = st.columns([3, 3, 1])
 with classify_col:
     if st.button(
         "🤖 Classify all with AI",
@@ -2231,6 +2324,15 @@ with classify_col:
     ):
         st.session_state["do_nova_classify"] = True
         st.session_state.pop("nova_classified", None)
+        st.rerun()
+
+with tweak_col:
+    if st.button(
+        "✏️ Tweak all questions",
+        disabled=not (OPENAI_KEY and "nova_classified" in st.session_state),
+        help="Rephrase/renumber all questions. Converts physical questions to digital types.",
+    ):
+        st.session_state["do_nova_tweak"] = True
         st.rerun()
 
 with clear_col:
@@ -2335,6 +2437,53 @@ if st.session_state.get("do_nova_classify"):
     n_ok  = sum(1 for x in nova_out if not x["error"])
     n_err = sum(1 for x in nova_out if x["error"])
     st.success(f"✅ {n_ok} classified · {n_err} errors · {len(parent_items)} multi-part groups")
+    st.rerun()
+
+# ── Tweak all ──────────────────────────────────────────────────────────────
+if st.session_state.get("do_nova_tweak"):
+    st.session_state["do_nova_tweak"] = False
+    all_nova = st.session_state.get("nova_classified", [])
+    _pname   = st.session_state.get("nova_paper_name", "")
+    client   = OpenAI(api_key=OPENAI_KEY)
+
+    to_tweak = [x for x in all_nova if not x.get("isParent") and x.get("novaData")]
+    progress_bar = st.progress(0, text="Tweaking questions…")
+    total = len(to_tweak)
+
+    def _tweak_one(item):
+        try:
+            nd = tweak_nova_question(client, item, _pname)
+            return item["questionNumber"], nd, None
+        except Exception as e:
+            return item["questionNumber"], None, str(e)
+
+    tweaked_map: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(_tweak_one, item): item for item in to_tweak}
+        done = 0
+        for fut in as_completed(futures):
+            qnum, nd, err = fut.result()
+            if nd:
+                tweaked_map[qnum] = nd
+            done += 1
+            progress_bar.progress(done / max(total, 1),
+                                   text=f"Tweaked {done}/{total}…")
+
+    progress_bar.empty()
+
+    # Apply tweaked data back into all_nova
+    for item in all_nova:
+        qnum = item.get("questionNumber", "")
+        if qnum in tweaked_map:
+            item["novaData"]  = tweaked_map[qnum]
+            item["tweaked"]   = True
+
+    n_tweaked  = len(tweaked_map)
+    n_physical = sum(1 for item in all_nova
+                     if item.get("tweaked") and
+                     (item.get("novaData") or {}).get("novaType") != "physical")
+    st.session_state["nova_classified"] = all_nova
+    st.success(f"✅ {n_tweaked} questions tweaked · physical questions converted")
     st.rerun()
 
 # ── Display classified records ─────────────────────────────────────────────
@@ -2726,7 +2875,8 @@ if "nova_classified" in st.session_state:
             )
             if item.get("error"):
                 header += f"  <span style='color:#e74c3c;font-size:0.8em'>⚠ {item['error'][:60]}</span>"
-            with st.expander(f"Q{qn} · {label}", expanded=False):
+            tweaked_badge = " ✏️" if item.get("tweaked") else ""
+            with st.expander(f"Q{qn} · {label}{tweaked_badge}", expanded=False):
                 st.markdown(header, unsafe_allow_html=True)
                 st.caption(
                     f"*Original:* {(item.get('originalRecord') or {}).get('questionText', '')[:120]}")
