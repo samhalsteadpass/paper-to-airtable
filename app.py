@@ -43,7 +43,7 @@ TEXT_MODEL        = "gpt-4.1-mini"
 VISION_MODEL      = "gpt-4.1"
 MAX_OUTPUT_TOKENS = 8000
 CHUNK_PAGES       = 3
-MAX_WORKERS       = 3
+MAX_WORKERS       = 2
 MAX_RETRIES       = 4
 BASE_BACKOFF      = 2
 IMAGE_MAX_SIZE    = (1200, 1200)
@@ -2450,6 +2450,7 @@ if st.session_state.get("do_nova_classify"):
 
     st.session_state["nova_classified"] = all_nova
     st.session_state["nova_paper_name"] = _pname
+    render_page_cached.clear()  # free page render cache — no longer needed
     n_ok  = sum(1 for x in nova_out if not x["error"])
     n_err = sum(1 for x in nova_out if x["error"])
     st.success(f"✅ {n_ok} classified · {n_err} errors · {len(parent_items)} multi-part groups")
