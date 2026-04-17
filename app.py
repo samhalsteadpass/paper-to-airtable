@@ -1102,7 +1102,8 @@ def nova_record_to_fields(item: dict, paper_name: str = "",
             fields[f"MC Option {label}"] = str(opt.get("text", "") or "")
         fields["MC Style"] = nd.get("style", "List")
     elif nt == "multiple_answer":
-        answers = nd.get("answers") or []
+        raw_answers = nd.get("answers") or []
+        answers = [a if isinstance(a, dict) else {} for a in raw_answers] if isinstance(raw_answers, list) else []
         fields["Require Specific Order"] = bool(nd.get("requireSpecificOrder", False))
         for i in range(1, 5):
             ans = answers[i-1] if i-1 < len(answers) else {}
@@ -1519,6 +1520,13 @@ def fetch_airtable_records(token: str, base_id: str,
 
 def nova_records_to_csv(nova_classified: list[dict]) -> str:
     """Export all classified records to a flat CSV string."""
+
+    def _safe_answers(nd: dict) -> list[dict]:
+        """Return answers as a list of dicts, handling malformed data."""
+        raw = nd.get("answers") or []
+        if not isinstance(raw, list):
+            return []
+        return [a if isinstance(a, dict) else {} for a in raw]
     rows = []
     for item in nova_classified:
         nd  = item.get("novaData", {}) or {}
@@ -1543,18 +1551,18 @@ def nova_records_to_csv(nova_classified: list[dict]) -> str:
             "MC Option D": next((o.get("text","") for i,o in enumerate(nd.get("options") or []) if not o.get("correct") and i > 1), ""),
             # Multiple answer
             "Require Specific Order": str(nd.get("requireSpecificOrder", "")),
-            "MA Answer 1 Prefix": (nd.get("answers") or [{}])[0].get("prefix","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 0 else "",
-            "MA Answer 1":        (nd.get("answers") or [{}])[0].get("answer","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 0 else "",
-            "MA Answer 1 Suffix": (nd.get("answers") or [{}])[0].get("suffix","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 0 else "",
-            "MA Answer 2 Prefix": (nd.get("answers") or [{},{}])[1].get("prefix","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 1 else "",
-            "MA Answer 2":        (nd.get("answers") or [{},{}])[1].get("answer","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 1 else "",
-            "MA Answer 2 Suffix": (nd.get("answers") or [{},{}])[1].get("suffix","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 1 else "",
-            "MA Answer 3 Prefix": (nd.get("answers") or [{},{},{}])[2].get("prefix","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 2 else "",
-            "MA Answer 3":        (nd.get("answers") or [{},{},{}])[2].get("answer","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 2 else "",
-            "MA Answer 3 Suffix": (nd.get("answers") or [{},{},{}])[2].get("suffix","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 2 else "",
-            "MA Answer 4 Prefix": (nd.get("answers") or [{},{},{},{}])[3].get("prefix","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 3 else "",
-            "MA Answer 4":        (nd.get("answers") or [{},{},{},{}])[3].get("answer","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 3 else "",
-            "MA Answer 4 Suffix": (nd.get("answers") or [{},{},{},{}])[3].get("suffix","") if isinstance(nd.get("answers"), list) and len(nd.get("answers", [])) > 3 else "",
+            "MA Answer 1 Prefix": _safe_answers(nd)[0].get("prefix","") if len(_safe_answers(nd)) > 0 else "",
+            "MA Answer 1":        _safe_answers(nd)[0].get("answer","") if len(_safe_answers(nd)) > 0 else "",
+            "MA Answer 1 Suffix": _safe_answers(nd)[0].get("suffix","") if len(_safe_answers(nd)) > 0 else "",
+            "MA Answer 2 Prefix": _safe_answers(nd)[1].get("prefix","") if len(_safe_answers(nd)) > 1 else "",
+            "MA Answer 2":        _safe_answers(nd)[1].get("answer","") if len(_safe_answers(nd)) > 1 else "",
+            "MA Answer 2 Suffix": _safe_answers(nd)[1].get("suffix","") if len(_safe_answers(nd)) > 1 else "",
+            "MA Answer 3 Prefix": _safe_answers(nd)[2].get("prefix","") if len(_safe_answers(nd)) > 2 else "",
+            "MA Answer 3":        _safe_answers(nd)[2].get("answer","") if len(_safe_answers(nd)) > 2 else "",
+            "MA Answer 3 Suffix": _safe_answers(nd)[2].get("suffix","") if len(_safe_answers(nd)) > 2 else "",
+            "MA Answer 4 Prefix": _safe_answers(nd)[3].get("prefix","") if len(_safe_answers(nd)) > 3 else "",
+            "MA Answer 4":        _safe_answers(nd)[3].get("answer","") if len(_safe_answers(nd)) > 3 else "",
+            "MA Answer 4 Suffix": _safe_answers(nd)[3].get("suffix","") if len(_safe_answers(nd)) > 3 else "",
             # Fraction
             "Answer Label":        nd.get("answerLabel", ""),
             "Numerator":           nd.get("numerator", ""),
