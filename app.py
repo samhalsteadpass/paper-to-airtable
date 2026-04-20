@@ -1384,7 +1384,7 @@ def tweak_nova_question(client: OpenAI, item: dict,
 
     change_result = {}
     for attempt in range(3):
-        raw          = call_gpt(client, content, TEXT_MODEL, max_tokens=600)
+        raw          = call_gpt(client, content, VISION_MODEL, max_tokens=600)
         change_result = safe_json_loads(raw, {})
         new_body = change_result.get("newBody", "")
         if new_body and _normalise(new_body) != _normalise(original_body):
@@ -2577,29 +2577,51 @@ if st.session_state.get("do_nova_tweak"):
     client   = OpenAI(api_key=OPENAI_KEY)
 
     to_tweak = [x for x in all_nova if not x.get("isParent") and x.get("novaData")]
-    progress_bar = st.progress(0, text="Tweaking questions…")
-    total = len(to_tweak)
+    total    = len(to_tweak)
 
     def _tweak_one(item):
+        orig_body = (item.get("novaData") or {}).get("body", "")
         try:
-            nd = tweak_nova_question(client, item, _pname)
-            return item["questionNumber"], nd, None
+            nd  = tweak_nova_question(client, item, _pname)
+            new_body = nd.get("body", "")
+            changed  = re.sub(r'[\s\[\]latex/]', '', new_body).lower() != \
+                       re.sub(r'[\s\[\]latex/]', '', orig_body).lower()
+            return item["questionNumber"], nd, None, changed
         except Exception as e:
-            return item["questionNumber"], None, str(e)
+            import traceback
+            return item["questionNumber"], None, traceback.format_exc(), False
 
-    tweaked_map: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(_tweak_one, item): item for item in to_tweak}
-        done = 0
-        for fut in as_completed(futures):
-            qnum, nd, err = fut.result()
-            if nd:
-                tweaked_map[qnum] = nd
-            done += 1
-            progress_bar.progress(done / max(total, 1),
-                                   text=f"Tweaked {done}/{total}…")
+    tweaked_map:   dict[str, dict] = {}
+    unchanged_qs:  list[str]       = []
+    error_qs:      list[tuple]     = []
 
-    progress_bar.empty()
+    with st.status("Tweaking…", expanded=True) as _tweak_status:
+        progress_bar = st.progress(0)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(_tweak_one, item): item for item in to_tweak}
+            done = 0
+            for fut in as_completed(futures):
+                qnum, nd, err, changed = fut.result()
+                if err:
+                    error_qs.append((qnum, err))
+                    st.write(f"❌ Q{qnum}: exception — {err[:120]}")
+                elif nd is None:
+                    error_qs.append((qnum, "returned None"))
+                    st.write(f"❌ Q{qnum}: no result returned")
+                elif not changed:
+                    tweaked_map[qnum] = nd
+                    unchanged_qs.append(qnum)
+                    st.write(f"⚠️ Q{qnum}: ran but body unchanged")
+                else:
+                    tweaked_map[qnum] = nd
+                    st.write(f"✅ Q{qnum}: tweaked → {nd.get('body','')[:60]}…")
+                done += 1
+                progress_bar.progress(done / max(total, 1))
+
+        _tweak_status.update(
+            label=f"✅ {len(tweaked_map) - len(unchanged_qs)} changed · "
+                  f"{len(unchanged_qs)} unchanged · {len(error_qs)} errors",
+            state="complete")
 
     # Apply tweaked data back into all_nova
     for item in all_nova:
