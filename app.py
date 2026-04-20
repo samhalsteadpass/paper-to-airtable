@@ -1416,8 +1416,7 @@ def tweak_nova_question(client: OpenAI, item: dict,
         # Update AI criteria to reflect new numbers if present
         old_crit = nd.get("aiMarkingCriteria", "")
         if old_crit and new_answer and new_answer != original_answer:
-            result["aiMarkingCriteria"] = re.sub(
-                re.escape(original_answer), new_answer, old_crit)
+            result["aiMarkingCriteria"] = old_crit.replace(original_answer, new_answer)
 
     # ── Step 3: Assess image update need ─────────────────────────────────
     has_image    = bool(rec.get("hasImages", False))
