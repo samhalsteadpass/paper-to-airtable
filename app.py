@@ -1270,58 +1270,44 @@ def nova_ai_role_prompt(subject: str = "", level: str = "") -> str:
 # Keep a default for reference
 NOVA_AI_ROLE_PROMPT = nova_ai_role_prompt()
 
-NOVA_TWEAK_PROMPT = """You are adapting an exam question for an e-learning platform called Nova.
-Your goal is to produce a GENUINELY DIFFERENT question that tests the same concept.
+NOVA_TWEAK_CHANGE_PROMPT = """You are creating a VARIANT of an exam question.
 
-━━━ CORE REQUIREMENT (always applies) ━━━
-You MUST change the question. The output body MUST differ from the input body.
-- Change at least one number to a different plausible value (e.g. 18475 → 23610, 48 → 36)
-- Rephrase at least one phrase (synonym, reordered sentence)
-- Update the answer, written solution, and all type-specific answer fields to match
-- Keep the same novaType, same difficulty, same concept being tested
+Change the numbers and lightly rephrase the wording. Keep the same topic and difficulty.
 
-━━━ STEP 1: Assess image dependency ━━━
+Input question body: BODY_PLACEHOLDER
+Input answer:        ANSWER_PLACEHOLDER
+Question type:       TYPE_PLACEHOLDER
 
-Look at hasImage and imageDescription. Classify as:
+Return ONLY raw JSON — no markdown, no explanation:
+{
+  "newBody":            "<rewritten question with different numbers — MUST differ from input>",
+  "newAnswer":          "<correct answer for the new numbers>",
+  "newWrittenSolution": "<brief worked solution for the new numbers>",
+  "changesMade":        "<one sentence: what numbers/words you changed>"
+}
 
-- LOCKED  → image contains specific numbers, scales, axes, data values, or measurements
-             that the question directly references (graph with labelled values, frequency
-             tree, data table, shape with dimensions). The image will need human updating.
-- FREE    → image is structural only — no specific values tied to the question numbers
-             (unlabelled shape, generic diagram, contextual photo). Change freely.
-- NO_IMAGE → hasImage is false or imageDescription is empty. Change freely.
+Rules:
+- newBody MUST contain at least one different number from the input body
+- Compute newAnswer correctly for the new numbers
+- Keep maths in [latex]...[/latex] tags
+- Do NOT copy the input body unchanged
+"""
 
-━━━ STEP 2: Make the changes ━━━
+NOVA_TWEAK_IMAGE_PROMPT = """An exam question has been rewritten with new numbers.
+Assess whether the accompanying image needs to be updated.
 
-For LOCKED images:
-- Change numbers in the question text as normal — the image will be updated by a human
-- Set imageNeedsUpdate: true
-- Write imageUpdateNotes: exactly what needs changing in the image to match
-  (e.g. "Update frequency tree: change total from 120 to 150, left-turners from 45 to 55")
+Original image description: IMAGE_DESC_PLACEHOLDER
+Original question body:     ORIGINAL_BODY_PLACEHOLDER
+New question body:          NEW_BODY_PLACEHOLDER
 
-For FREE or NO_IMAGE:
-- Change numbers and wording freely
-- Set imageNeedsUpdate: false, imageUpdateNotes: ""
+Return ONLY raw JSON — no markdown, no explanation:
+{
+  "imageNeedsUpdate": true or false,
+  "imageUpdateNotes": "<exactly what to change in the image to match the new question, or empty string>"
+}
 
-━━━ If novaType = "physical" ━━━
-Convert to a digitally-answerable type AND apply number/wording changes:
-- "Draw a circle around X" → "Which of the following best describes X?" (multiple_choice)
-- "Label the diagram" → simple or multiple_choice
-- "Complete the graph" → essay asking them to describe what the graph would show
-- Apply the LOCKED/FREE assessment and set imageNeedsUpdate accordingly.
-
-━━━ STEP 3: Return JSON ━━━
-
-Current classified question:
-NOVA_DATA_PLACEHOLDER
-
-Return ONLY the same JSON structure as the input — same fields, same novaType (unless
-converting from physical), all fields updated — PLUS these two fields:
-
-"imageNeedsUpdate": true or false,
-"imageUpdateNotes": "What needs changing in the image, or empty string."
-
-No markdown fences. No explanation.
+imageNeedsUpdate is true only if the image contains specific numbers, scales, or labels
+that are now contradicted by the new question body.
 """
 
 
@@ -1330,83 +1316,139 @@ def tweak_nova_question(client: OpenAI, item: dict,
     """Tweak a classified nova item — rephrase/renumber, or convert physical to digital."""
     nd  = item.get("novaData") or {}
     rec = item.get("originalRecord") or {}
+    nt  = nd.get("novaType", "")
 
-    tweak_data = {
-        "novaType":     nd.get("novaType", ""),
-        "friendlyName": nd.get("friendlyName", ""),
-        "body":         nd.get("body", ""),
-        "marks":        nd.get("marks", rec.get("markAllocation", 0)),
-        "difficulty":   nd.get("difficulty", 1),
-        "writtenSolution": nd.get("writtenSolution", ""),
-        "markSchemeAnswer": rec.get("markSchemeAnswer", ""),
-        "hasImage":     rec.get("hasImages", False),
-        "imageDescription": rec.get("imageDescription", ""),
-        # type-specific fields
-        "answer":       nd.get("answer", ""),
-        "answerPrefix": nd.get("answerPrefix", ""),
-        "answerUnit":   nd.get("answerUnit", ""),
-        "options":      nd.get("options", []),
-        "answers":      nd.get("answers", []),
-        "numerator":    nd.get("numerator", ""),
-        "denominator":  nd.get("denominator", ""),
-        "questionForAI": nd.get("questionForAI", ""),
-        "aiMarkingCriteria": nd.get("aiMarkingCriteria", ""),
-        "markingCriteriaForStudent": nd.get("markingCriteriaForStudent", ""),
-        "requireSpecificOrder": nd.get("requireSpecificOrder", False),
-        "style":        nd.get("style", ""),
-        "preamble":     nd.get("preamble", ""),
-        "blankContent": nd.get("blankContent", ""),
-        "blanks":       nd.get("blanks", []),
-    }
+    # ── Physical → digital conversion (unchanged logic) ───────────────────
+    if nt == "physical":
+        tweak_data = {
+            "novaType":     nt,
+            "body":         nd.get("body", ""),
+            "marks":        nd.get("marks", rec.get("markAllocation", 0)),
+            "difficulty":   nd.get("difficulty", 1),
+            "writtenSolution": nd.get("writtenSolution", ""),
+            "hasImage":     rec.get("hasImages", False),
+            "imageDescription": rec.get("imageDescription", ""),
+            "friendlyName": nd.get("friendlyName", ""),
+            "answer": "", "answerPrefix": "", "answerUnit": "",
+            "options": [], "answers": [], "numerator": "", "denominator": "",
+            "questionForAI": "", "aiMarkingCriteria": "",
+            "markingCriteriaForStudent": "", "requireSpecificOrder": False,
+            "style": "", "preamble": "", "blankContent": "", "blanks": [],
+        }
+        convert_prompt = (
+            "Convert this physical exam question into a digitally-answerable Nova question type.\n"
+            "- 'Draw a circle around X' → multiple_choice\n"
+            "- 'Label the diagram' → simple or multiple_choice\n"
+            "- 'Complete the graph' → essay describing what the graph shows\n\n"
+            "Input:\n" + json.dumps(tweak_data, indent=2) + "\n\n"
+            "Return ONLY the full JSON with the same fields as input, novaType changed, "
+            "all relevant fields filled. No markdown fences."
+        )
+        content = [{"type": "input_text", "text": convert_prompt}]
+        for _ in range(2):
+            raw = call_gpt(client, content, VISION_MODEL, max_tokens=3000)
+            result = safe_json_loads(raw, {})
+            if result.get("novaType") and result.get("novaType") != "physical":
+                break
+        if not result.get("novaType"):
+            result = nd
+        result["imageNeedsUpdate"] = False
+        result["imageUpdateNotes"] = ""
+        return result
 
-    prompt = (NOVA_TWEAK_PROMPT
-              .replace("NOVA_DATA_PLACEHOLDER", json.dumps(tweak_data, indent=2)))
-    content = [{"type": "input_text", "text": prompt}]
+    # ── Step 1: Generate new body / answer ────────────────────────────────
+    original_body   = nd.get("body", "")
+    original_answer = str(nd.get("answer", "") or "")
 
-    result = {}
-    original_body   = tweak_data.get("body", "")
-    original_answer = str(tweak_data.get("answer", "") or "")
+    # For non-simple types, derive a representative "answer" string for the prompt
+    if nt == "fraction":
+        original_answer = f"{nd.get('numerator','')}/{nd.get('denominator','')}"
+    elif nt == "multiple_answer":
+        ans_list = nd.get("answers") or []
+        original_answer = ", ".join(
+            str(a.get("answer", "")) for a in ans_list if isinstance(a, dict))
+    elif nt == "multiple_choice":
+        opts = nd.get("options") or []
+        correct = next((o.get("text","") for o in opts
+                        if isinstance(o, dict) and o.get("correct")), "")
+        original_answer = correct
+
+    change_prompt = (NOVA_TWEAK_CHANGE_PROMPT
+                     .replace("BODY_PLACEHOLDER",   original_body)
+                     .replace("ANSWER_PLACEHOLDER", original_answer)
+                     .replace("TYPE_PLACEHOLDER",   nt))
+    content = [{"type": "input_text", "text": change_prompt}]
 
     def _normalise(s: str) -> str:
-        """Strip whitespace/latex noise for a meaningful comparison."""
-        return re.sub(r'\s+', '', s).lower()
+        return re.sub(r'[\s\[\]latex/]', '', s).lower()
 
-    def _genuinely_changed(res: dict) -> bool:
-        """Return True only if the question content has actually changed."""
-        new_body = res.get("body", "")
-        if _normalise(new_body) == _normalise(original_body):
-            return False
-        # For simple questions, the answer must also change
-        if res.get("novaType") == "simple":
-            new_answer = str(res.get("answer", "") or "")
-            if new_answer == original_answer:
-                return False
-        return True
-
+    change_result = {}
     for attempt in range(3):
-        raw    = call_gpt(client, content, VISION_MODEL, max_tokens=3000)
-        result = safe_json_loads(raw, {})
-        if not (result.get("novaType") and result.get("body")):
-            continue
-        if _genuinely_changed(result):
+        raw          = call_gpt(client, content, TEXT_MODEL, max_tokens=600)
+        change_result = safe_json_loads(raw, {})
+        new_body = change_result.get("newBody", "")
+        if new_body and _normalise(new_body) != _normalise(original_body):
             break
-        # Not changed — retry with explicit correction
-        content = [{"type": "input_text", "text": prompt + (
-            f"\n\nIMPORTANT: Your previous response returned the SAME question as the input "
-            f"(body was still: {original_body[:80]}...). "
-            f"You MUST change the number(s) to different values. "
-            f"For example, if the input has 18475, change it to a different 5-digit number "
-            f"like 23610 or 31450. The answer must also change to match."
-        )}]
+        content = [{"type": "input_text", "text": change_prompt +
+                    f"\n\nNOTE: You returned the same question again. "
+                    f"The number in the input body is still present in your output. "
+                    f"You MUST use a completely different number."}]
 
-    if not result.get("novaType"):
-        return nd  # return original if tweak failed
+    new_body            = change_result.get("newBody",            original_body)
+    new_answer          = change_result.get("newAnswer",          original_answer)
+    new_written_sol     = change_result.get("newWrittenSolution", nd.get("writtenSolution", ""))
+
+    # ── Step 2: Stamp new content into a copy of novaData ─────────────────
+    result = dict(nd)  # shallow copy of original classified data
+    result["body"]            = new_body
+    result["writtenSolution"] = new_written_sol
+
+    if nt == "simple":
+        result["answer"] = new_answer
+    elif nt == "fraction":
+        if "/" in new_answer:
+            parts = new_answer.split("/", 1)
+            result["numerator"]   = parts[0].strip()
+            result["denominator"] = parts[1].strip()
+    elif nt == "essay":
+        result["questionForAI"] = re.sub(r'\[latex\].*?\[/latex\]',
+                                          lambda m: m.group(0), new_body)
+        # Update AI criteria to reflect new numbers if present
+        old_crit = nd.get("aiMarkingCriteria", "")
+        if old_crit and new_answer and new_answer != original_answer:
+            result["aiMarkingCriteria"] = re.sub(
+                re.escape(original_answer), new_answer, old_crit)
+
+    # ── Step 3: Assess image update need ─────────────────────────────────
+    has_image    = bool(rec.get("hasImages", False))
+    image_desc   = str(rec.get("imageDescription", "") or "").strip()
+    image_needs  = False
+    image_notes  = ""
+
+    if has_image and image_desc:
+        img_prompt = (NOVA_TWEAK_IMAGE_PROMPT
+                      .replace("IMAGE_DESC_PLACEHOLDER",    image_desc)
+                      .replace("ORIGINAL_BODY_PLACEHOLDER", original_body)
+                      .replace("NEW_BODY_PLACEHOLDER",      new_body))
+        img_raw    = call_gpt(client, [{"type": "input_text", "text": img_prompt}],
+                               TEXT_MODEL, max_tokens=200)
+        img_result = safe_json_loads(img_raw, {})
+        image_needs = bool(img_result.get("imageNeedsUpdate", False))
+        image_notes = str(img_result.get("imageUpdateNotes", "") or "").strip()
+
+    result["imageNeedsUpdate"] = image_needs
+    result["imageUpdateNotes"] = image_notes
 
     # Apply same safety overrides as classify
     question_text = result.get("body", "").lower()
     fraction_keywords = ["as a fraction", "simplest form", "lowest terms", "what fraction"]
     if result.get("novaType") == "simple" and any(kw in question_text for kw in fraction_keywords):
         result["novaType"] = "fraction"
+        if "/" in str(result.get("answer", "")):
+            parts = str(result["answer"]).split("/", 1)
+            result["numerator"]   = parts[0].strip()
+            result["denominator"] = parts[1].strip()
+        result.pop("answer", None)
 
     if result.get("novaType") == "simple":
         ans = str(result.get("answer", "") or "")
@@ -1418,10 +1460,6 @@ def tweak_nova_question(client: OpenAI, item: dict,
             result["numerator"]   = parts[0].strip()
             result["denominator"] = parts[1].strip()
             result.pop("answer", None)
-
-    # Preserve image flag fields so the caller can store them on the item
-    result["imageNeedsUpdate"] = bool(result.get("imageNeedsUpdate", False))
-    result["imageUpdateNotes"] = str(result.get("imageUpdateNotes", "") or "").strip()
 
     return result
 
