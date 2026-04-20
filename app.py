@@ -2737,10 +2737,10 @@ if "nova_classified" in st.session_state:
                height: int = 100, hint: str = "", key: str = ""):
         st.caption(f"**{label}**" + (f"  ·  *{hint}*" if hint else ""))
         if multiline:
-            st.text_area("", value=str(value or ""), height=height,
+            st.text_area(label, value=str(value or ""), height=height,
                          key=key, label_visibility="collapsed")
         else:
-            st.text_input("", value=str(value or ""), key=key,
+            st.text_input(label, value=str(value or ""), key=key,
                           label_visibility="collapsed")
 
     # ── Helper: render type-specific fields ─────────────────────────────────
