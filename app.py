@@ -841,6 +841,9 @@ NOVA_ALL_FIELDS: list[tuple[str, str]] = [
     ("Pass Marks",             "number"),
     ("Min Word Count",         "number"),
     ("Marking Method",         "singleLineText"),
+    # Tweak image flags
+    ("Image Needs Update",     "checkbox"),
+    ("Image Update Notes",     "multilineText"),
 ]
 
 # Columns shown in each type's view
@@ -1136,6 +1139,13 @@ def nova_record_to_fields(item: dict, paper_name: str = "",
             "Min Word Count":      1,
             "Marking Method":      "AI",
         })
+    if nt not in ("essay",):
+        pass  # type-specific fields handled above
+
+    # Image update flags (set by tweak pass)
+    fields["Image Needs Update"] = bool(item.get("imageNeedsUpdate", False))
+    fields["Image Update Notes"] = str(item.get("imageUpdateNotes", "") or "")
+
     return fields
 
 
@@ -1262,7 +1272,42 @@ NOVA_AI_ROLE_PROMPT = nova_ai_role_prompt()
 
 NOVA_TWEAK_PROMPT = """You are adapting an exam question for an e-learning platform called Nova.
 
-You will receive a classified Nova question. Your job depends on its type:
+You will receive a classified Nova question. Always produce a tweaked version — even when an image is involved.
+
+━━━ STEP 1: Assess image dependency ━━━
+
+Look at hasImage and imageDescription. Classify the image relationship as one of:
+
+- LOCKED  → the image itself contains specific numbers, scales, axes, data, or labels that
+             the question directly references (e.g. a graph with values, a frequency tree,
+             a table of data, a labelled diagram with measurements). Changing the question
+             numbers creates a contradiction with the existing image.
+- FREE    → the image is structural/contextual only — no specific values, scales, or labels
+             that tie to the question numbers (e.g. an unlabelled shape, a generic circuit
+             diagram, a photo). Numbers can be freely changed.
+- NO_IMAGE → hasImage is false or imageDescription is empty.
+
+━━━ STEP 2: Tweak the question ━━━
+
+Always tweak regardless of image type. Apply these rules:
+
+For LOCKED images:
+- Change numbers and values in the question text AS YOU NORMALLY WOULD
+- The image will need to be updated by a human later — that is expected and fine
+- Set imageNeedsUpdate: true and write clear imageUpdateNotes explaining exactly what
+  needs to change in the image to match the new question (e.g. "Update frequency tree:
+  change total from 120 to 150, children from 80 to 100, left-turners from 45 to 55")
+
+For FREE or NO_IMAGE:
+- Freely change numbers, values, and wording
+- Set imageNeedsUpdate: false and imageUpdateNotes: ""
+
+General tweaking rules (apply to all types):
+- Swap specific numbers for similar plausible ones that produce clean answers
+- Rephrase slightly (synonym words, different sentence structure)
+- Keep the SAME novaType, same difficulty, same topic
+- The answer and written solution must be updated to match any number changes
+- Do not make the question harder or easier — same cognitive demand
 
 ━━━ If novaType = "physical" ━━━
 Convert it into a digitally-answerable question. The image stays — only the question changes.
@@ -1270,19 +1315,20 @@ Convert it into a digitally-answerable question. The image stays — only the qu
 - "Label the diagram" / "Identify the structure labelled A" → simple or multiple_choice
 - "Complete the graph" → essay asking them to describe what the graph would show
 - Choose the most appropriate Nova type for the converted question.
+- Still apply the LOCKED/FREE image assessment and set imageNeedsUpdate accordingly.
 
-━━━ For all other types ━━━
-Slightly vary the question so it tests the same concept but with different wording or numbers:
-- Swap specific numbers for similar ones (e.g. 48 → 36, 3 pounds → 4 pounds)
-- Rephrase the question slightly (synonym words, different sentence structure)
-- Keep the SAME novaType, same difficulty, same topic
-- If the question references an image/diagram, only change the text — never change what the image shows
-- The answer must change to match any number changes
+━━━ STEP 3: Return JSON ━━━
 
 Current classified question:
 NOVA_DATA_PLACEHOLDER
 
-Return ONLY the same JSON structure as the input — same fields, same novaType (unless converting from physical), all fields filled in.
+Return ONLY the same JSON structure as the input — same fields, same novaType (unless converting
+from physical), all fields filled in — PLUS these two additional fields at the top level:
+
+"imageNeedsUpdate": true or false,
+"imageUpdateNotes": "Plain English description of exactly what needs changing in the image,
+                     or empty string if imageNeedsUpdate is false."
+
 No markdown fences, no explanation.
 """
 
@@ -1350,6 +1396,10 @@ def tweak_nova_question(client: OpenAI, item: dict,
             result["numerator"]   = parts[0].strip()
             result["denominator"] = parts[1].strip()
             result.pop("answer", None)
+
+    # Preserve image flag fields so the caller can store them on the item
+    result["imageNeedsUpdate"] = bool(result.get("imageNeedsUpdate", False))
+    result["imageUpdateNotes"] = str(result.get("imageUpdateNotes", "") or "").strip()
 
     return result
 
@@ -1587,6 +1637,9 @@ def nova_records_to_csv(nova_classified: list[dict]) -> str:
             "ChatGPT Model":       "gpt-4.1" if nt == "essay" else "",
             "Min Word Count":      "1" if nt == "essay" else "",
             "Marking Method":      "AI" if nt == "essay" else "",
+            # Tweak image flags
+            "Image Needs Update":  str(item.get("imageNeedsUpdate", "")),
+            "Image Update Notes":  str(item.get("imageUpdateNotes", "") or ""),
         }
         rows.append(row)
     if not rows:
@@ -2492,15 +2545,19 @@ if st.session_state.get("do_nova_tweak"):
     for item in all_nova:
         qnum = item.get("questionNumber", "")
         if qnum in tweaked_map:
-            item["novaData"]  = tweaked_map[qnum]
-            item["tweaked"]   = True
+            nd = tweaked_map[qnum]
+            item["novaData"]          = nd
+            item["tweaked"]           = True
+            item["imageNeedsUpdate"]  = nd.get("imageNeedsUpdate", False)
+            item["imageUpdateNotes"]  = nd.get("imageUpdateNotes", "")
 
-    n_tweaked  = len(tweaked_map)
-    n_physical = sum(1 for item in all_nova
-                     if item.get("tweaked") and
-                     (item.get("novaData") or {}).get("novaType") != "physical")
+    n_tweaked       = len(tweaked_map)
+    n_image_updates = sum(1 for item in all_nova if item.get("imageNeedsUpdate"))
     st.session_state["nova_classified"] = all_nova
-    st.success(f"✅ {n_tweaked} questions tweaked · physical questions converted")
+    st.success(
+        f"✅ {n_tweaked} questions tweaked · "
+        f"{n_image_updates} image(s) flagged for update"
+    )
     st.rerun()
 
 # ── Display classified records ─────────────────────────────────────────────
@@ -2895,10 +2952,19 @@ if "nova_classified" in st.session_state:
             if item.get("error"):
                 header += f"  <span style='color:#e74c3c;font-size:0.8em'>⚠ {item['error'][:60]}</span>"
             tweaked_badge = " ✏️" if item.get("tweaked") else ""
-            with st.expander(f"Q{qn} · {label}{tweaked_badge}", expanded=False):
+            img_badge     = " 🖼️⚠️" if item.get("imageNeedsUpdate") else ""
+            with st.expander(f"Q{qn} · {label}{tweaked_badge}{img_badge}", expanded=False):
                 st.markdown(header, unsafe_allow_html=True)
                 st.caption(
                     f"*Original:* {(item.get('originalRecord') or {}).get('questionText', '')[:120]}")
+                # Image update warning
+                if item.get("imageNeedsUpdate"):
+                    st.warning(
+                        f"🖼️ **Image needs updating** — the question numbers have changed. "
+                        f"Update the image before publishing.\n\n"
+                        f"**What to change:** {item.get('imageUpdateNotes', '(no details provided)')}",
+                        icon=None,
+                    )
                 if item.get("error"):
                     st.error(f"Classification error: {item['error']}")
                     _reclassify_button(item, qn)
@@ -2961,6 +3027,13 @@ if "nova_classified" in st.session_state:
                         st.error(f"Classification error: {child['error']}")
                         _reclassify_button(child, cqn)
                     else:
+                        if child.get("imageNeedsUpdate"):
+                            st.warning(
+                                f"🖼️ **Image needs updating** — the question numbers have changed. "
+                                f"Update the image before publishing.\n\n"
+                                f"**What to change:** {child.get('imageUpdateNotes', '(no details provided)')}",
+                                icon=None,
+                            )
                         _render_nova_fields(nd, cqn, uid=f"g{rendered}_{cqn}")
                         _reclassify_button(child, cqn)
                     st.divider()
