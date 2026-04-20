@@ -1146,6 +1146,19 @@ def nova_record_to_fields(item: dict, paper_name: str = "",
     fields["Image Needs Update"] = bool(item.get("imageNeedsUpdate", False))
     fields["Image Update Notes"] = str(item.get("imageUpdateNotes", "") or "")
 
+    # ── Sanitize: Airtable rejects None for text fields ───────────────────
+    number_fields  = {"Marks", "Difficulty", "Pass Marks", "Min Word Count"}
+    boolean_fields = {"Is Sub-question", "Require Specific Order",
+                      "Image Needs Update"}
+    for k, v in fields.items():
+        if k in number_fields:
+            fields[k] = clamp_int(v, 0)
+        elif k in boolean_fields:
+            fields[k] = bool(v)
+        elif not isinstance(v, (int, float, bool, list)):
+            # All remaining fields should be strings
+            fields[k] = str(v) if v is not None else ""
+
     return fields
 
 
