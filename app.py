@@ -1271,65 +1271,57 @@ def nova_ai_role_prompt(subject: str = "", level: str = "") -> str:
 NOVA_AI_ROLE_PROMPT = nova_ai_role_prompt()
 
 NOVA_TWEAK_PROMPT = """You are adapting an exam question for an e-learning platform called Nova.
+Your goal is to produce a GENUINELY DIFFERENT question that tests the same concept.
 
-You will receive a classified Nova question. Always produce a tweaked version — even when an image is involved.
+━━━ CORE REQUIREMENT (always applies) ━━━
+You MUST change the question. The output body MUST differ from the input body.
+- Change at least one number to a different plausible value (e.g. 18475 → 23610, 48 → 36)
+- Rephrase at least one phrase (synonym, reordered sentence)
+- Update the answer, written solution, and all type-specific answer fields to match
+- Keep the same novaType, same difficulty, same concept being tested
 
 ━━━ STEP 1: Assess image dependency ━━━
 
-Look at hasImage and imageDescription. Classify the image relationship as one of:
+Look at hasImage and imageDescription. Classify as:
 
-- LOCKED  → the image itself contains specific numbers, scales, axes, data, or labels that
-             the question directly references (e.g. a graph with values, a frequency tree,
-             a table of data, a labelled diagram with measurements). Changing the question
-             numbers creates a contradiction with the existing image.
-- FREE    → the image is structural/contextual only — no specific values, scales, or labels
-             that tie to the question numbers (e.g. an unlabelled shape, a generic circuit
-             diagram, a photo). Numbers can be freely changed.
-- NO_IMAGE → hasImage is false or imageDescription is empty.
+- LOCKED  → image contains specific numbers, scales, axes, data values, or measurements
+             that the question directly references (graph with labelled values, frequency
+             tree, data table, shape with dimensions). The image will need human updating.
+- FREE    → image is structural only — no specific values tied to the question numbers
+             (unlabelled shape, generic diagram, contextual photo). Change freely.
+- NO_IMAGE → hasImage is false or imageDescription is empty. Change freely.
 
-━━━ STEP 2: Tweak the question ━━━
-
-Always tweak regardless of image type. Apply these rules:
+━━━ STEP 2: Make the changes ━━━
 
 For LOCKED images:
-- Change numbers and values in the question text AS YOU NORMALLY WOULD
-- The image will need to be updated by a human later — that is expected and fine
-- Set imageNeedsUpdate: true and write clear imageUpdateNotes explaining exactly what
-  needs to change in the image to match the new question (e.g. "Update frequency tree:
-  change total from 120 to 150, children from 80 to 100, left-turners from 45 to 55")
+- Change numbers in the question text as normal — the image will be updated by a human
+- Set imageNeedsUpdate: true
+- Write imageUpdateNotes: exactly what needs changing in the image to match
+  (e.g. "Update frequency tree: change total from 120 to 150, left-turners from 45 to 55")
 
 For FREE or NO_IMAGE:
-- Freely change numbers, values, and wording
-- Set imageNeedsUpdate: false and imageUpdateNotes: ""
-
-General tweaking rules (apply to all types):
-- Swap specific numbers for similar plausible ones that produce clean answers
-- Rephrase slightly (synonym words, different sentence structure)
-- Keep the SAME novaType, same difficulty, same topic
-- The answer and written solution must be updated to match any number changes
-- Do not make the question harder or easier — same cognitive demand
+- Change numbers and wording freely
+- Set imageNeedsUpdate: false, imageUpdateNotes: ""
 
 ━━━ If novaType = "physical" ━━━
-Convert it into a digitally-answerable question. The image stays — only the question changes.
+Convert to a digitally-answerable type AND apply number/wording changes:
 - "Draw a circle around X" → "Which of the following best describes X?" (multiple_choice)
-- "Label the diagram" / "Identify the structure labelled A" → simple or multiple_choice
+- "Label the diagram" → simple or multiple_choice
 - "Complete the graph" → essay asking them to describe what the graph would show
-- Choose the most appropriate Nova type for the converted question.
-- Still apply the LOCKED/FREE image assessment and set imageNeedsUpdate accordingly.
+- Apply the LOCKED/FREE assessment and set imageNeedsUpdate accordingly.
 
 ━━━ STEP 3: Return JSON ━━━
 
 Current classified question:
 NOVA_DATA_PLACEHOLDER
 
-Return ONLY the same JSON structure as the input — same fields, same novaType (unless converting
-from physical), all fields filled in — PLUS these two additional fields at the top level:
+Return ONLY the same JSON structure as the input — same fields, same novaType (unless
+converting from physical), all fields updated — PLUS these two fields:
 
 "imageNeedsUpdate": true or false,
-"imageUpdateNotes": "Plain English description of exactly what needs changing in the image,
-                     or empty string if imageNeedsUpdate is false."
+"imageUpdateNotes": "What needs changing in the image, or empty string."
 
-No markdown fences, no explanation.
+No markdown fences. No explanation.
 """
 
 
@@ -1371,11 +1363,23 @@ def tweak_nova_question(client: OpenAI, item: dict,
               .replace("NOVA_DATA_PLACEHOLDER", json.dumps(tweak_data, indent=2)))
     content = [{"type": "input_text", "text": prompt}]
 
-    for attempt in range(2):
+    result = {}
+    original_body = tweak_data.get("body", "")
+
+    for attempt in range(3):
         raw    = call_gpt(client, content, VISION_MODEL, max_tokens=3000)
         result = safe_json_loads(raw, {})
-        if result.get("novaType") and result.get("body"):
-            break
+        if not (result.get("novaType") and result.get("body")):
+            continue
+        # Reject if body is unchanged — force a retry with a stronger nudge
+        if result.get("body", "").strip() == original_body.strip():
+            content = [{"type": "input_text", "text": prompt + (
+                "\n\nIMPORTANT: Your previous response returned the SAME body as the input. "
+                "You MUST change at least one number and rephrase at least one sentence. "
+                "The output body must be visibly different from the input body."
+            )}]
+            continue
+        break  # got a genuinely changed result
 
     if not result.get("novaType"):
         return nd  # return original if tweak failed
