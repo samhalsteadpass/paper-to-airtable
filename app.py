@@ -2636,6 +2636,7 @@ if st.session_state.get("do_nova_tweak"):
     n_tweaked       = len(tweaked_map)
     n_image_updates = sum(1 for item in all_nova if item.get("imageNeedsUpdate"))
     st.session_state["nova_classified"] = all_nova
+    st.session_state["_tweak_run"] = st.session_state.get("_tweak_run", 0) + 1
     st.success(
         f"✅ {n_tweaked} questions tweaked · "
         f"{n_image_updates} image(s) flagged for update"
@@ -3013,7 +3014,8 @@ if "nova_classified" in st.session_state:
         return True
 
     # ── Render ─────────────────────────────────────────────────────────────
-    rendered = 0
+    rendered   = 0
+    _tweak_run = st.session_state.get("_tweak_run", 0)
     for entry in display_order:
 
         if entry["dtype"] == "standalone":
@@ -3051,7 +3053,7 @@ if "nova_classified" in st.session_state:
                     st.error(f"Classification error: {item['error']}")
                     _reclassify_button(item, qn)
                 else:
-                    _render_nova_fields(nd, qn, uid=f"s{rendered}")
+                    _render_nova_fields(nd, qn, uid=f"s{rendered}r{_tweak_run}")
                     _reclassify_button(item, qn)
             rendered += 1
 
@@ -3080,7 +3082,7 @@ if "nova_classified" in st.session_state:
                 )
                 st.markdown("**Shared preamble** *(paste into the Multi-part container in Nova)*")
                 st.text_area(
-                    "",
+                    "Shared preamble",
                     value=ptext,
                     height=100,
                     key=f"mp_preamble_{pqn}",
@@ -3116,7 +3118,7 @@ if "nova_classified" in st.session_state:
                                 f"**What to change:** {child.get('imageUpdateNotes', '(no details provided)')}",
                                 icon=None,
                             )
-                        _render_nova_fields(nd, cqn, uid=f"g{rendered}_{cqn}")
+                        _render_nova_fields(nd, cqn, uid=f"g{rendered}_{cqn}r{_tweak_run}")
                         _reclassify_button(child, cqn)
                     st.divider()
             rendered += 1
