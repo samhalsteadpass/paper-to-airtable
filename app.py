@@ -1364,22 +1364,40 @@ def tweak_nova_question(client: OpenAI, item: dict,
     content = [{"type": "input_text", "text": prompt}]
 
     result = {}
-    original_body = tweak_data.get("body", "")
+    original_body   = tweak_data.get("body", "")
+    original_answer = str(tweak_data.get("answer", "") or "")
+
+    def _normalise(s: str) -> str:
+        """Strip whitespace/latex noise for a meaningful comparison."""
+        return re.sub(r'\s+', '', s).lower()
+
+    def _genuinely_changed(res: dict) -> bool:
+        """Return True only if the question content has actually changed."""
+        new_body = res.get("body", "")
+        if _normalise(new_body) == _normalise(original_body):
+            return False
+        # For simple questions, the answer must also change
+        if res.get("novaType") == "simple":
+            new_answer = str(res.get("answer", "") or "")
+            if new_answer == original_answer:
+                return False
+        return True
 
     for attempt in range(3):
         raw    = call_gpt(client, content, VISION_MODEL, max_tokens=3000)
         result = safe_json_loads(raw, {})
         if not (result.get("novaType") and result.get("body")):
             continue
-        # Reject if body is unchanged — force a retry with a stronger nudge
-        if result.get("body", "").strip() == original_body.strip():
-            content = [{"type": "input_text", "text": prompt + (
-                "\n\nIMPORTANT: Your previous response returned the SAME body as the input. "
-                "You MUST change at least one number and rephrase at least one sentence. "
-                "The output body must be visibly different from the input body."
-            )}]
-            continue
-        break  # got a genuinely changed result
+        if _genuinely_changed(result):
+            break
+        # Not changed — retry with explicit correction
+        content = [{"type": "input_text", "text": prompt + (
+            f"\n\nIMPORTANT: Your previous response returned the SAME question as the input "
+            f"(body was still: {original_body[:80]}...). "
+            f"You MUST change the number(s) to different values. "
+            f"For example, if the input has 18475, change it to a different 5-digit number "
+            f"like 23610 or 31450. The answer must also change to match."
+        )}]
 
     if not result.get("novaType"):
         return nd  # return original if tweak failed
