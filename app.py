@@ -2444,7 +2444,7 @@ if _src:
     st.caption(f"{len(_src)} records available for classification.")
 
 # ── Classify button ────────────────────────────────────────────────────────
-classify_col, tweak_col, clear_col = st.columns([3, 3, 1])
+classify_col, tweak_col, retry_col, clear_col = st.columns([3, 3, 3, 1])
 with classify_col:
     if st.button(
         "🤖 Classify all with AI",
@@ -2462,6 +2462,16 @@ with tweak_col:
         help="Rephrase/renumber all questions. Converts physical questions to digital types.",
     ):
         st.session_state["do_nova_tweak"] = True
+        st.rerun()
+
+with retry_col:
+    _failed = st.session_state.get("_tweak_failed_qnums", [])
+    if st.button(
+        f"🔁 Retry {len(_failed)} failed" if _failed else "🔁 Retry failed",
+        disabled=not (OPENAI_KEY and bool(_failed)),
+        help="Re-run the tweak only for questions that errored last time.",
+    ):
+        st.session_state["do_nova_tweak_retry"] = True
         st.rerun()
 
 with clear_col:
@@ -2594,6 +2604,7 @@ if st.session_state.get("do_nova_tweak"):
     tweaked_map:   dict[str, dict] = {}
     unchanged_qs:  list[str]       = []
     error_qs:      list[tuple]     = []
+    tweak_log:     list[str]       = []
 
     with st.status("Tweaking…", expanded=True) as _tweak_status:
         progress_bar = st.progress(0)
@@ -2604,17 +2615,19 @@ if st.session_state.get("do_nova_tweak"):
                 qnum, nd, err, changed = fut.result()
                 if err:
                     error_qs.append((qnum, err))
-                    st.write(f"❌ Q{qnum}: exception — {err[:120]}")
+                    msg = f"❌ Q{qnum}: {err.strip().splitlines()[-1]}"
                 elif nd is None:
                     error_qs.append((qnum, "returned None"))
-                    st.write(f"❌ Q{qnum}: no result returned")
+                    msg = f"❌ Q{qnum}: no result returned"
                 elif not changed:
                     tweaked_map[qnum] = nd
                     unchanged_qs.append(qnum)
-                    st.write(f"⚠️ Q{qnum}: ran but body unchanged")
+                    msg = f"⚠️ Q{qnum}: ran but body unchanged"
                 else:
                     tweaked_map[qnum] = nd
-                    st.write(f"✅ Q{qnum}: tweaked → {nd.get('body','')[:60]}…")
+                    msg = f"✅ Q{qnum}: tweaked → {nd.get('body','')[:60]}…"
+                tweak_log.append(msg)
+                st.write(msg)
                 done += 1
                 progress_bar.progress(done / max(total, 1))
 
@@ -2635,18 +2648,75 @@ if st.session_state.get("do_nova_tweak"):
 
     n_tweaked       = len(tweaked_map)
     n_image_updates = sum(1 for item in all_nova if item.get("imageNeedsUpdate"))
-    st.session_state["nova_classified"] = all_nova
-    st.session_state["_tweak_run"] = st.session_state.get("_tweak_run", 0) + 1
+    st.session_state["nova_classified"]     = all_nova
+    st.session_state["_tweak_run"]          = st.session_state.get("_tweak_run", 0) + 1
+    st.session_state["_tweak_failed_qnums"] = [q for q, _ in error_qs]
+    st.session_state["_tweak_log"]          = tweak_log
+    st.session_state["_tweak_summary"]      = (
+        f"{len(tweaked_map) - len(unchanged_qs)} changed · "
+        f"{len(unchanged_qs)} unchanged · {len(error_qs)} errors"
+    )
     st.success(
         f"✅ {n_tweaked} questions tweaked · "
         f"{n_image_updates} image(s) flagged for update"
     )
     st.rerun()
 
+# ── Retry failed tweaks ────────────────────────────────────────────────────
+if st.session_state.get("do_nova_tweak_retry"):
+    st.session_state["do_nova_tweak_retry"] = False
+    all_nova      = st.session_state.get("nova_classified", [])
+    failed_qnums  = set(st.session_state.get("_tweak_failed_qnums", []))
+    _pname        = st.session_state.get("nova_paper_name", "")
+    client        = OpenAI(api_key=OPENAI_KEY)
+
+    to_retry = [x for x in all_nova
+                if not x.get("isParent") and x.get("novaData")
+                and x.get("questionNumber", "") in failed_qnums]
+
+    with st.status(f"Retrying {len(to_retry)} failed questions…", expanded=True) as _rs:
+        still_failed = []
+        retry_log    = []
+        for item in to_retry:
+            qnum = item.get("questionNumber", "")
+            try:
+                nd      = tweak_nova_question(client, item, _pname)
+                orig    = (item.get("novaData") or {}).get("body", "")
+                changed = re.sub(r'[\s\[\]latex/]', '', nd.get("body","")).lower() != \
+                          re.sub(r'[\s\[\]latex/]', '', orig).lower()
+                item["novaData"]         = nd
+                item["tweaked"]          = True
+                item["imageNeedsUpdate"] = nd.get("imageNeedsUpdate", False)
+                item["imageUpdateNotes"] = nd.get("imageUpdateNotes", "")
+                icon = "✅" if changed else "⚠️"
+                msg  = f"{icon} Q{qnum} (retry): {'tweaked' if changed else 'still unchanged'}"
+            except Exception as e:
+                still_failed.append(qnum)
+                msg = f"❌ Q{qnum} (retry): {str(e).strip().splitlines()[-1]}"
+            retry_log.append(msg)
+            st.write(msg)
+        _rs.update(label=f"Done · {len(to_retry)-len(still_failed)} fixed · {len(still_failed)} still failing",
+                   state="complete")
+
+    st.session_state["nova_classified"]     = all_nova
+    st.session_state["_tweak_run"]          = st.session_state.get("_tweak_run", 0) + 1
+    st.session_state["_tweak_failed_qnums"] = still_failed
+    # Append retry results to the persistent log
+    existing_log = st.session_state.get("_tweak_log", [])
+    st.session_state["_tweak_log"] = existing_log + retry_log
+    st.rerun()
+
 # ── Display classified records ─────────────────────────────────────────────
 if "nova_classified" in st.session_state:
     all_nova  = st.session_state["nova_classified"]
     pname     = st.session_state.get("nova_paper_name", "")
+
+    # ── Persistent tweak log ───────────────────────────────────────────────
+    if st.session_state.get("_tweak_log"):
+        summary = st.session_state.get("_tweak_summary", "")
+        with st.expander(f"📋 Last tweak log — {summary}", expanded=False):
+            for line in st.session_state["_tweak_log"]:
+                st.write(line)
 
     # ── Filters ────────────────────────────────────────────────────────────
     all_types = sorted({
